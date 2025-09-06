@@ -1,0 +1,10 @@
+ .\.venv\Scripts\python.exe -m nuitka --standalone `
+>>   --windows-icon-from-ico=icon.ico `
+>>   --include-package=numba --include-package=llvmlite `
+>>   --include-package=sklearn --include-package=scipy `
+>>   --include-package-data=certifi `
+>>   --noinclude-numba-mode=nofollow `
+>>   --module-parameter=numba-disable-jit=yes `
+>>   --nofollow-import-to=numba.tests,numba.pycc,setuptools,doctest `
+>>   --include-data-files="c:\Users\zhaoyang\Desktop\code\GlassAlgo_v3\*.json=./" `
+>>   --include-data-files="c:\Users\zhaoyang\Desktop\code\GlassAlgo_v3\MVGigE.dll=./" `

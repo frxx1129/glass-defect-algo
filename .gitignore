@@ -1,0 +1,39 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.python-env/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Nuitka outputs and caches
+.nuitka-cache/
+*.build/
+*.dist/
+*.onefile-build/
+*.onefile-dist/
+nuitka-crash-report.xml
+
+# Common build/packaging folders
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# Project-specific artifacts
+main.build/
+main.dist/
+main.dist.zip
+persistent_stats.dat
