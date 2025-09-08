@@ -32,17 +32,26 @@ class CameraManager:
             MVTerminateLib()
             cls._lib_initialized = False
 
-    def __init__(self, cam_index, ip: str | None = None, mac: str | None = None, serial: str | None = None):
+    def __init__(self, cam_index, ip: str | None = None, mac: str | None = None):
+        # 基本属性
         self.cam_index = cam_index
         self.ip = ip
         self.mac = mac
-        self.serial = serial
         self.handle = 0
         self.opened_index = None
+        # 绑定映射（由上层注入）
+        self._ip_bindings: dict | None = None  # { index(str): ip }
         # 可配置：重试次数、退避基数（秒）、心跳超时（毫秒）
         self.max_open_attempts = 3
         self.open_backoff_base_s = 2
         self.heartbeat_timeout_ms = 30000
+
+    def set_ip_bindings(self, ip_bindings: dict | None):
+        """允许外部注入 index->IP 映射。"""
+        if isinstance(ip_bindings, dict):
+            self._ip_bindings = ip_bindings
+        else:
+            self._ip_bindings = None
 
     def open(self):
         """
@@ -54,52 +63,123 @@ class CameraManager:
         try:
             MVUpdateCameraList()
             _, cam_count = MVGetNumOfCameras()
-            # 优先使用序列号匹配到索引
-            if self.serial:
-                target_sn = str(self.serial).strip().upper()
-                found_idx = None
-                for i in range(cam_count):
-                    res, cam_info = MVGetCameraInfo(i)
-                    if res == MVST_SUCCESS:
-                        try:
-                            sn = cam_info.mSerialNumber.decode('ascii', errors='ignore').strip('\x00').upper()
-                        except Exception:
-                            sn = ''
-                        if sn and sn == target_sn:
-                            found_idx = i
-                            break
-                if found_idx is None:
-                    print(f"[相机进程 {self.cam_index}]: 未在设备列表中找到 序列号={self.serial} 的相机。")
-                    return False
-                print(f"[相机进程 {self.cam_index}]: 通过序列号打开相机 {self.serial} (索引 {found_idx})...")
-                res, self.handle = MVOpenCamByIndex(found_idx)
-                if res == MVST_SUCCESS and self.handle != 0:
-                    self.opened_index = found_idx
-            elif self.mac:
-                # 通过 MAC 查找设备索引
+            print(f"[相机进程 {self.cam_index}]: 本地网段可见相机数量={cam_count}")
+            if self.mac:
                 target = self.mac.upper().replace('-', ':')
                 found_idx = None
+                available = []
                 for i in range(cam_count):
                     res, cam_info = MVGetDevInfo(i)
                     if res == MVST_SUCCESS:
                         mac_str = ":".join([f"{b:02X}" for b in cam_info.mEthernetAddr])
+                        available.append(f"{i}:{mac_str}")
                         if mac_str.upper() == target:
                             found_idx = i
                             break
+                print(f"[相机进程 {self.cam_index}]: 当前MVGetDevInfo列表={available}")
                 if found_idx is None:
-                    print(f"[相机进程 {self.cam_index}]: 未在设备列表中找到 MAC={self.mac} 的相机。")
-                    return False
-                # 使用索引打开
-                print(f"[相机进程 {self.cam_index}]: 通过MAC打开相机 {self.mac} (索引 {found_idx})...")
-                res, self.handle = MVOpenCamByIndex(found_idx)
-                if res == MVST_SUCCESS and self.handle != 0:
-                    self.opened_index = found_idx
+                    # 可能原因：MVEnumerateAllDevices 与 MVUpdateCameraList 列表不一致 / 不同子网
+                    print(f"[相机进程 {self.cam_index}]: 列表未直接匹配 MAC={self.mac}，尝试暴力匹配打开...")
+                    # 先尝试跨网段枚举（可能包含不在同一子网的设备）
+                    try:
+                        res_all, all_cnt = MVEnumerateAllDevices()
+                        print(f"[相机进程 {self.cam_index}]: MVEnumerateAllDevices 返回数量={all_cnt} res={res_all}")
+                        if res_all == MVST_SUCCESS and all_cnt > 0:
+                            for j in range(all_cnt):
+                                r2, info2 = MVGetDevInfo(j)
+                                if r2 == MVST_SUCCESS:
+                                    mac2 = ":".join([f"{b:02X}" for b in info2.mEthernetAddr])
+                                    ip2 = ".".join(str(x) for x in info2.mIpAddr)
+                                    if mac2.upper() == target:
+                                        # 直接尝试按 IP 打开（跨网段情况下按 index 可能失败）
+                                        if ip2.count('.') == 3:
+                                            print(f"[相机进程 {self.cam_index}]: 通过跨网段扫描匹配 MAC，尝试IP {ip2} 打开...")
+                                            r_ip2, h_ip2 = MVOpenCamByIP(ip2)
+                                            if r_ip2 == MVST_SUCCESS and h_ip2 != 0:
+                                                self.handle = h_ip2
+                                                self.opened_index = j
+                                                print(f"[相机进程 {self.cam_index}]: 通过跨网段 IP 打开成功。")
+                                                return True
+                    except Exception as _e_enum:
+                        print(f"[相机进程 {self.cam_index}]: 跨网段枚举异常: {_e_enum}")
+                    # 先尝试使用提供的 ip_bindings 中同 index 的 IP 打开
+                    if not self.handle and self._ip_bindings:
+                        ip_try = self._ip_bindings.get(str(self.cam_index)) if isinstance(self._ip_bindings, dict) else None
+                        if ip_try:
+                            print(f"[相机进程 {self.cam_index}]: 尝试通过绑定IP {ip_try} 打开...")
+                            r_ip, h_ip = MVOpenCamByIP(ip_try)
+                            if r_ip == MVST_SUCCESS and h_ip != 0:
+                                # 验证MAC（如果能拿到）
+                                try:
+                                    res_info, cam_info = MVGetDevInfo(self.cam_index)
+                                    if res_info == MVST_SUCCESS:
+                                        mac_str = ":".join([f"{b:02X}" for b in cam_info.mEthernetAddr])
+                                        print(f"[相机进程 {self.cam_index}]: 通过IP打开(未验证MAC或MAC={mac_str})")
+                                except Exception:
+                                    pass
+                                self.handle = h_ip
+                                self.opened_index = self.cam_index
+                                # 直接返回成功
+                                return True
+                    # 暴力尝试逐个打开并比对MAC
+                    for i in range(cam_count):
+                        res_open, h = MVOpenCamByIndex(i)
+                        if res_open == MVST_SUCCESS and h != 0:
+                            try:
+                                res_info, cam_info = MVGetDevInfo(i)
+                                if res_info == MVST_SUCCESS:
+                                    mac_str = ":".join([f"{b:02X}" for b in cam_info.mEthernetAddr])
+                                    if mac_str.upper() == target:
+                                        self.handle = h
+                                        self.opened_index = i
+                                        print(f"[相机进程 {self.cam_index}]: 通过暴力方式匹配到 MAC={self.mac} 位于索引 {i}")
+                                        break
+                            except Exception:
+                                pass
+                            # 若不是目标，关闭临时句柄
+                            if self.handle != h:
+                                try:
+                                    MVCloseCam(h)
+                                except Exception:
+                                    pass
+                    if not self.handle:
+                        print(f"[相机进程 {self.cam_index}]: 未匹配到 MAC={self.mac}，放弃。")
+                        return False
+                else:
+                    print(f"[相机进程 {self.cam_index}]: 通过MAC打开相机 {self.mac} (索引 {found_idx})...")
+                    res, self.handle = MVOpenCamByIndex(found_idx)
+                    if res == MVST_SUCCESS and self.handle != 0:
+                        self.opened_index = found_idx
+                    else:
+                        print(f"[相机进程 {self.cam_index}]: 按索引 {found_idx} 打开失败，错误码 {res}。尝试暴力匹配...")
+                        # 退化到暴力方式
+                        for i in range(cam_count):
+                            res_open, h = MVOpenCamByIndex(i)
+                            if res_open == MVST_SUCCESS and h != 0:
+                                try:
+                                    res_info, cam_info = MVGetDevInfo(i)
+                                    if res_info == MVST_SUCCESS:
+                                        mac_str = ":".join([f"{b:02X}" for b in cam_info.mEthernetAddr])
+                                        if mac_str.upper() == target:
+                                            self.handle = h
+                                            self.opened_index = i
+                                            print(f"[相机进程 {self.cam_index}]: 通过暴力方式匹配到 MAC={self.mac} 位于索引 {i}")
+                                            break
+                                except Exception:
+                                    pass
+                                if self.handle != h:
+                                    try:
+                                        MVCloseCam(h)
+                                    except Exception:
+                                        pass
+                        if not self.handle:
+                            return False
             else:
                 if self.cam_index < 0 or self.cam_index >= cam_count:
                     print(f"[相机进程 {self.cam_index}]: 索引越界，当前相机数量: {cam_count}。")
                     return False
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[相机进程 {self.cam_index}]: 打开前准备阶段异常: {e}")
 
         for attempt in range(1, self.max_open_attempts + 1):
             if self.handle:
@@ -197,13 +277,17 @@ class CameraManager:
             # 1. Get static hardware info
             # 优先使用实际打开的索引获取硬件信息
             idx = self.opened_index if self.opened_index is not None else self.cam_index
-            res, cam_info = MVGetCameraInfo(idx)
+            # 使用 MVGetDevInfo 获取网络与型号信息；不再暴露序列号
+            res, cam_info = MVGetDevInfo(idx)
             if res != MVST_SUCCESS:
-                hardware_info = {"error": "Failed to get hardware info"}
+                hardware_info = {"error": "Failed to get device info"}
             else:
+                try:
+                    model = cam_info.mModelName.decode('ascii', errors='ignore').strip('\x00')
+                except Exception:
+                    model = ''
                 hardware_info = {
-                    'model_name': cam_info.mModelName.decode('ascii', errors='ignore').strip('\x00'),
-                    'serial_number': cam_info.mSerialNumber.decode('ascii', errors='ignore').strip('\x00'),
+                    'model_name': model,
                     'mac_address': ":".join([f"{b:02X}" for b in cam_info.mEthernetAddr]),
                     'ip_address': ".".join(map(str, cam_info.mIpAddr))
                 }
@@ -323,7 +407,7 @@ class CameraManager:
 # --- Multi-Camera Setup Utility (For main process only) ---
 # ======================================================================
 class MultiCameraSetup:
-    """一个工具类，仅在主进程中用于启动时发现并配置所有相机的IP地址。"""
+    """一个工具类：启动时发现相机并建立 MAC 绑定（替换原序列号绑定）。"""
     def __init__(self, config):
         self.config = config
         self.camera_setup = self.config.get('camera_setup', {})
@@ -333,58 +417,61 @@ class MultiCameraSetup:
         MVInitLib()
         print("[SetupTool]: 相机库已初始化。")
 
-    def bootstrap_id_bindings(self):
-        """
-        不限网段扫描相机，按序列号(id)建立绑定。
-        若 config 中缺少 id_bindings 或与当前检测到的设备不一致，则用检测结果覆盖并保存 config.json。
-        """
-        print("[SetupTool]: 不限网段扫描相机(按序列号)...")
+    def bootstrap_mac_bindings(self):
+        """扫描相机并建立 MAC -> 索引 绑定，写入 config.json 中的 mac_bindings。"""
+        print("[SetupTool]: 扫描相机(按MAC绑定)...")
         res, num_devices = MVEnumerateAllDevices()
         if res != MVST_SUCCESS or num_devices <= 0:
             print("[SetupTool]: 未发现相机设备。")
             return False
-        discovered_ids = []
-        print("[SetupTool]: 发现的设备列表 (索引 -> 序列号):")
+        discovered_macs = []
+        discovered_ips = []
+        print("[SetupTool]: 发现的设备列表 (索引 -> MAC / IP):")
         for i in range(num_devices):
-            # 用 CameraInfo 获取序列号
-            r1, info = MVGetCameraInfo(i)
+            r1, info = MVGetDevInfo(i)
             if r1 == MVST_SUCCESS:
-                try:
-                    sn = info.mSerialNumber.decode('ascii', errors='ignore').strip('\x00')
-                except Exception:
-                    sn = ''
+                mac_str = ":".join([f"{b:02X}" for b in info.mEthernetAddr])
+                ip_str = ".".join(str(x) for x in info.mIpAddr)
             else:
-                sn = ''
-            discovered_ids.append(sn)
-            print(f"  - [{i}] -> SN='{sn}'")
+                mac_str = ''
+                ip_str = ''
+            discovered_macs.append(mac_str)
+            discovered_ips.append(ip_str)
+            print(f"  - [{i}] -> MAC='{mac_str}' IP='{ip_str}'")
 
-        ib = self.camera_setup.get('id_bindings')
+        mb = self.camera_setup.get('mac_bindings')
+        ib = self.camera_setup.get('ip_bindings')
         need_write = False
-        # 兼容老配置: 若仅存在 mac_bindings，则迁移为 id_bindings
-        if not ib:
+        if not mb or not ib:
             need_write = True
         else:
-            # 校验现有绑定是否与当前发现一致（数量/内容）
             try:
-                existing = [ib.get(str(i)) for i in range(len(ib))]
-                if len(existing) != len(discovered_ids) or any((existing[i] or '') != discovered_ids[i] for i in range(min(len(existing), len(discovered_ids)))):
+                existing_mac = [mb.get(str(i)) for i in range(len(mb))]
+                existing_ip = [ib.get(str(i)) for i in range(len(ib))]
+                if (len(existing_mac) != len(discovered_macs)
+                    or any((existing_mac[i] or '') != discovered_macs[i] for i in range(min(len(existing_mac), len(discovered_macs))))
+                    or len(existing_ip) != len(discovered_ips)
+                    or any((existing_ip[i] or '') != discovered_ips[i] for i in range(min(len(existing_ip), len(discovered_ips))))):
                     need_write = True
             except Exception:
                 need_write = True
 
         if need_write:
-            new_map = {str(i): discovered_ids[i] for i in range(len(discovered_ids))}
-            self.camera_setup['id_bindings'] = new_map
-            self.camera_setup.pop('mac_bindings', None)
-            self.camera_setup.setdefault('expected_cameras', len(discovered_ids))
+            new_map = {str(i): discovered_macs[i] for i in range(len(discovered_macs))}
+            new_ip_map = {str(i): discovered_ips[i] for i in range(len(discovered_ips))}
+            self.camera_setup['mac_bindings'] = new_map
+            self.camera_setup['ip_bindings'] = new_ip_map
+            # 清理旧字段
+            self.camera_setup.pop('id_bindings', None)
+            self.camera_setup.setdefault('expected_cameras', len(discovered_macs))
             try:
                 with open('config.json', 'w', encoding='utf-8') as f:
                     json.dump(self.config, f, ensure_ascii=False, indent=2)
-                print(f"[SetupTool]: 已写入/覆盖 id_bindings 到 config.json: {new_map}")
+                print(f"[SetupTool]: 已写入/覆盖 mac_bindings 与 ip_bindings 到 config.json")
             except Exception as e:
                 print(f"[SetupTool]: 写入 config.json 失败: {e}")
         else:
-            print("[SetupTool]: id_bindings 与当前设备一致，跳过写入。")
+            print("[SetupTool]: mac/ip 绑定与当前设备一致，跳过写入。")
         MVUpdateCameraList()
         return True
 

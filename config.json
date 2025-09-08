@@ -2,28 +2,22 @@
   "storage_path": "inspection_results",
   "roi_template_file": "roi_averaged_by_group_CORRECTED.json",
   "system_params": {
-  "pixels_per_mm": 2.735,
-  "camera_capture_interval": 0.1,
-  "use_software_trigger": true,
-  "target_fps": 40 ,
-  "enforce_mono8": true,
-  "default_packet_size_bytes": 8996,
-  "default_packet_delay_us": 12000,
-  "queue_size_factor": 2,
-  "http_client_max_workers": 4,
-  "http_get_timeout_s": 5,
-  "http_post_timeout_s": 5,
-  "http_upload_timeout_s": 15,
-  "stats_push_interval_s": 601,
-  "opencv_threads": 1,
-  "preview_width": 800,
-  "jpeg_quality_main": 85,
-  "jpeg_quality_preview": 75,
-  "coalesce_drain_budget_ms": 5,
-  "coalesce_max_drain": 500,
-  "process_workers": 5,
-  "roi_threads": 2,
-  "max_roi_workers": 3
+    "pixels_per_mm": 2.735,
+    "queue_size_factor": 2,
+    "http_client_max_workers": 4,
+    "http_get_timeout_s": 5,
+    "http_post_timeout_s": 5,
+    "http_upload_timeout_s": 15,
+    "stats_push_interval_s": 601,
+    "opencv_threads": 1,
+    "preview_width": 800,
+    "jpeg_quality_main": 85,
+    "jpeg_quality_preview": 75,
+    "coalesce_drain_budget_ms": 5,
+    "coalesce_max_drain": 500,
+    "process_workers": 5,
+    "roi_threads": 2,
+    "max_roi_workers": 3
   },
   "user_id_auto": 7,
   "user_id_manual": 9999,
@@ -31,26 +25,47 @@
     "open_retry_count": 3,
     "open_retry_backoff_base_s": 2,
     "heartbeat_timeout_ms": 30000,
-  "auto_configure_nics": false,
-  "auto_assign_ips": false,
+    "auto_configure_nics": false,
+    "auto_assign_ips": false,
     "expected_cameras": 5,
-    "id_bindings": {
-      "0": ""
+    "runtime": {
+      "capture_interval_s": 0.1,
+      "use_software_trigger": true,
+      "frame_rate": 10,
+      "enforce_mono8": true,
+      "default_packet_size_bytes": 8996,
+      "default_packet_delay_us": 120
+    },
+    "mac_bindings": {
+      "0": "94:AA:B8:01:FC:E6",
+      "1": "94:AA:B8:01:3A:DF",
+      "2": "94:AA:B8:00:08:A2"
     },
     "unified_params": {
       "acquisition": {
         "width": 2448,
         "height": 2048,
-    "frame_rate": 10,
-    "pixel_format": 17301505
+        "frame_rate": 10,
+        "pixel_format": 17301505
       },
-      "exposure": { "value_us": 800.0 },
-      "gain": { "value_db": 1.2 },
-      "gamma": { "value": 1.0 },
+      "exposure": {
+        "value_us": 800.0
+      },
+      "gain": {
+        "value_db": 1.2
+      },
+      "gamma": {
+        "value": 1.0
+      },
       "network": {
         "packet_size_bytes": 8848,
-        "packet_delay_us": 12000
+        "packet_delay_us": 120
       }
+    },
+    "ip_bindings": {
+      "0": "192.168.1.201",
+      "1": "192.168.1.200",
+      "2": "192.168.1.202"
     }
   },
   "lineName": "Line1",
@@ -63,9 +78,11 @@
   },
   "server_config": {
     "server": "10.185.253.126",
-  "listen_host": "0.0.0.0",
-  "listen_port": 12450,
-  "cors_origins": ["*"],
+    "listen_host": "0.0.0.0",
+    "listen_port": 12450,
+    "cors_origins": [
+      "*"
+    ],
     "upload_url": "http://10.185.253.126:8085/fastapi/glass/uploadWithDefects",
     "stats_push_url": "http://10.185.253.126:8085/fastapi/glass/updateYieldAndRejections",
     "heartbeat_url": "http://10.185.253.126:8085/fastapi/system/heartbeat"
@@ -77,41 +94,41 @@
     "REJECTION_DELAY_S": 2
   },
   "defect_detection_params": {
-        "preprocess_params": {
-            "GAMMA_VALUE": 1,
-            "CANNY_SIGMA": 0.2,
-            "CLAHE_CLIP_LIMIT": 3.0,
-            "CLAHE_TILE_TARGET_PX": 64
-        },
-        "dbscan_params": { 
-            "eps": 12.0, 
-            "min_samples": 3, 
-            "min_points_per_cluster": 120
-        },
+    "preprocess_params": {
+      "GAMMA_VALUE": 1,
+      "CANNY_SIGMA": 0.2,
+      "CLAHE_CLIP_LIMIT": 3.0,
+      "CLAHE_TILE_TARGET_PX": 64
+    },
+    "dbscan_params": {
+      "eps": 12.0,
+      "min_samples": 3,
+      "min_points_per_cluster": 120
+    },
     "contour_params": {
       "min_area": 50000
     },
-        "defect_params": {
-            "PIXELS_PER_MM": 2.735,
-            "ANGLE_NORMAL_TOLERANCE": 4,
-            "ANGLE_BEVEL_TOLERANCE": 10,
-            "ANGLE_MIN_THRESHOLD": 10.0,
-            "ANGLE_MAX_THRESHOLD": 170.0,
-            "ANGLE_BIAS_DEG": 0.6,
-            "ANGLE_SNAP_TO_90_DEADBAND_DEG": 2.0,
-            "ANGLE_SOFT_SNAP_GAIN": 0.5,
-            "ANGLE_SOFT_SNAP_MAX_DEVIATION": 5.0,
-            "ANGLE_REPORT_ROUND_TO": 0.5,
-            "DEFECT_STD_DEV_THRESHOLD": 3,
-            "MIN_DEFECT_AREA_MM2": 1,
-            "MIN_DEFECT_DIMENSION_MM": 1,
-            "MIN_DEFECT_WIDTH_MM": 1,
-            "DEFECT_MERGE_KERNEL_SIZE": 5,
-            "ORIENTATION_PARALLEL_THRESHOLD": 15.0
-        },
-        "drawing_params": {
-            "BOUNDARY_THRESHOLD": 5,
-            "DEFECT_OVERLAY_ALPHA": 0.5
-        }
+    "defect_params": {
+      "PIXELS_PER_MM": 2.735,
+      "ANGLE_NORMAL_TOLERANCE": 4,
+      "ANGLE_BEVEL_TOLERANCE": 10,
+      "ANGLE_MIN_THRESHOLD": 10.0,
+      "ANGLE_MAX_THRESHOLD": 170.0,
+      "ANGLE_BIAS_DEG": 0.6,
+      "ANGLE_SNAP_TO_90_DEADBAND_DEG": 2.0,
+      "ANGLE_SOFT_SNAP_GAIN": 0.5,
+      "ANGLE_SOFT_SNAP_MAX_DEVIATION": 5.0,
+      "ANGLE_REPORT_ROUND_TO": 0.5,
+      "DEFECT_STD_DEV_THRESHOLD": 3,
+      "MIN_DEFECT_AREA_MM2": 5,
+      "MIN_DEFECT_DIMENSION_MM": 5,
+      "MIN_DEFECT_WIDTH_MM": 5,
+      "DEFECT_MERGE_KERNEL_SIZE": 5,
+      "ORIENTATION_PARALLEL_THRESHOLD": 15.0
+    },
+    "drawing_params": {
+      "BOUNDARY_THRESHOLD": 5,
+      "DEFECT_OVERLAY_ALPHA": 0.5
+    }
   }
 }

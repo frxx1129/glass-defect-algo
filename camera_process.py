@@ -29,8 +29,9 @@ def _boost_process_priority_windows():
 
 def _compute_trigger_period_ms(config: dict) -> float:
     """计算软触发周期（毫秒）。默认10fps=100ms；保证周期>=曝光(μs)/1000+2ms。"""
-    sys_cfg = (config.get('system_params') or {}) if isinstance(config, dict) else {}
-    cam_cfg = (config.get('camera_setup') or {}).get('unified_params', {}) if isinstance(config, dict) else {}
+    cs = (config.get('camera_setup') or {}) if isinstance(config, dict) else {}
+    runtime = cs.get('runtime', {}) if isinstance(cs, dict) else {}
+    cam_cfg = cs.get('unified_params', {}) if isinstance(cs, dict) else {}
     # 曝光（默认800us）
     try:
         exp_us = float(((cam_cfg or {}).get('exposure') or {}).get('value_us', 800))
@@ -38,7 +39,10 @@ def _compute_trigger_period_ms(config: dict) -> float:
         exp_us = 800.0
     # 目标帧率（默认10fps）
     try:
-        fps = float(sys_cfg.get('target_fps', 10))
+        fps = float(((cam_cfg.get('acquisition') or {}).get('frame_rate')
+                     or runtime.get('frame_rate')
+                     or runtime.get('target_fps')
+                     or (config.get('system_params') or {}).get('target_fps', 10)))
         if fps <= 0:
             fps = 10.0
     except Exception:
@@ -55,14 +59,19 @@ def _camera_worker_process(cam_index: int, task_queue, stop_event, run_event, co
     from MVGigE import MVStartGrab, MVStopGrab, MVTriggerSoftware, MVST_SUCCESS
     import copy
 
-    # 优先按配置的序列号(id)绑定打开，避免索引歧义
-    id_bindings = (config.get('camera_setup', {}) or {}).get('id_bindings', {})
-    desired_id = None
-    if isinstance(id_bindings, dict):
-        desired_id = id_bindings.get(str(cam_index)) or id_bindings.get(cam_index)
-    elif isinstance(id_bindings, list) and cam_index < len(id_bindings):
-        desired_id = id_bindings[cam_index]
-    cam = CameraManager(cam_index, serial=desired_id)
+    # 读取 MAC 绑定：camera_setup.mac_bindings { index: "AA:BB:CC:DD:EE:FF" }
+    cs = (config.get('camera_setup', {}) or {})
+    mac_bindings = cs.get('mac_bindings', {})
+    ip_bindings = cs.get('ip_bindings', {})
+    desired_mac = None
+    if isinstance(mac_bindings, dict):
+        desired_mac = mac_bindings.get(str(cam_index)) or mac_bindings.get(cam_index)
+    elif isinstance(mac_bindings, list) and cam_index < len(mac_bindings):
+        desired_mac = mac_bindings[cam_index]
+    cam = CameraManager(cam_index, mac=desired_mac)
+    # 注入 ip_bindings 以便在 MAC 列表为空时尝试按 IP 打开
+    if isinstance(ip_bindings, dict):
+        cam.set_ip_bindings(ip_bindings)
     # 从配置注入可调的打开参数
     cm_setup = (config.get('camera_setup') or {}) if isinstance(config, dict) else {}
     try:
@@ -96,7 +105,8 @@ def _camera_worker_process(cam_index: int, task_queue, stop_event, run_event, co
         if 'acquisition' not in unified_params:
             unified_params['acquisition'] = {}
         # 是否强制 Mono8
-        enforce_mono8 = bool((config.get('system_params', {}) or {}).get('enforce_mono8', True))
+        runtime_cfg = (config.get('camera_setup', {}) or {}).get('runtime', {})
+        enforce_mono8 = bool(runtime_cfg.get('enforce_mono8', (config.get('system_params', {}) or {}).get('enforce_mono8', True)))
         if enforce_mono8:
             unified_params['acquisition']['pixel_format'] = int(0x01080001)
 
@@ -207,17 +217,19 @@ def camera_pool_process(task_queue, stop_event, run_event, config, shared_states
     # 1) 初始化与配置 IP
     # 读取可选的采集间隔（秒）：优先 camera_capture_interval，其次 capture_interval；未设置或<=0 表示不限制
     try:
-        _sys = config.get('system_params', {}) if isinstance(config, dict) else {}
-        capture_interval_s = float(_sys.get('camera_capture_interval', _sys.get('capture_interval', 0)) or 0)
+        cs = (config.get('camera_setup') or {}) if isinstance(config, dict) else {}
+        runtime = cs.get('runtime', {}) if isinstance(cs, dict) else {}
+        legacy_sys = (config.get('system_params') or {}) if isinstance(config, dict) else {}
+        capture_interval_s = float(runtime.get('capture_interval_s', legacy_sys.get('camera_capture_interval', legacy_sys.get('capture_interval', 0))) or 0)
         if capture_interval_s < 0:
             capture_interval_s = 0.0
-        use_soft_trigger = bool(_sys.get('use_software_trigger', False))
+        use_soft_trigger = bool(runtime.get('use_software_trigger', legacy_sys.get('use_software_trigger', False)))
     except Exception:
         capture_interval_s = 0.0
         use_soft_trigger = False
     setup_tool = MultiCameraSetup(config)
     # 1) 启动阶段：不限网段发现相机MAC，并在缺失时写入 config
-    setup_tool.bootstrap_id_bindings()
+    setup_tool.bootstrap_mac_bindings()
     # 3) 可选：自动配置本机网卡到不同网段（谨慎使用，需管理员权限）
     if (config.get('camera_setup', {}) or {}).get('auto_configure_nics', False):
         setup_tool.auto_configure_nics()
@@ -239,14 +251,16 @@ def camera_pool_process(task_queue, stop_event, run_event, config, shared_states
         acq = (config.get('camera_setup', {}) or {}).get('unified_params', {}).get('acquisition', {})
         cam_w = int(acq.get('width', 1280) or 1280)
         cam_h = int(acq.get('height', 960) or 960)
-        frame_rate = float(acq.get('frame_rate', _sys.get('target_fps', 15)) or _sys.get('target_fps', 15) or 15)
+        runtime = (config.get('camera_setup') or {}).get('runtime', {})
+        legacy_sys = (config.get('system_params') or {})
+        frame_rate = float(acq.get('frame_rate', runtime.get('frame_rate', legacy_sys.get('target_fps', 15))) or runtime.get('target_fps', legacy_sys.get('target_fps', 15)) or 15)
         # 设定每“行”间隔 = 1/frame_rate 秒 -> 每个相机每秒也近似输出 frame_rate 帧
         row_interval = 1.0 / max(1.0, frame_rate)
         # 垂直步进像素：使得完整穿过高度大约需要 cam_h / step_px 行；设置为高度 / (frame_rate * 6) 约 6 秒穿过
         step_px = max(1, int(cam_h / (frame_rate * 6)))
         # 读取可选的玻璃宽度控制参数
-        pane_width_factor = float(_sys.get('test_scene_width_factor', 0.95) or 0.95)
-        pane_margin_px = _sys.get('test_scene_margin_px')
+        pane_width_factor = float(runtime.get('test_scene_width_factor', legacy_sys.get('test_scene_width_factor', 0.95)) or 0.95)
+        pane_margin_px = runtime.get('test_scene_margin_px', legacy_sys.get('test_scene_margin_px'))
         try:
             pane_margin_px = int(pane_margin_px) if pane_margin_px is not None else None
         except Exception:
