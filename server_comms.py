@@ -58,45 +58,40 @@ def fetch_initial_state_from_server(settings):
 
 
 def fetch_collection_id_from_server(settings, collection_id_var):
-    """在剔废前，调用此函数从服务器主动获取Collection ID"""
+    """获取 Collection ID (整数)，失败写入 -1。"""
     print(f"    [HTTP]: 准备获取 collection_id...")
     try:
-        # 使用传入的参数，而不是全局变量
         server_ip = settings.server
         line_name = settings.lineName
         target_url = f"http://{server_ip}:8085/fastapi/glass/getTodayCollectionByLine"
-        print(f"    [HTTP]: 正在向服务器请求 ({line_name})...")
         request_url = f"{target_url}?lineName={line_name}"
+        print(f"    [HTTP]: 正在向服务器请求 ({line_name})...")
         response = requests.get(request_url, timeout=getattr(settings, 'http_get_timeout_s', 5))
-        
         if response.status_code == 200:
-            json_data = response.json()
-            data = json_data.get("data")
-            
-            if data and isinstance(data, dict):
-                new_id = data.get("id")
-                if new_id is not None:
-                    # 更新传入的共享变量
-                    collection_id_var.value = str(new_id).encode('utf-8')
-                    print(f"    [HTTP]: 成功获取并更新 Collection ID")
+            json_data = response.json(); data = json_data.get("data")
+            if isinstance(data, dict) and data.get("id") is not None:
+                try:
+                    collection_id_var.value = int(data.get("id"))
+                except Exception:
+                    collection_id_var.value = -1
+                if collection_id_var.value >= 0:
+                    print("    [HTTP]: 成功获取并更新 Collection ID")
                 else:
-                    print(f"    [HTTP]: 错误 - 数据中未找到 'id' 字段。")
-                    collection_id_var.value = b'error'
+                    print("    [HTTP]: ID 解析失败 -> -1")
             else:
-                print(f"    [HTTP]: 错误 - 响应中未找到有效的 'data' 字段。")
-                collection_id_var.value = b'error'
+                print("    [HTTP]: 响应缺少有效 data.id")
+                collection_id_var.value = -1
         else:
             host = _host_only(request_url)
             print(f"    [HTTP]: 请求失败 -> {host}")
-            collection_id_var.value = b'error'
-            
+            collection_id_var.value = -1
     except Exception:
         try:
             host = _host_only(target_url)
         except Exception:
             host = "<unknown>"
         print(f"    [HTTP]: 网络/未知异常 -> {host}")
-        collection_id_var.value = b'error'
+        collection_id_var.value = -1
 
 # =================================================================
 # --- 以下函数被修改为非阻塞 ---
@@ -115,24 +110,12 @@ def periodic_stats_pusher(stop_event, counters, settings, metadata_vars, http_cl
 
         # 获取ID仍然是同步的，因为我们需要它来构建payload
         fetch_collection_id_from_server(settings, collection_id_var)
-        if collection_id_var.value == b'error':
+        if int(collection_id_var.value) < 0:
             print("    [统计推送]: 获取 collection_id 失败，跳过本次推送。")
             continue
 
-        # 将 collection_id 从 bytes/str 解析为整数
-        cid_raw = collection_id_var.value
-        try:
-            if isinstance(cid_raw, (bytes, bytearray)):
-                cid_str = cid_raw.decode('utf-8', errors='replace')
-            else:
-                cid_str = str(cid_raw)
-            cid_int = int(cid_str)
-        except Exception:
-            print("    [统计推送]: collection_id 解析为整数失败，跳过本次推送。")
-            continue
-
         payload = {
-            "collectionId": cid_int,
+            "collectionId": int(collection_id_var.value),
             "lineName": settings.lineName,
             "yield": int(yield_counter.value),
             "rejection": int(rejection_counter.value)
@@ -147,7 +130,11 @@ def periodic_stats_pusher(stop_event, counters, settings, metadata_vars, http_cl
 
 def send_report_to_server(json_report, image_buffer, server_url, http_client, upload_timeout_s: float | None = None):
     """(修改) 使用非阻塞客户端上传缺陷报告。"""
-    collection_id = json_report.get("collection_id", "unknown")
+    collection_id = json_report.get("collection_id", -1)
+    try:
+        collection_id = int(collection_id)
+    except Exception:
+        collection_id = -1
     rejection_time_str = json_report.get("rejection_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     try:
         rejection_dt = datetime.strptime(rejection_time_str, "%Y-%m-%d %H:%M:%S")

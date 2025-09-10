@@ -59,11 +59,20 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         label_parts = [p for p in [size_part, "X" if has_x_defect else "", "Q" if has_q_defect else ""] if p]
         final_size_label = ",".join(label_parts)
         
-        collection_id = shared_collection_id.value
+        # 处理 collection_id：共享内存中存储为 bytes，需要转换为可 JSON 序列化的 str / int
+        raw_cid = shared_collection_id.value
+        # 直接解析为整数，不可解析则为 -1
+        try:
+            if isinstance(raw_cid, (bytes, bytearray)):
+                collection_id = int(raw_cid.decode('utf-8', errors='ignore').strip() or -1)
+            else:
+                collection_id = int(raw_cid)
+        except Exception:
+            collection_id = -1
         user_id = shared_user_id_manual.value if rejection_details_to_save.get("rejection_type") == "2" else shared_user_id_auto.value
         
         report = {
-            "collection_id": collection_id,
+            "collection_id": int(collection_id),
             "rejection_type": rejection_details_to_save.get("rejection_type", "unknown"),
             "rejection_time": rejection_details_to_save.get("rejection_time", datetime.now()).strftime("%Y-%m-%d %H:%M:%S"),
             "userId": user_id,

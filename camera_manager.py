@@ -33,18 +33,21 @@ class CameraManager:
             cls._lib_initialized = False
 
     def __init__(self, cam_index, ip: str | None = None, mac: str | None = None):
-        # 基本属性
-        self.cam_index = cam_index
-        self.ip = ip
-        self.mac = mac
-        self.handle = 0
-        self.opened_index = None
-        # 绑定映射（由上层注入）
-        self._ip_bindings: dict | None = None  # { index(str): ip }
-        # 可配置：重试次数、退避基数（秒）、心跳超时（毫秒）
-        self.max_open_attempts = 3
-        self.open_backoff_base_s = 2
-        self.heartbeat_timeout_ms = 30000
+            # 基本属性
+            self.cam_index = cam_index
+            self.ip = ip
+            self.mac = mac
+            self.handle = 0
+            self.opened_index = None
+            # 绑定映射（由上层注入）
+            self._ip_bindings = None  # { index(str): ip }
+            # 可配置：重试次数、退避基数（秒）、心跳超时（毫秒）
+            self.max_open_attempts = 3
+            self.open_backoff_base_s = 2
+            self.heartbeat_timeout_ms = 30000
+            # 记录是否已经尝试过自动强制分配临时IP，避免死循环
+            self._force_ip_attempted = False
+            self._last_forced_ip = None  # type: ignore
 
     def set_ip_bindings(self, ip_bindings: dict | None):
         """允许外部注入 index->IP 映射。"""
@@ -143,7 +146,19 @@ class CameraManager:
                                 except Exception:
                                     pass
                     if not self.handle:
-                        print(f"[相机进程 {self.cam_index}]: 未匹配到 MAC={self.mac}，放弃。")
+                        print(f"[相机进程 {self.cam_index}]: 未匹配到 MAC={self.mac}，准备尝试临时分配IP (MVForceIp)...")
+                        if self._attempt_force_temp_ip():
+                            # 如果成功分配了新的IP，则尝试直接按新IP打开
+                            if self._last_forced_ip:
+                                print(f"[相机进程 {self.cam_index}]: 尝试使用临时IP {self._last_forced_ip} 打开...")
+                                r_forced, h_forced = MVOpenCamByIP(self._last_forced_ip)
+                                if r_forced == MVST_SUCCESS and h_forced != 0:
+                                    self.handle = h_forced
+                                    self.ip = self._last_forced_ip
+                                    print(f"[相机进程 {self.cam_index}]: 通过临时IP 打开成功。")
+                                    return True
+                        # 若仍未成功
+                        print(f"[相机进程 {self.cam_index}]: 临时IP 分配流程未成功，放弃。")
                         return False
                 else:
                     print(f"[相机进程 {self.cam_index}]: 通过MAC打开相机 {self.mac} (索引 {found_idx})...")
@@ -217,8 +232,125 @@ class CameraManager:
                 time.sleep(wait_time)
         
         # 如果所有尝试都失败了
+        # 在完全失败后最后再尝试一次自动分配临时IP（若未尝试过且有MAC）
+        if self.mac and not self._force_ip_attempted:
+            print(f"[相机进程 {self.cam_index}]: 正常打开失败，尝试最后的临时IP分配...")
+            if self._attempt_force_temp_ip():
+                if self._last_forced_ip:
+                    print(f"[相机进程 {self.cam_index}]: 使用最后分配的临时IP {self._last_forced_ip} 重试打开...")
+                    r2, h2 = MVOpenCamByIP(self._last_forced_ip)
+                    if r2 == MVST_SUCCESS and h2 != 0:
+                        self.handle = h2
+                        self.ip = self._last_forced_ip
+                        print(f"[相机进程 {self.cam_index}]: 通过临时IP 打开成功。")
+                        return True
         print(f"❌ [相机进程 {self.cam_index}]: 经过 {self.max_open_attempts} 次尝试后，仍无法打开相机。")
         return False
+
+    # ---------------- 内部辅助：强制分配临时IP -----------------
+    def _attempt_force_temp_ip(self) -> bool:
+        """当相机无法按既定方式打开时：
+        1. 枚举全部设备，找到匹配MAC的相机结构(即使跨网段)。
+        2. 采集本机以太网IPv4（排除虚拟/WLAN），选一个基地址；如果有配置的 self.ip 且前三段与某网卡一致，优先该网卡。
+        3. 构造临时IP：基地址最后一段+1（若冲突则+2, +3 直到 <254）。
+        4. 使用 MVForceIp 设置，等待并刷新列表。
+        返回是否成功发送 Force IP 指令。
+        """
+        if self._force_ip_attempted:
+            return False
+        self._force_ip_attempted = True
+        if not self.mac:
+            return False
+        target_mac_norm = self.mac.upper().replace('-', ':')
+        try:
+            res_all, all_cnt = MVEnumerateAllDevices()
+            if res_all != MVST_SUCCESS or all_cnt <= 0:
+                print(f"[相机进程 {self.cam_index}]: ForceIp 前枚举失败。")
+                return False
+            matched_cam_info = None
+            for j in range(all_cnt):
+                r_info, info = MVGetDevInfo(j)
+                if r_info == MVST_SUCCESS:
+                    mac_j = ':'.join([f"{b:02X}" for b in info.mEthernetAddr])
+                    if mac_j.upper() == target_mac_norm:
+                        matched_cam_info = info
+                        break
+            if not matched_cam_info:
+                print(f"[相机进程 {self.cam_index}]: 未在全量枚举中找到用于 ForceIp 的目标MAC。")
+                return False
+            # 收集本机网卡IPv4
+            nic_ips = self._collect_nic_ipv4()
+            base_ip = None
+            if self.ip:
+                ip_prefix = '.'.join(self.ip.split('.')[:3]) + '.'
+                for nic in nic_ips:
+                    if nic.startswith(ip_prefix):
+                        base_ip = nic
+                        break
+            if not base_ip:
+                base_ip = nic_ips[0] if nic_ips else '192.168.10.1'
+            parts = base_ip.split('.')
+            try:
+                base_host = int(parts[3])
+            except Exception:
+                base_host = 1
+            # 生成候选 host (base+1, +2, +3 ...)
+            candidate_ip = None
+            for offset in range(1, 10):
+                host_val = base_host + offset
+                if host_val >= 254:
+                    break
+                candidate_ip = '.'.join(parts[:3] + [str(host_val)])
+                # 可以添加：避免与已知网卡地址或已发现相机IP冲突（简单跳过与 base 相同）
+                if candidate_ip != base_ip:
+                    break
+            if not candidate_ip:
+                print(f"[相机进程 {self.cam_index}]: 无法生成候选临时IP。")
+                return False
+            subnet_mask = '255.255.255.0'
+            default_gw = '0.0.0.0'
+            print(f"[相机进程 {self.cam_index}]: 发送 ForceIp -> {candidate_ip}")
+            res_force = MVForceIp(matched_cam_info.mEthernetAddr, candidate_ip.encode('ascii'), subnet_mask.encode('ascii'), default_gw.encode('ascii'))
+            if res_force == MVST_SUCCESS:
+                self._last_forced_ip = candidate_ip
+                print(f"[相机进程 {self.cam_index}]: ForceIp 指令成功，下次尝试将使用 {candidate_ip}")
+                time.sleep(2.0)
+                MVUpdateCameraList()
+                return True
+            else:
+                print(f"[相机进程 {self.cam_index}]: ForceIp 失败，错误码 {res_force}")
+                return False
+        except Exception as e:
+            print(f"[相机进程 {self.cam_index}]: ForceIp 流程异常: {e}")
+            return False
+
+    @staticmethod
+    def _collect_nic_ipv4():
+        """收集本机物理以太网IPv4地址列表。"""
+        ips = []
+        try:
+            import subprocess, re
+            output = subprocess.check_output(['ipconfig', '/all'], shell=True)
+            try:
+                text = output.decode('utf-8', errors='ignore')
+            except Exception:
+                text = output.decode('gbk', errors='ignore')
+            sections = re.split(r"\r?\n\r?\n", text)
+            for sec in sections:
+                header_match = re.search(r"^(.*?):\s*$", sec, flags=re.MULTILINE)
+                if not header_match:
+                    continue
+                header = header_match.group(1)
+                hl = header.lower()
+                if (('ethernet' in hl or '以太网' in hl) and not any(x in hl for x in ['wlan', 'wi-fi', '无线', 'bluetooth', '蓝牙', 'vmware', 'virtual', 'hyper-v', 'vethernet'])):
+                    m = re.search(r"IPv4 (?:地址|Address)[^:]*: ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", sec)
+                    if m:
+                        ip = m.group(1)
+                        if not ip.startswith('127.'):
+                            ips.append(ip)
+        except Exception:
+            pass
+        return ips
 
     def close(self):
         """关闭相机并释放库资源。"""

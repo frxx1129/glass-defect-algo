@@ -155,7 +155,8 @@ def main():
     machine_state_shared = manager.Value('i', 0)
     shared_rejection_mode = manager.Value('i', 2) # Default to manual
     can_late_reject = manager.Value('b', False)
-    shared_collection_id = manager.Value('c', b'N/A')
+    # collection_id 使用整数共享类型
+    shared_collection_id = manager.Value('i', -1)
     shared_user_id_auto = manager.Value('i', config.get('user_id_auto', 7))
     shared_user_id_manual = manager.Value('i', config.get('user_id_manual', 9999))
 

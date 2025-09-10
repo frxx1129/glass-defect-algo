@@ -89,8 +89,25 @@ class NonBlockingHttpClient:
         # 为了传递files参数，我们需要一个专用的工作函数
         def _upload_task():
             try:
+                # --- 新增: 递归清洗 JSON 数据中的 bytes，避免 json.dumps 抛出 TypeError ---
+                def _sanitize(obj):
+                    if isinstance(obj, (bytes, bytearray)):
+                        # 尝试 utf-8 解码；失败则转 base64 文本，保证可 JSON 序列化
+                        try:
+                            return obj.decode('utf-8')
+                        except Exception:
+                            import base64
+                            return base64.b64encode(obj).decode('ascii')
+                    if isinstance(obj, dict):
+                        return {k: _sanitize(v) for k, v in obj.items()}
+                    if isinstance(obj, list):
+                        return [_sanitize(v) for v in obj]
+                    if isinstance(obj, tuple):
+                        return tuple(_sanitize(v) for v in obj)
+                    return obj
+                safe_payload = _sanitize(json_payload)
                 # 构建 multipart/form-data
-                payload_tuple = ('payload', (None, json.dumps(json_payload, ensure_ascii=False), 'application/json'))
+                payload_tuple = ('payload', (None, json.dumps(safe_payload, ensure_ascii=False), 'application/json'))
                 all_files = [('file', files), payload_tuple]
 
                 to = 15 if timeout_s is None else float(timeout_s)
