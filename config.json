@@ -95,10 +95,10 @@
   },
   "defect_detection_params": {
     "preprocess_params": {
-      "GAMMA_VALUE": 0.88,
-      "CANNY_SIGMA": 0.36,
-      "CLAHE_CLIP_LIMIT": 3.2,
-      "CLAHE_TILE_TARGET_PX": 32
+      "GAMMA_VALUE": 0.612,
+      "CANNY_SIGMA": 0.097,
+      "CLAHE_CLIP_LIMIT": 4.20,
+      "CLAHE_TILE_TARGET_PX": 27
     },
     "dbscan_params": {
       "eps": 10.0,
@@ -106,7 +106,7 @@
       "min_points_per_cluster": 50
     },
     "contour_params": {
-      "min_area": 2000
+      "min_area": 23333
     },
     "defect_params": {
       "PIXELS_PER_MM": 2.735,
@@ -119,16 +119,22 @@
       "ANGLE_SOFT_SNAP_GAIN": 0.5,
       "ANGLE_SOFT_SNAP_MAX_DEVIATION": 5.0,
       "ANGLE_REPORT_ROUND_TO": 0.5,
-      "DEFECT_STD_DEV_THRESHOLD": 2,
+      "DEFECT_STD_DEV_THRESHOLD": 2.886,
       "MIN_DEFECT_AREA_MM2": 5,
-      "MIN_DEFECT_DIMENSION_MM": 1,
-      "MIN_DEFECT_WIDTH_MM": 1,
-      "DEFECT_MERGE_KERNEL_SIZE": 5,
+      "MIN_DEFECT_DIMENSION_MM": 3.5,
+      "MIN_DEFECT_WIDTH_MM": 3.5,
+      "DEFECT_MERGE_KERNEL_SIZE": 4,
       "ORIENTATION_PARALLEL_THRESHOLD": 15.0
     },
     "drawing_params": {
       "BOUNDARY_THRESHOLD": 5,
-      "DEFECT_OVERLAY_ALPHA": 0.5
+      "DEFECT_OVERLAY_ALPHA": 0.5,
+      "RAW_CONTOUR_COLOR": [0,255,0],
+      "RAW_CONTOUR_THICKNESS": 2,
+      "SIMPLIFIED_CONTOUR_COLOR": [0,0,255],
+      "SIMPLIFIED_CONTOUR_THICKNESS": 1,
+      "DEFECT_CONTOUR_MASK_THICKNESS": 7,
+      "DEBUG_TRACE": false
     }
   }
 }

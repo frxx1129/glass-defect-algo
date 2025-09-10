@@ -398,13 +398,55 @@ def connect_border_points_advanced(edges_image, direction='cw'):
     h, w = edges_image.shape
     closed_edges_image = edges_image.copy()
 
-    # 1. 获取所有边界点
+    # 1. 获取所有边界点 (原始点集)
     point_lists = {
         "top": sorted([(x, 0) for x in range(w) if edges_image[0, x] > 0], key=lambda p: p[0]),
         "bottom": sorted([(x, h-1) for x in range(w) if edges_image[h-1, x] > 0], key=lambda p: p[0]),
         "left": sorted([(0, y) for y in range(h) if edges_image[y, 0] > 0], key=lambda p: p[1]),
         "right": sorted([(w-1, y) for y in range(h) if edges_image[y, w-1] > 0], key=lambda p: p[1])
     }
+    # 保留原始点集合副本（便于调试或未来可视化）
+    _original_point_lists_for_debug = {k: v[:] for k, v in point_lists.items()}
+
+    # 1.1 连接阶段点合并：对所有边界点做半径聚类 (r<10) 以减少密集重复点，仅影响连接推理，不改动原图
+    merge_thresh = 10.0
+    raw_points_all = point_lists["top"] + point_lists["bottom"] + point_lists["left"] + point_lists["right"]
+    if len(raw_points_all) > 1:
+        # 角点 (保持原样不参与合并)
+        corner_points = {(0, 0), (w-1, 0), (0, h-1), (w-1, h-1)}
+        non_corner_points = [p for p in raw_points_all if p not in corner_points]
+        r2 = merge_thresh * merge_thresh
+        clusters = []  # 每簇: [cx, cy, n]
+        for (px, py) in non_corner_points:
+            placed = False
+            for c in clusters:
+                cx, cy, n = c
+                if (px - cx)**2 + (py - cy)**2 <= r2:
+                    n_new = n + 1
+                    c[0] = cx + (px - cx) / n_new  # 增量均值
+                    c[1] = cy + (py - cy) / n_new
+                    c[2] = n_new
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([float(px), float(py), 1])
+        merged_points = [(int(round(c[0])), int(round(c[1]))) for c in clusters]
+        # 合并结果 + 原始角点
+        merged_points.extend(list(corner_points & set(raw_points_all)))
+
+        reassigned = {"top": [], "bottom": [], "left": [], "right": []}
+        for (mx, my) in merged_points:
+            if my == 0: reassigned["top"].append((mx, my))
+            elif my == h - 1: reassigned["bottom"].append((mx, my))
+            elif mx == 0: reassigned["left"].append((mx, my))
+            elif mx == w - 1: reassigned["right"].append((mx, my))
+        point_lists = {
+            "top": sorted(set(reassigned["top"]), key=lambda p: p[0]),
+            "bottom": sorted(set(reassigned["bottom"]), key=lambda p: p[0]),
+            "left": sorted(set(reassigned["left"]), key=lambda p: p[1]),
+            "right": sorted(set(reassigned["right"]), key=lambda p: p[1])
+        }
+
     all_border_points = point_lists["top"] + point_lists["bottom"] + point_lists["left"] + point_lists["right"]
     if len(all_border_points) < 2:
         return closed_edges_image
@@ -769,14 +811,22 @@ def _correct_right_angle_numeric(angle_deg, d_cfg):
         
 def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config, draw_main_contour=True):
     # --- 1. 初始化 ---
-    p_cfg = config.get('preprocess_params', {})
-    dbscan_cfg = config.get('dbscan_params', {})
-    contour_cfg = config.get('contour_params', {})
-    d_cfg = config.get('defect_params', {})
-    dr_cfg = config.get('drawing_params', {})
+    # 兼容两种配置结构：顶层平铺 / defect_detection_params 嵌套
+    dd_cfg = config.get('defect_detection_params', {}) if isinstance(config, dict) else {}
+    p_cfg = config.get('preprocess_params') or dd_cfg.get('preprocess_params', {})
+    dbscan_cfg = config.get('dbscan_params') or dd_cfg.get('dbscan_params', {})
+    contour_cfg = config.get('contour_params') or dd_cfg.get('contour_params', {})
+    d_cfg = config.get('defect_params') or dd_cfg.get('defect_params', {})
+    dr_cfg = config.get('drawing_params') or dd_cfg.get('drawing_params', {})
 
     # 预取常量，避免循环中反复 dict 查找
     boundary_threshold = dr_cfg.get('BOUNDARY_THRESHOLD', 10)
+    raw_contour_color = tuple(dr_cfg.get('RAW_CONTOUR_COLOR', [0, 255, 0]))  # 绿色更醒目
+    raw_contour_thickness = int(dr_cfg.get('RAW_CONTOUR_THICKNESS', 2))
+    simplified_color = tuple(dr_cfg.get('SIMPLIFIED_CONTOUR_COLOR', [0, 0, 255]))
+    simplified_thickness = int(dr_cfg.get('SIMPLIFIED_CONTOUR_THICKNESS', 1))
+    mask_line_thickness = int(dr_cfg.get('DEFECT_CONTOUR_MASK_THICKNESS', 3))
+    debug_trace = bool(dr_cfg.get('DEBUG_TRACE', False))
     angle_min = d_cfg.get('ANGLE_MIN_THRESHOLD', 10.0)
     angle_max = d_cfg.get('ANGLE_MAX_THRESHOLD', 170.0)
     bevel_tol = d_cfg.get('ANGLE_BEVEL_TOLERANCE', 2.5)
@@ -821,6 +871,7 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
 
     cleaned_edges = np.zeros_like(canny_edges)
     canny_points_yx = np.argwhere(canny_edges == 255)
+    canny_points_count = int(canny_points_yx.shape[0])
     if canny_points_yx.shape[0] >= dbscan_cfg.get('min_points_per_cluster', 100):
         # 限流/下采样，避免 DBSCAN 过慢
         max_points = int(dbscan_cfg.get('max_points', 8000))
@@ -834,27 +885,41 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
             all_cleaned_points = np.vstack(cleaned_point_clusters)
             # 矢量化一次性赋值，替代逐点 for 写入
             cleaned_edges[all_cleaned_points[:, 1], all_cleaned_points[:, 0]] = 255
+            cleaned_points_count = int(all_cleaned_points.shape[0])
+        else:
+            cleaned_points_count = 0
+    else:
+        cleaned_points_count = 0
 
     connection_direction = _determine_connection_direction(roi_original)
 
     closed_wireframe = connect_border_points_advanced(cleaned_edges, direction=connection_direction)
     contours, _ = cv2.findContours(closed_wireframe, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    valid_polygons_raw = [p for p in contours if cv2.contourArea(p) > contour_cfg.get('min_area', 5000)] if contours else []
+    min_area_cfg = contour_cfg.get('min_area', 5000)
+    valid_polygons_raw = [p for p in contours if cv2.contourArea(p) > min_area_cfg] if contours else []
 
     # --- Fallback: 若按原规则仍无轮廓，尝试一次“每条边连接最远点” ---
     if not valid_polygons_raw:
         try:
-            # 回退阶段仅允许使用“cleaned_edges”中的点；若为空直接放弃回退
+            # 第二次连接才使用最远点策略；若 cleaned_edges 为空则不启用新策略
             if not cleaned_edges.any():
-                raise RuntimeError("fallback skipped: no cleaned edge points")
+                raise RuntimeError("skip new connection strategy: no cleaned edges")
             edge_src = cleaned_edges
             h_loc, w_loc = edge_src.shape[:2]
             fallback_wire = np.zeros_like(edge_src)
             # 收集四边点 (局部 ROI 坐标)
-            top_pts = [(int(x), 0) for x in np.where(edge_src[0, :] == 255)[0]]
-            bot_pts = [(int(x), h_loc - 1) for x in np.where(edge_src[h_loc - 1, :] == 255)[0]] if h_loc > 1 else []
-            left_pts = [(0, int(y)) for y in np.where(edge_src[:, 0] == 255)[0]]
-            right_pts = [(w_loc - 1, int(y)) for y in np.where(edge_src[:, w_loc - 1] == 255)[0]] if w_loc > 1 else []
+            # 收集四边点（排除四个角点）
+            corners = {(0,0), (w_loc-1,0), (0,h_loc-1), (w_loc-1,h_loc-1)}
+            top_pts = [(int(xx), 0) for xx in np.where(edge_src[0, :] == 255)[0]]
+            bot_pts = [(int(xx), h_loc - 1) for xx in np.where(edge_src[h_loc - 1, :] == 255)[0]] if h_loc > 1 else []
+            left_pts = [(0, int(yy)) for yy in np.where(edge_src[:, 0] == 255)[0]]
+            right_pts = [(w_loc - 1, int(yy)) for yy in np.where(edge_src[:, w_loc - 1] == 255)[0]] if w_loc > 1 else []
+            def _exclude_corners(pts):
+                return [p for p in pts if p not in corners]
+            top_pts = _exclude_corners(top_pts)
+            bot_pts = _exclude_corners(bot_pts)
+            left_pts = _exclude_corners(left_pts)
+            right_pts = _exclude_corners(right_pts)
 
             def _connect_farthest(pts):
                 if len(pts) < 2:
@@ -879,7 +944,7 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
 
             if fallback_wire.any():
                 contours2, _ = cv2.findContours(fallback_wire, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                valid_polygons_raw = [p for p in contours2 if cv2.contourArea(p) > contour_cfg.get('min_area', 5000)] if contours2 else []
+                valid_polygons_raw = [p for p in contours2 if cv2.contourArea(p) > min_area_cfg] if contours2 else []
                 if valid_polygons_raw:
                     closed_wireframe = fallback_wire  # 使用回退结果
         except Exception:
@@ -894,7 +959,9 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
     for raw_contour, simplified_contour in zip(valid_polygons_raw, final_simplified_polygons):
         roi_report["polygons_in_roi"] += 1
         if draw_main_contour:
-            cv2.polylines(roi_color, [raw_contour], isClosed=True, color=(255, 0, 0), thickness=1)
+            cv2.polylines(roi_color, [raw_contour], isClosed=True, color=raw_contour_color, thickness=raw_contour_thickness)
+            if simplified_contour is not None and len(simplified_contour) >= 3:
+                cv2.polylines(roi_color, [simplified_contour], isClosed=True, color=simplified_color, thickness=simplified_thickness)
 
         vertices_f32 = simplified_contour.reshape(-1, 2).astype(np.float32, copy=False)
         n = len(vertices_f32)
@@ -927,7 +994,7 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
             anomaly_mask = cv2.bitwise_and(anomaly_mask, mask)
 
             contour_line_mask = np.zeros(roi_original.shape, dtype=np.uint8)
-            cv2.polylines(contour_line_mask, [raw_contour], isClosed=True, color=255, thickness=6)
+            cv2.polylines(contour_line_mask, [raw_contour], isClosed=True, color=255, thickness=mask_line_thickness)
             anomaly_mask = cv2.subtract(anomaly_mask, contour_line_mask)
 
             if merge_kernel is not None:
@@ -980,6 +1047,17 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
                                   "length_mm": round(length_mm, 2), "width_mm": round(width_mm, 2) }
                 })
 
+    if debug_trace:
+        try:
+            roi_report['debug'] = {
+                'canny_points': canny_points_count,
+                'cleaned_points': cleaned_points_count,
+                'contours_found': int(len(contours) if contours is not None else 0),
+                'valid_polygons': int(len(valid_polygons_raw)),
+                'simplified_polygons': int(len(final_simplified_polygons)),
+            }
+        except Exception:
+            pass
     return roi_report, roi_color
 
 def process_image_from_memory_serial(image_gray, template_rois, config, draw_contours=False):
@@ -987,7 +1065,7 @@ def process_image_from_memory_serial(image_gray, template_rois, config, draw_con
     (新增) 按顺序串行处理图像中的所有ROI。
     """
     final_image = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
-    report = {"image_status": "OK", "defects": []}
+    report = {"image_status": "OK", "defects": [], "rois": []}
     results = []
 
     # 使用简单的 for 循环代替线程池
@@ -1018,6 +1096,10 @@ def process_image_from_memory_serial(image_gray, template_rois, config, draw_con
         if roi_report.get("defects"):
             report["image_status"] = "NG"
             report["defects"].extend(roi_report["defects"])
+        slim = {k: roi_report.get(k) for k in ("roi_idx","x","y","w","h","polygons_in_roi")}
+        if 'debug' in roi_report:
+            slim['debug'] = roi_report['debug']
+        report['rois'].append(slim)
     report["state_code"] = min(max_polygons_in_any_roi, 2)
     print(report["state_code"])
     return report, final_image
@@ -1025,7 +1107,7 @@ def process_image_from_memory_serial(image_gray, template_rois, config, draw_con
 def process_image_from_memory_parallel(image_gray, template_rois, config, draw_contours=True):
     # (新) 增加了 draw_contours 参数传递
     final_image = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
-    report = {"image_status": "OK", "defects": [] , "state_code": 0}
+    report = {"image_status": "OK", "defects": [] , "state_code": 0, "rois": []}
 
     sys_params = config.get('system_params', {})
     # 新参数 roi_threads 控制每帧 ROI 并行度；旧 max_roi_workers 兼容作为回退
@@ -1077,6 +1159,10 @@ def process_image_from_memory_parallel(image_gray, template_rois, config, draw_c
         if roi_report.get("defects"):
             report["image_status"] = "NG"
             report["defects"].extend(roi_report["defects"])
+        slim = {k: roi_report.get(k) for k in ("roi_idx","x","y","w","h","polygons_in_roi")}
+        if 'debug' in roi_report:
+            slim['debug'] = roi_report['debug']
+        report['rois'].append(slim)
 
     report["state_code"] = min(max_polygons_in_any_roi, 2)
     return report, final_image

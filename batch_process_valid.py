@@ -36,7 +36,7 @@ def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
 
 
-def process_single_image(img_path, template_rois, config, out_dir, draw_contours=False, debug_intermediates=False):
+def process_single_image(img_path, template_rois, config, out_dir, draw_contours=True, debug_intermediates=False):
     # 直接调用算法顶层接口，自动处理读图/输出
     t0 = time.time()
     report = image_processor_optimized.process_image(
@@ -61,7 +61,7 @@ def process_single_image(img_path, template_rois, config, out_dir, draw_contours
             print(f"[调试导出失败]: {base}: {e}")
 
 def _export_intermediates(img_path, template_rois, config, out_dir):
-    """仅生成并保存边框连接(补全)后的二值结果。"""
+    """生成边框连接结果 + 多边形拟合轮廓（亮度检测前阶段）。"""
     img_gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
     if img_gray is None:
         print(f"[调试]: 无法读取图像 {img_path}")
@@ -71,8 +71,9 @@ def _export_intermediates(img_path, template_rois, config, out_dir):
     inter_dir = os.path.join(out_dir, 'intermediates')
     os.makedirs(inter_dir, exist_ok=True)
 
-    # 仅保留边框补全画布
+    # 画布：边框补全 + 多边形拟合可视化
     border_canvas = np.zeros((H, W), dtype=np.uint8)
+    poly_canvas = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
 
     # 取配置片段
     p_cfg = config.get('defect_detection_params', {}).get('preprocess_params', {})
@@ -83,6 +84,7 @@ def _export_intermediates(img_path, template_rois, config, out_dir):
     preprocess_roi = image_processor_optimized.preprocess_roi_enhanced
     cluster_fn = image_processor_optimized.cluster_points_with_dbscan
     connect_fn = image_processor_optimized.connect_border_points_advanced
+    simplify_fn = image_processor_optimized.find_best_fit_polygon
     direction_fn = image_processor_optimized._determine_connection_direction  # noqa: protected-access
 
     for r in template_rois:
@@ -122,14 +124,47 @@ def _export_intermediates(img_path, template_rois, config, out_dir):
             direction = direction_fn(roi_raw)
             wireframe = connect_fn(edge_basis, direction=direction)
             border_canvas[y:y+h, x:x+w] = np.maximum(border_canvas[y:y+h, x:x+w], wireframe)
-
-            # 不再执行轮廓绘制，只保留边框连接结果
+            # 轮廓 -> 过滤 -> 多边形拟合（在亮度检测前阶段停止）
+            contours, _ = cv2.findContours(wireframe, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                min_area = contour_cfg.get('min_area', 5000)
+                kept = [c for c in contours if cv2.contourArea(c) > min_area]
+                if not kept and edge_basis.any():
+                    # 尝试回退一次：使用 cleaned 边缘集合在四边最远点连接（与主流程简化版）
+                    h_loc, w_loc = edge_basis.shape[:2]
+                    fb = np.zeros_like(edge_basis)
+                    def _connect_line(points):
+                        if len(points) < 2: return
+                        cv2.line(fb, points[0], points[-1], 255, 1)
+                    if edge_basis[0, :].any():
+                        xs = np.where(edge_basis[0, :] == 255)[0]
+                        _connect_line([(int(xs[0]),0),(int(xs[-1]),0)])
+                    if edge_basis[h_loc-1, :].any():
+                        xs = np.where(edge_basis[h_loc-1, :] == 255)[0]
+                        _connect_line([(int(xs[0]),h_loc-1),(int(xs[-1]),h_loc-1)])
+                    if edge_basis[:,0].any():
+                        ys = np.where(edge_basis[:,0] == 255)[0]
+                        _connect_line([(0,int(ys[0])),(0,int(ys[-1]))])
+                    if edge_basis[:,w_loc-1].any():
+                        ys = np.where(edge_basis[:,w_loc-1] == 255)[0]
+                        _connect_line([(w_loc-1,int(ys[0])),(w_loc-1,int(ys[-1]))])
+                    if fb.any():
+                        c2,_ = cv2.findContours(fb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        kept = [c for c in c2 if cv2.contourArea(c) > min_area]
+                        if kept:
+                            border_canvas[y:y+h, x:x+w] = np.maximum(border_canvas[y:y+h, x:x+w], fb)
+                for c in kept:
+                    poly = simplify_fn(c)
+                    if poly is not None and len(poly) >= 3:
+                        poly_off = poly + np.array([[x, y]])
+                        cv2.polylines(poly_canvas, [poly_off], True, (0,255,0), 1, lineType=cv2.LINE_AA)
         except Exception as _e:
             print(f"[调试-ROI失败]: {os.path.basename(img_path)} ROI跳过 {_e}")
 
     # 保存
     cv2.imwrite(os.path.join(inter_dir, f"{base}_border.png"), border_canvas)
-    print(f"[调试输出]: {base} -> border 已生成")
+    cv2.imwrite(os.path.join(inter_dir, f"{base}_poly.png"), poly_canvas)
+    print(f"[调试输出]: {base} -> border / poly 已生成")
 
 
 def main():
