@@ -95,18 +95,18 @@
   },
   "defect_detection_params": {
     "preprocess_params": {
-      "GAMMA_VALUE": 1.08,
-      "CANNY_SIGMA": 0.18,
-      "CLAHE_CLIP_LIMIT": 2.0,
-      "CLAHE_TILE_TARGET_PX": 64
+      "GAMMA_VALUE": 0.88,
+      "CANNY_SIGMA": 0.36,
+      "CLAHE_CLIP_LIMIT": 3.2,
+      "CLAHE_TILE_TARGET_PX": 32
     },
     "dbscan_params": {
-      "eps": 12.0,
-      "min_samples": 3,
-      "min_points_per_cluster": 20
+      "eps": 10.0,
+      "min_samples": 5,
+      "min_points_per_cluster": 50
     },
     "contour_params": {
-      "min_area": 5000
+      "min_area": 2000
     },
     "defect_params": {
       "PIXELS_PER_MM": 2.735,
@@ -119,7 +119,7 @@
       "ANGLE_SOFT_SNAP_GAIN": 0.5,
       "ANGLE_SOFT_SNAP_MAX_DEVIATION": 5.0,
       "ANGLE_REPORT_ROUND_TO": 0.5,
-      "DEFECT_STD_DEV_THRESHOLD": 3,
+      "DEFECT_STD_DEV_THRESHOLD": 2,
       "MIN_DEFECT_AREA_MM2": 5,
       "MIN_DEFECT_DIMENSION_MM": 1,
       "MIN_DEFECT_WIDTH_MM": 1,

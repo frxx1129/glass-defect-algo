@@ -4,6 +4,7 @@ import cv2
 import time
 import argparse
 import image_processor_optimized
+import numpy as np
 
 # 批处理 valid 文件夹下图片，复用现有算法/参数
 
@@ -35,24 +36,100 @@ def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
 
 
-def process_single_image(img_path, template_rois, config, out_dir, draw_contours=False):
-    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        print(f"[跳过]: 无法读取 {img_path}")
-        return
+def process_single_image(img_path, template_rois, config, out_dir, draw_contours=False, debug_intermediates=False):
+    # 直接调用算法顶层接口，自动处理读图/输出
     t0 = time.time()
-    report, annotated = image_processor_optimized.process_image_from_memory_parallel(img, template_rois, config, draw_contours=draw_contours)
+    report = image_processor_optimized.process_image(
+        img_path,
+        template_rois,
+        out_dir,
+        config,
+        draw_contours=draw_contours,
+        use_parallel=True
+    )
     dt = (time.time() - t0) * 1000.0
     base = os.path.splitext(os.path.basename(img_path))[0]
-    json_out = os.path.join(out_dir, base + '.json')
-    img_out = os.path.join(out_dir, base + '_annotated.jpg')
-    try:
-        with open(json_out, 'w', encoding='utf-8') as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
-        cv2.imwrite(img_out, annotated)
+    if report is not None:
         print(f"[完成]: {base} 状态={report.get('image_status')} 缺陷数={len(report.get('defects', []))} 耗时={dt:.1f}ms")
-    except Exception as e:
-        print(f"[错误]: 保存结果失败 {e}")
+    else:
+        print(f"[跳过]: 无法处理 {img_path}")
+
+    if debug_intermediates:
+        try:
+            _export_intermediates(img_path, template_rois, config, out_dir)
+        except Exception as e:
+            print(f"[调试导出失败]: {base}: {e}")
+
+def _export_intermediates(img_path, template_rois, config, out_dir):
+    """仅生成并保存边框连接(补全)后的二值结果。"""
+    img_gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if img_gray is None:
+        print(f"[调试]: 无法读取图像 {img_path}")
+        return
+    H, W = img_gray.shape[:2]
+    base = os.path.splitext(os.path.basename(img_path))[0]
+    inter_dir = os.path.join(out_dir, 'intermediates')
+    os.makedirs(inter_dir, exist_ok=True)
+
+    # 仅保留边框补全画布
+    border_canvas = np.zeros((H, W), dtype=np.uint8)
+
+    # 取配置片段
+    p_cfg = config.get('defect_detection_params', {}).get('preprocess_params', {})
+    dbscan_cfg = config.get('defect_detection_params', {}).get('dbscan_params', {})
+    contour_cfg = config.get('defect_detection_params', {}).get('contour_params', {})
+
+    # 函数引用（即便是下划线也可访问）
+    preprocess_roi = image_processor_optimized.preprocess_roi_enhanced
+    cluster_fn = image_processor_optimized.cluster_points_with_dbscan
+    connect_fn = image_processor_optimized.connect_border_points_advanced
+    direction_fn = image_processor_optimized._determine_connection_direction  # noqa: protected-access
+
+    for r in template_rois:
+        try:
+            x = int(r.get('x', 0)); y = int(r.get('y', 0))
+            w = int(r.get('width', 0)); h = int(r.get('height', 0))
+            if w <= 0 or h <= 0: continue
+            x = max(0, min(x, W - 1)); y = max(0, min(y, H - 1))
+            w = max(0, min(w, W - x)); h = max(0, min(h, H - y))
+            roi_raw = img_gray[y:y+h, x:x+w]
+            if roi_raw.size == 0: continue
+
+            roi_pre = preprocess_roi(roi_raw, p_cfg)
+            v = float(np.median(roi_pre))
+            sigma = float(p_cfg.get('CANNY_SIGMA', 0.2))
+            lower = int(max(0, (1.0 - sigma) * v))
+            upper = int(min(255, (1.0 + sigma) * v))
+            canny_edges = cv2.Canny(roi_pre, lower, upper)
+            # 不再单独导出 Canny，全局不存储
+
+            # DBSCAN 清理
+            cleaned_edges = np.zeros_like(canny_edges)
+            pts_yx = np.argwhere(canny_edges == 255)
+            if pts_yx.shape[0] >= dbscan_cfg.get('min_points_per_cluster', 100):
+                max_points = int(dbscan_cfg.get('max_points', 8000))
+                if pts_yx.shape[0] > max_points:
+                    step = int(np.ceil(pts_yx.shape[0] / max_points))
+                    pts_yx = pts_yx[::step]
+                pts_xy = pts_yx[:, [1, 0]]
+                clusters = cluster_fn(pts_xy, **dbscan_cfg)
+                if clusters:
+                    all_pts = np.vstack(clusters)
+                    cleaned_edges[all_pts[:,1], all_pts[:,0]] = 255
+
+            # 若清理后为空，降级使用原 canny
+            edge_basis = cleaned_edges if cleaned_edges.any() else canny_edges
+            direction = direction_fn(roi_raw)
+            wireframe = connect_fn(edge_basis, direction=direction)
+            border_canvas[y:y+h, x:x+w] = np.maximum(border_canvas[y:y+h, x:x+w], wireframe)
+
+            # 不再执行轮廓绘制，只保留边框连接结果
+        except Exception as _e:
+            print(f"[调试-ROI失败]: {os.path.basename(img_path)} ROI跳过 {_e}")
+
+    # 保存
+    cv2.imwrite(os.path.join(inter_dir, f"{base}_border.png"), border_canvas)
+    print(f"[调试输出]: {base} -> border 已生成")
 
 
 def main():
@@ -61,7 +138,8 @@ def main():
     parser.add_argument('--input', default='valid', help='输入图片目录')
     parser.add_argument('--output', default='valid_results', help='输出结果目录')
     parser.add_argument('--ext', nargs='*', default=['.jpg', '.png', '.bmp'], help='允许的扩展名')
-    parser.add_argument('--draw-contours', action='store_true', help='可选：在结果中绘制轮廓')
+    parser.add_argument('--draw-contours', action='store_true', help='在最终结果图中绘制原始轮廓')
+    parser.add_argument('--debug-intermediates', action='store_true', help='输出边框补全二值结果')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -84,7 +162,9 @@ def main():
 
     print(f'[批处理]: 发现 {len(all_files)} 张图片，开始处理...')
     for fp in all_files:
-        process_single_image(fp, template_rois, cfg, args.output, draw_contours=args.draw_contours)
+        process_single_image(fp, template_rois, cfg, args.output,
+                              draw_contours=args.draw_contours,
+                              debug_intermediates=args.debug_intermediates)
 
 if __name__ == '__main__':
     main()

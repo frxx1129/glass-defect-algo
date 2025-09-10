@@ -841,6 +841,50 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
     contours, _ = cv2.findContours(closed_wireframe, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     valid_polygons_raw = [p for p in contours if cv2.contourArea(p) > contour_cfg.get('min_area', 5000)] if contours else []
 
+    # --- Fallback: 若按原规则仍无轮廓，尝试一次“每条边连接最远点” ---
+    if not valid_polygons_raw:
+        try:
+            # 回退阶段仅允许使用“cleaned_edges”中的点；若为空直接放弃回退
+            if not cleaned_edges.any():
+                raise RuntimeError("fallback skipped: no cleaned edge points")
+            edge_src = cleaned_edges
+            h_loc, w_loc = edge_src.shape[:2]
+            fallback_wire = np.zeros_like(edge_src)
+            # 收集四边点 (局部 ROI 坐标)
+            top_pts = [(int(x), 0) for x in np.where(edge_src[0, :] == 255)[0]]
+            bot_pts = [(int(x), h_loc - 1) for x in np.where(edge_src[h_loc - 1, :] == 255)[0]] if h_loc > 1 else []
+            left_pts = [(0, int(y)) for y in np.where(edge_src[:, 0] == 255)[0]]
+            right_pts = [(w_loc - 1, int(y)) for y in np.where(edge_src[:, w_loc - 1] == 255)[0]] if w_loc > 1 else []
+
+            def _connect_farthest(pts):
+                if len(pts) < 2:
+                    return
+                # 由于这些点都在同一条直边上，最远的就是 min / max 端点
+                # 但为通用性，再线性扫描一次（点数通常不大）
+                max_d = -1; p1 = p2 = None
+                for i in range(len(pts)):
+                    xi, yi = pts[i]
+                    for j in range(i + 1, len(pts)):
+                        xj, yj = pts[j]
+                        d = (xi - xj) * (xi - xj) + (yi - yj) * (yi - yj)
+                        if d > max_d:
+                            max_d = d; p1, p2 = pts[i], pts[j]
+                if p1 and p2:
+                    cv2.line(fallback_wire, p1, p2, 255, 1)
+
+            _connect_farthest(top_pts)
+            _connect_farthest(bot_pts)
+            _connect_farthest(left_pts)
+            _connect_farthest(right_pts)
+
+            if fallback_wire.any():
+                contours2, _ = cv2.findContours(fallback_wire, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                valid_polygons_raw = [p for p in contours2 if cv2.contourArea(p) > contour_cfg.get('min_area', 5000)] if contours2 else []
+                if valid_polygons_raw:
+                    closed_wireframe = fallback_wire  # 使用回退结果
+        except Exception:
+            pass
+
     final_simplified_polygons = [find_best_fit_polygon(c) for c in valid_polygons_raw]
 
     # --- 3. 缺陷检测与标注 ---
