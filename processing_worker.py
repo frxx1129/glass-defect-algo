@@ -107,7 +107,7 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                 if cam_idx not in roi_cache:
                     roi_cache[cam_idx] = load_rois_for_cam(cam_idx)
                 pane_json, annotated_image = image_processor_optimized.process_image_from_memory_parallel(
-                    frame_data, roi_cache[cam_idx], processor_config, draw_contours=False)
+                    frame_data, roi_cache[cam_idx], processor_config, draw_contours=True)
 
                 should_reject_overall = should_reject_pane(pane_json, shared_settings, PIXELS_PER_MM)
 
