@@ -173,7 +173,12 @@ def main():
     parser.add_argument('--input', default='valid', help='输入图片目录')
     parser.add_argument('--output', default='valid_results', help='输出结果目录')
     parser.add_argument('--ext', nargs='*', default=['.jpg', '.png', '.bmp'], help='允许的扩展名')
-    parser.add_argument('--draw-contours', action='store_true', help='在最终结果图中绘制原始轮廓')
+    # 轮廓绘制：默认开启，可用 --no-draw-contours 关闭
+    draw_group = parser.add_mutually_exclusive_group()
+    draw_group.add_argument('--draw-contours', dest='draw_contours', action='store_true', default=True,
+                            help='在最终结果图中绘制原始/简化轮廓 (默认开启)')
+    draw_group.add_argument('--no-draw-contours', dest='draw_contours', action='store_false',
+                            help='关闭最终结果图中的轮廓绘制')
     parser.add_argument('--debug-intermediates', action='store_true', help='输出边框补全二值结果')
     args = parser.parse_args()
 

@@ -827,6 +827,9 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
     simplified_thickness = int(dr_cfg.get('SIMPLIFIED_CONTOUR_THICKNESS', 1))
     mask_line_thickness = int(dr_cfg.get('DEFECT_CONTOUR_MASK_THICKNESS', 3))
     debug_trace = bool(dr_cfg.get('DEBUG_TRACE', False))
+    # 新增：是否绘制原始/简化轮廓由配置控制
+    draw_raw_contour = bool(dr_cfg.get('DRAW_RAW_CONTOUR', True))
+    draw_simplified_contour = bool(dr_cfg.get('DRAW_SIMPLIFIED_CONTOUR', True))
     # 新增：亮度异常像素高亮配置
     highlight_pixels = bool(dr_cfg.get('HIGHLIGHT_DEFECT_PIXELS', True))
     pixel_alpha = float(dr_cfg.get('DEFECT_PIXEL_ALPHA', 0.45))  # 0..1 之间
@@ -963,8 +966,9 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
     for raw_contour, simplified_contour in zip(valid_polygons_raw, final_simplified_polygons):
         roi_report["polygons_in_roi"] += 1
         if draw_main_contour:
-            cv2.polylines(roi_color, [raw_contour], isClosed=True, color=raw_contour_color, thickness=raw_contour_thickness)
-            if simplified_contour is not None and len(simplified_contour) >= 3:
+            if draw_raw_contour:
+                cv2.polylines(roi_color, [raw_contour], isClosed=True, color=raw_contour_color, thickness=raw_contour_thickness)
+            if draw_simplified_contour and (simplified_contour is not None) and len(simplified_contour) >= 3:
                 cv2.polylines(roi_color, [simplified_contour], isClosed=True, color=simplified_color, thickness=simplified_thickness)
 
         vertices_f32 = simplified_contour.reshape(-1, 2).astype(np.float32, copy=False)
@@ -1092,7 +1096,7 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
                 box = cv2.boxPoints(rotated_rect)
                 box = np.intp(box)
                 # 1) 仍然保留外接矩形轮廓用于调试/定位
-                cv2.drawContours(roi_color, [box], 0, DEFECT_COLORS.get(defect_type, (255,255,255)), 2)
+                cv2.drawContours(roi_color, [box], 0, DEFECT_COLORS.get(defect_type, (255,255,255)), 1)
 
                 # 2) 按需对该连通域内的所有像素进行按缺陷类别着色 (亮度异常像素高亮)
                 if highlight_pixels and pixel_alpha > 0.0:
