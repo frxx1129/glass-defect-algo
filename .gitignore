@@ -40,3 +40,5 @@ persistent_stats.dat
 
 valid/
 valid_results/
+valid_*/
+build_*/

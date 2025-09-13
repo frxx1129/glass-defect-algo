@@ -68,7 +68,7 @@
       "2": "192.168.1.202"
     }
   },
-  "lineName": "Line2",
+  "lineName": "Line1",
   "camera_rois": {
     "0": "roi_averaged_by_group_CORRECTED.json",
     "1": "roi_averaged_by_group_CORRECTED.json",
@@ -77,15 +77,15 @@
     "4": "roi_averaged_by_group_CORRECTED.json"
   },
   "server_config": {
-    "server": "10.153.5.126",
+    "server": "202.115.65.101",
     "listen_host": "0.0.0.0",
     "listen_port": 12450,
     "cors_origins": [
       "*"
     ],
-    "upload_url": "http://10.1.253.126:3200/fastapi/glass/uploadWithDefects",
-    "stats_push_url": "http://10.1.253.126:3200/fastapi/glass/updateYieldAndRejections",
-    "heartbeat_url": "http://10.1.253.126:3200/fastapi/system/heartbeat"
+    "upload_url": "http://202.115.65.101:3200/fastapi/glass/uploadWithDefects",
+    "stats_push_url": "http://202.115.65.101:3200/fastapi/glass/updateYieldAndRejections",
+    "heartbeat_url": "http://202.115.65.101:3200/fastapi/system/heartbeat"
   },
   "rejection_params": {
     "max_defect_size_mm": 20.0,
@@ -95,10 +95,10 @@
   },
   "defect_detection_params": {
     "preprocess_params": {
-      "GAMMA_VALUE": 0.612,
-      "CANNY_SIGMA": 0.097,
-      "CLAHE_CLIP_LIMIT": 4.20,
-      "CLAHE_TILE_TARGET_PX": 27
+      "GAMMA_VALUE": 0.6,
+      "CANNY_SIGMA": 0.45,
+      "CLAHE_CLIP_LIMIT": 0.5,
+      "CLAHE_TILE_TARGET_PX": 16
     },
     "dbscan_params": {
       "eps": 10.0,
@@ -106,7 +106,7 @@
       "min_points_per_cluster": 50
     },
     "contour_params": {
-      "min_area": 23333
+      "min_area": 30000
     },
     "defect_params": {
       "PIXELS_PER_MM": 2.735,
@@ -119,21 +119,40 @@
       "ANGLE_SOFT_SNAP_GAIN": 0.5,
       "ANGLE_SOFT_SNAP_MAX_DEVIATION": 5.0,
       "ANGLE_REPORT_ROUND_TO": 0.5,
-      "DEFECT_STD_DEV_THRESHOLD": 2.886,
-      "MIN_DEFECT_AREA_MM2": 5,
-      "MIN_DEFECT_DIMENSION_MM": 3.5,
-      "MIN_DEFECT_WIDTH_MM": 3.5,
-      "DEFECT_MERGE_KERNEL_SIZE": 4,
-      "ORIENTATION_PARALLEL_THRESHOLD": 15.0
+      "DEFECT_STD_DEV_THRESHOLD": 2.8,
+      "MIN_DEFECT_AREA_MM2": 6.25,
+      "MIN_DEFECT_DIMENSION_MM": 2.5,
+      "MIN_DEFECT_WIDTH_MM": 2.5,
+      "DEFECT_MERGE_KERNEL_SIZE": 7,
+      "ORIENTATION_PARALLEL_THRESHOLD": 10.0,
+      "MIN_L_ASPECT_RATIO": 3.0,
+      "MAX_L_ASPECT_RATIO": 30.0,
+      "BRIGHTNESS_ENHANCE": true,
+      "BRIGHTNESS_CLAHE_CLIP_LIMIT": 4.0,
+      "BRIGHTNESS_CLAHE_TILE_TARGET_PX": 32,
+      "BRIGHTNESS_MEDIAN_KSIZE": 11,
+      "BRIGHTNESS_MEDIAN_BLUR": true,
+      "SMALL_DEFECT_AREA_MM2": 30.0,
+      "SMALL_DEFECT_FAR_EDGE_MM": 5.0
     },
     "drawing_params": {
+      "HIGHLIGHT_DEFECT_PIXELS": true,
+      "DEFECT_PIXEL_ALPHA": 0.5,
       "BOUNDARY_THRESHOLD": 5,
       "DEFECT_OVERLAY_ALPHA": 0.5,
-      "RAW_CONTOUR_COLOR": [0,255,0],
+      "RAW_CONTOUR_COLOR": [
+        0,
+        255,
+        0
+      ],
       "RAW_CONTOUR_THICKNESS": 2,
-      "SIMPLIFIED_CONTOUR_COLOR": [0,0,255],
+      "SIMPLIFIED_CONTOUR_COLOR": [
+        0,
+        0,
+        255
+      ],
       "SIMPLIFIED_CONTOUR_THICKNESS": 1,
-      "DEFECT_CONTOUR_MASK_THICKNESS": 7,
+      "DEFECT_CONTOUR_MASK_THICKNESS": 5,
       "DEBUG_TRACE": false
     }
   }

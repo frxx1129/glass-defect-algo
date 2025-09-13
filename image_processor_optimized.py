@@ -827,6 +827,10 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
     simplified_thickness = int(dr_cfg.get('SIMPLIFIED_CONTOUR_THICKNESS', 1))
     mask_line_thickness = int(dr_cfg.get('DEFECT_CONTOUR_MASK_THICKNESS', 3))
     debug_trace = bool(dr_cfg.get('DEBUG_TRACE', False))
+    # 新增：亮度异常像素高亮配置
+    highlight_pixels = bool(dr_cfg.get('HIGHLIGHT_DEFECT_PIXELS', True))
+    pixel_alpha = float(dr_cfg.get('DEFECT_PIXEL_ALPHA', 0.45))  # 0..1 之间
+    pixel_alpha = 0.0 if pixel_alpha < 0 else (1.0 if pixel_alpha > 1.0 else pixel_alpha)
     angle_min = d_cfg.get('ANGLE_MIN_THRESHOLD', 10.0)
     angle_max = d_cfg.get('ANGLE_MAX_THRESHOLD', 170.0)
     bevel_tol = d_cfg.get('ANGLE_BEVEL_TOLERANCE', 2.5)
@@ -984,13 +988,41 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
 
         mask = np.zeros(roi_original.shape, dtype=np.uint8)
         cv2.fillPoly(mask, [raw_contour], 255)
-        mean, std_dev = cv2.meanStdDev(roi_original, mask=mask)
+
+        # 亮度缺陷检测前，先可选进行中值滤波以抹平干扰，再进行对比度增强（均默认开启）
+        roi_for_detect = roi_original
+        try:
+            # 1)中值滤波（可选）
+            if bool(d_cfg.get('BRIGHTNESS_MEDIAN_BLUR', True)):
+                ksize = int(d_cfg.get('BRIGHTNESS_MEDIAN_KSIZE', 3))
+                # ksize 必须为奇数且>=3
+                if ksize < 3: ksize = 3
+                if ksize % 2 == 0: ksize += 1
+                if roi_for_detect.size > 0:
+                    roi_for_detect = cv2.medianBlur(roi_for_detect, ksize)
+
+            # 2)对比度增强（可选 CLAHE）
+            if bool(d_cfg.get('BRIGHTNESS_ENHANCE', True)):
+                h0, w0 = roi_original.shape[:2]
+                # 计算自适应 tile grid（与预处理类似，但独立参数）
+                target_px = int(d_cfg.get('BRIGHTNESS_CLAHE_TILE_TARGET_PX', 96))
+                grid_x = int(np.clip(round(max(2, w0) / max(1, target_px)), 2, 12))
+                grid_y = int(np.clip(round(max(2, h0) / max(1, target_px)), 2, 12))
+                clip_limit = float(d_cfg.get('BRIGHTNESS_CLAHE_CLIP_LIMIT', 2.0))
+                clahe_det = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(grid_x, grid_y))
+                roi_for_detect = clahe_det.apply(roi_for_detect)
+        except Exception:
+            roi_for_detect = roi_original
+
+        # 计算增强后（或原始）区域的均值与方差
+        mean, std_dev = cv2.meanStdDev(roi_for_detect, mask=mask)
         mean, std_dev = float(mean[0][0]), float(std_dev[0][0])
 
         if std_dev > 1.0:
-            lower_bound = mean - d_cfg.get('DEFECT_STD_DEV_THRESHOLD', 3.0) * std_dev
-            upper_bound = mean + d_cfg.get('DEFECT_STD_DEV_THRESHOLD', 3.0) * std_dev
-            anomaly_mask = ((roi_original < lower_bound) | (roi_original > upper_bound)).astype(np.uint8) * 255
+            k = float(d_cfg.get('DEFECT_STD_DEV_THRESHOLD', 3.0))
+            lower_bound = mean - k * std_dev
+            # 仅检测“更暗”的像素；去除上界判断
+            anomaly_mask = (roi_for_detect < lower_bound).astype(np.uint8) * 255
             anomaly_mask = cv2.bitwise_and(anomaly_mask, mask)
 
             contour_line_mask = np.zeros(roi_original.shape, dtype=np.uint8)
@@ -1025,7 +1057,7 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
                 defect_long_axis_angle = rect_angle if w_px >= h_px else rect_angle + 90
 
                 simplified_vertices_float = vertices_f32.astype(np.float64, copy=False)
-                local_edge_angle, _ = find_closest_edge_numba(simplified_vertices_float, defect_center[0], defect_center[1])
+                local_edge_angle, edge_dist_px = find_closest_edge_numba(simplified_vertices_float, defect_center[0], defect_center[1])
 
                 angle_diff = calculate_angle_difference_numba(
                     normalize_angle_numba(defect_long_axis_angle),
@@ -1037,9 +1069,42 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
 
                 defect_type = "B" if angle_diff <= parallel_threshold else ("L" if angle_diff >= perpendicular_threshold else "B")
 
+                # 新增规则：若亮度缺陷面积较小且离边较远，则忽略该缺陷
+                area_px = float(stats[i, cv2.CC_STAT_AREA])
+                area_mm2 = area_px / (ppmm * ppmm) if ppmm > 0 else area_px
+                edge_dist_mm = float(edge_dist_px) / ppmm if ppmm > 0 else float(edge_dist_px)
+                small_area_thr = float(d_cfg.get('SMALL_DEFECT_AREA_MM2', 25.0))
+                far_edge_thr = float(d_cfg.get('SMALL_DEFECT_FAR_EDGE_MM', 10.0))
+                if area_mm2 < small_area_thr and edge_dist_mm > far_edge_thr:
+                    # 跳过：小面积且远离边缘
+                    continue
+
+                # 针对 L 再做长宽比过滤（可配置 MIN_L_ASPECT_RATIO / MAX_L_ASPECT_RATIO），缺省不启用
+                if defect_type == 'L':
+                    aspect = (length_mm / width_mm) if width_mm > 0 else None
+                    min_l_ar = d_cfg.get('MIN_L_ASPECT_RATIO', None)
+                    max_l_ar = d_cfg.get('MAX_L_ASPECT_RATIO', None)
+                    if aspect is not None:
+                        if (min_l_ar is not None and aspect < float(min_l_ar)) or (max_l_ar is not None and aspect > float(max_l_ar)):
+                            # 不符合 L 的长宽比，直接跳过记录
+                            continue
+
                 box = cv2.boxPoints(rotated_rect)
                 box = np.intp(box)
+                # 1) 仍然保留外接矩形轮廓用于调试/定位
                 cv2.drawContours(roi_color, [box], 0, DEFECT_COLORS.get(defect_type, (255,255,255)), 2)
+
+                # 2) 按需对该连通域内的所有像素进行按缺陷类别着色 (亮度异常像素高亮)
+                if highlight_pixels and pixel_alpha > 0.0:
+                    # 构造该连通域的布尔掩膜（局部 ROI 坐标）
+                    component_mask = (labels == i)
+                    # 去掉贴边像素（可选：防止边缘误差造成的溢色），仅使用中心像素；这里简单保留全部
+                    color_vec = np.array(DEFECT_COLORS.get(defect_type, (255,255,255)), dtype=np.float32)
+                    # 执行 Alpha 混合：new = (1-a)*old + a*color
+                    roi_patch = roi_color[component_mask]
+                    if roi_patch.size > 0:
+                        blended = (roi_patch.astype(np.float32) * (1.0 - pixel_alpha) + color_vec * pixel_alpha)
+                        roi_color[component_mask] = blended.astype(np.uint8)
 
                 roi_report["defects"].append({
                     "type": defect_type,
