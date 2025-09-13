@@ -76,11 +76,11 @@ def run_sweep(image_path: str,
     目标：收集满足 1) 所有 ROI polygons_in_roi == 1 的样本（允许缺陷，记录统计）。
     gamma/sigma 在中心附近小范围随机；外部区间参数保持以兼容调用。
     """
-    # 采样窗口（仍用固定中心范围）
-    GAMMA_CENTER, GAMMA_HALF_RANGE = 0.749, 0.15   # 扩大到 ±0.15
-    SIGMA_CENTER, SIGMA_HALF_RANGE = 0.140, 0.05   # 扩大到 ±0.05
-    CLAHE_CLIP_MIN, CLAHE_CLIP_MAX = 1.0, 5.0
-    CLAHE_TILE_MIN, CLAHE_TILE_MAX = 8, 128
+    # 扩大搜索范围 (更大范围 + 更离散的 TILE)
+    GAMMA_CENTER, GAMMA_HALF_RANGE = 0.90, 0.50    # 范围约 [0.40, 1.40]
+    SIGMA_CENTER, SIGMA_HALF_RANGE = 0.25, 0.20    # 范围约 [0.05, 0.45]
+    CLAHE_CLIP_MIN, CLAHE_CLIP_MAX = 0.5, 8.0
+    CLAHE_TILE_MIN, CLAHE_TILE_MAX = 4, 160
 
     ensure_dir(output_dir)
     images_dir = os.path.join(output_dir, 'images')
@@ -200,11 +200,11 @@ def run_multi_sweep(image_specs,
     ensure_dir(images_root)
     csv_path = os.path.join(output_dir, 'multi_results.csv')
 
-    # 参数范围与单图一致（中心 ± 扩大）
-    GAMMA_CENTER, GAMMA_HALF_RANGE = 0.749, 0.15
-    SIGMA_CENTER, SIGMA_HALF_RANGE = 0.140, 0.05
-    CLAHE_CLIP_MIN, CLAHE_CLIP_MAX = 1.0, 5.0
-    CLAHE_TILE_MIN, CLAHE_TILE_MAX = 8, 128
+    # 扩大搜索范围 (与单图一致或更大)，减少集中性以覆盖更广参数空间
+    GAMMA_CENTER, GAMMA_HALF_RANGE = 0.90, 0.50     # -> [0.40, 1.40]
+    SIGMA_CENTER, SIGMA_HALF_RANGE = 0.25, 0.20     # -> [0.05, 0.45]
+    CLAHE_CLIP_MIN, CLAHE_CLIP_MAX = 0.5, 8.0
+    CLAHE_TILE_MIN, CLAHE_TILE_MAX = 4, 160
 
     if seed is not None:
         random.seed(seed)
@@ -230,22 +230,24 @@ def run_multi_sweep(image_specs,
             all_ok = True
             total_defects_sum = 0
 
+            # 顺序处理每张图（单进程单线程）
             for spec in image_specs:
                 img_path = spec['path']
-                required = spec.get('required_roi_contours')
-                allowed_types = spec.get('defect_types_only')
-                # B 缺陷尺寸约束（针对 a800b_2_x 场景）：默认 <50mm * <50mm
-                b_max_length = spec.get('b_defect_max_length_mm', 50.0)
-                b_max_width = spec.get('b_defect_max_width_mm', 50.0)
-                cfg = clone_config_for_run(base_config, gamma, sigma, clahe_clip, clahe_tile)
+                cfg_img = clone_config_for_run(base_config, gamma, sigma, clahe_clip, clahe_tile)
                 report = image_processor_optimized.process_image(
                     img_path,
                     rois,
                     images_root,
-                    cfg,
+                    cfg_img,
                     draw_contours=draw_contours,
                     use_parallel=True
                 )
+                img_path = spec['path']
+                required = spec.get('required_roi_contours')
+                allowed_types = spec.get('defect_types_only')
+                b_max_length = spec.get('b_defect_max_length_mm', 50.0)
+                b_max_width = spec.get('b_defect_max_width_mm', 50.0)
+
                 if report is None:
                     print(f"[尝试 {attempt}] 图像 {img_path} 处理失败")
                     all_ok = False
@@ -261,7 +263,6 @@ def run_multi_sweep(image_specs,
                         print(f"[尝试 {attempt}] {os.path.basename(img_path)} 存在不允许的缺陷类型")
                         all_ok = False
                         break
-                    # 对 a800b_2_x 的 B 缺陷尺寸判定（仅当允许列表为 B 且出现 B 缺陷时）
                     if set(allowed_types) == {'B'} and defects:
                         size_ok = True
                         for d in defects:
@@ -281,7 +282,6 @@ def run_multi_sweep(image_specs,
                 defect_counts = summarize_defects(report)
                 total_defects = sum(defect_counts.values())
                 total_defects_sum += total_defects
-
                 base_name = os.path.splitext(os.path.basename(img_path))[0]
                 img_dir = os.path.join(images_root, base_name)
                 ensure_dir(img_dir)
@@ -289,7 +289,6 @@ def run_multi_sweep(image_specs,
                 generic_img = os.path.join(images_root, f"{base_name}_processed.jpg")
                 target_img = os.path.join(img_dir, stub + '.jpg')
                 target_json = os.path.join(img_dir, stub + '.json')
-                # 暂存，稍后统一保存
                 per_image_results.append({
                     'image': base_name,
                     'defects': defect_counts,
@@ -372,7 +371,7 @@ def main():
         image_specs = [
             { 'path': 'valid/b800b_x.BMP', 'required_roi_contours': 1, 'defect_types_only': None },
             { 'path': 'valid/a800b_2_x.BMP', 'required_roi_contours': 1, 'defect_types_only': ['B'] },
-            { 'path': 'valid/b800q.BMP', 'required_roi_contours': 1, 'defect_types_only': None },
+            { 'path': 'valid/b800q.BMP', 'required_roi_contours': 1, 'defect_types_only': ['Q'] },
             { 'path': 'valid/b800b_S.BMP', 'required_roi_contours': 1, 'defect_types_only': None }
         ]
         run_multi_sweep(
