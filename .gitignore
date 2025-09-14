@@ -43,3 +43,16 @@ valid_results/
 valid_*/
 build_*/
 inspection_results/
+
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.svg
+*.ico
+*.mp4
+*.avi
+*.mkv
+*.mov
