@@ -13,7 +13,7 @@
     "http_upload_timeout_s": 15,
     "stats_push_interval_s": 601,
     "opencv_threads": 1,
-    "preview_width": 2048,
+    "preview_width": 1200,
     "jpeg_quality_main": 85,
     "jpeg_quality_preview": 75,
     "coalesce_drain_budget_ms": 5,
@@ -23,7 +23,7 @@
   },
   "camera_setup": {
     "expected_cameras": 3,
-    "bootstrap_default_ip": "192.168.200.1",
+    "bootstrap_default_ip": "192.168.1.200",
     "bootstrap_assign_ips": true,
     "open_retry_count": 3,
     "open_retry_backoff_base_s": 2,
@@ -33,21 +33,42 @@
       "frame_rate": 10,
       "enforce_mono8": true
     },
-    "camera_bindings": [
+    "network_interfaces": [
       {
         "index": 0,
-        "mac": "94:AA:B8:01:FC:E6",
-        "ip": "192.168.10.2"
+        "ip": "192.168.3.100"
       },
       {
         "index": 1,
-        "mac": "94:AA:B8:01:3A:DF",
-        "ip": "192.168.11.2"
+        "ip": "192.168.4.100"
       },
       {
         "index": 2,
+        "ip": "192.168.5.100"
+      }
+    ],
+    "camera_nic_bindings": {},
+    "camera_bindings": [
+      {
+        "index": 0,
+        "physical_index": 1,
         "mac": "94:AA:B8:00:08:A2",
-        "ip": "192.168.12.2"
+        "ip": "192.168.4.162",
+        "model": "MV-HP120GM"
+      },
+      {
+        "index": 1,
+        "physical_index": 2,
+        "mac": "94:AA:B8:01:FC:E6",
+        "ip": "192.168.5.130",
+        "model": "MV-HP120GM"
+      },
+      {
+        "index": 2,
+        "physical_index": 0,
+        "mac": "94:AA:B8:01:3A:DF",
+        "ip": "192.168.3.123",
+        "model": "MV-HP120GM"
       }
     ],
     "unified_params": {
@@ -109,29 +130,29 @@
     },
     "defect_params": {
       "PIXELS_PER_MM": 2.735,
-  "ANGLE_NORMAL_TOLERANCE": 2,
-  "ANGLE_BEVEL_TOLERANCE": 10,
+      "ANGLE_NORMAL_TOLERANCE": 2,
+      "ANGLE_BEVEL_TOLERANCE": 10,
       "ANGLE_MIN_THRESHOLD": 10.0,
       "ANGLE_MAX_THRESHOLD": 170.0,
-  "ANGLE_BIAS_DEG": 0.6,
-  "ANGLE_SNAP_TO_90_DEADBAND_DEG": 6.0,
-  "ANGLE_SOFT_SNAP_GAIN": 0.0,
-  "ANGLE_SOFT_SNAP_MAX_DEVIATION": 0.0,
+      "ANGLE_BIAS_DEG": 0.0,
+      "ANGLE_SNAP_TO_90_DEADBAND_DEG": 10.0,
+      "ANGLE_SOFT_SNAP_GAIN": 0.5,
+      "ANGLE_SOFT_SNAP_MAX_DEVIATION": 12.0,
       "ANGLE_REPORT_ROUND_TO": 0.5,
-      "DEFECT_STD_DEV_THRESHOLD": 2.8,
+      "DEFECT_STD_DEV_THRESHOLD": 2.5,
       "MIN_DEFECT_AREA_MM2": 9,
       "MIN_DEFECT_DIMENSION_MM": 3,
       "MIN_DEFECT_WIDTH_MM": 3,
-      "DEFECT_MERGE_KERNEL_SIZE": 7,
+      "DEFECT_MERGE_KERNEL_SIZE": 3,
       "ORIENTATION_PARALLEL_THRESHOLD": 10.0,
       "MIN_L_ASPECT_RATIO": 3.0,
       "MAX_L_ASPECT_RATIO": 30.0,
       "BRIGHTNESS_ENHANCE": true,
-      "BRIGHTNESS_CLAHE_CLIP_LIMIT": 5.0,
-      "BRIGHTNESS_CLAHE_TILE_TARGET_PX": 32,
-      "BRIGHTNESS_MEDIAN_KSIZE": 11,
+      "BRIGHTNESS_CLAHE_CLIP_LIMIT": 8,
+      "BRIGHTNESS_CLAHE_TILE_TARGET_PX": 16,
+      "BRIGHTNESS_MEDIAN_KSIZE": 7,
       "BRIGHTNESS_MEDIAN_BLUR": true,
-      "SMALL_DEFECT_AREA_MM2": 30.0,
+      "SMALL_DEFECT_AREA_MM2": 15.0,
       "SMALL_DEFECT_FAR_EDGE_MM": 3.0
     },
     "drawing_params": {

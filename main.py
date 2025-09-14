@@ -185,7 +185,7 @@ def main():
     pool_proc = multiprocessing.Process(
         target=camera_pool_process,
         args=(task_queue, stop_event, run_event, cameras_ready_event, config, shared_camera_states),
-        daemon=True  # ### MODIFIED ###: Ensure daemon flag is set
+        daemon=False  # 不能设置为daemon=True，因为需要创建子进程
     )
     processes.append(pool_proc)
     
@@ -194,7 +194,7 @@ def main():
         worker_proc = multiprocessing.Process(
             target=calculation_worker, 
             args=(i, task_queue, results_queue, stop_event, run_event, config, shared_settings),
-            daemon=True # ### MODIFIED ###: Ensure daemon flag is set
+            daemon=True
         )
         processes.append(worker_proc)
         
@@ -229,25 +229,25 @@ def main():
         shared_settings.cors_origins = ["*"]
 
     # --- ### NEW ###: Wait for all cameras to be ready before starting the API server ---
-    print("[主进程]: 等待所有相机初始化...")
+    print("[主进程]: 等待相机初始化...")
     start_time = time.time()
-    timeout = 15  # 给相机15秒来初始化
+    timeout = 60  # 给相机60秒来初始化
 
     # 等待相机就绪事件
     camera_ready = cameras_ready_event.wait(timeout)
     
     if camera_ready:
         # 显示相机状态概述
-        print("✅ [主进程]: 所有相机已准备就绪")
+        print("✅ [主进程]: 相机就绪")
         camera_status = []
         for i in range(NUM_CAMERAS):
             if i in shared_camera_states:
                 status = shared_camera_states[i].get('status', 'Unknown')
                 info = ""
                 if 'mac' in shared_camera_states[i]:
-                    info += f"MAC: {shared_camera_states[i]['mac']}"
+                    info += f"MAC={shared_camera_states[i]['mac']}"
                 if 'ip' in shared_camera_states[i]:
-                    info += f", IP: {shared_camera_states[i]['ip']}"
+                    info += f", IP={shared_camera_states[i]['ip']}"
                 camera_status.append(f"相机 {i}: {status} {info}")
             else:
                 camera_status.append(f"相机 {i}: 未初始化")
@@ -255,7 +255,7 @@ def main():
         for status in camera_status:
             print(f"  - {status}")
     else:
-        print("⚠️ [主进程]: 等待相机初始化超时，程序将继续运行但可能存在问题")
+        print("⚠️ [主进程]: 等待相机初始化超时")
     
     print("[主进程]: 启动API服务器...")
 

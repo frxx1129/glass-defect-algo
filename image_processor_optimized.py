@@ -695,7 +695,7 @@ def _calculate_score_advanced(
     加大了动态权重的调整幅度，使保真度对多边形的影响更大。
     """
     num_vertices = len(contour)
-    simplicity_score_map = {3: 0.3, 4: 1.0, 5: 0.8, 6: 0.8, 7:0.3, 8:0.3}
+    simplicity_score_map = {3: 0.15, 4: 1.0, 5: 0.8, 6: 0.8, 7:0.3, 8:0.3}
     score_simplicity = simplicity_score_map.get(num_vertices, 0.8 * (6 / max(num_vertices, 1)))
 
     min_v, max_v = 3, 8
@@ -718,7 +718,7 @@ def _calculate_score_advanced(
         "w_simp": w_simp_dyn, "w_fid": w_fid_dyn, "total": final_score
     }
 
-def find_best_fit_polygon(original_contour, min_edge_length_px=15):
+def find_best_fit_polygon(original_contour, min_edge_length_px=69):
     """
     (已更新) 寻找最佳拟合多边形，核心逻辑更新：
     1. 将三角形(3个顶点)纳入最终候选池。
@@ -1072,16 +1072,6 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
                 perpendicular_threshold = 90.0 - parallel_threshold
 
                 defect_type = "B" if angle_diff <= parallel_threshold else ("L" if angle_diff >= perpendicular_threshold else "B")
-
-                # 新增规则：若亮度缺陷面积较小且离边较远，则忽略该缺陷
-                area_px = float(stats[i, cv2.CC_STAT_AREA])
-                area_mm2 = area_px / (ppmm * ppmm) if ppmm > 0 else area_px
-                edge_dist_mm = float(edge_dist_px) / ppmm if ppmm > 0 else float(edge_dist_px)
-                small_area_thr = float(d_cfg.get('SMALL_DEFECT_AREA_MM2', 25.0))
-                far_edge_thr = float(d_cfg.get('SMALL_DEFECT_FAR_EDGE_MM', 10.0))
-                if area_mm2 < small_area_thr and edge_dist_mm > far_edge_thr:
-                    # 跳过：小面积且远离边缘
-                    continue
 
                 # 针对 L 再做长宽比过滤（可配置 MIN_L_ASPECT_RATIO / MAX_L_ASPECT_RATIO），缺省不启用
                 if defect_type == 'L':
