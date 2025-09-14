@@ -6,6 +6,8 @@ import sys
 import os
 import uvicorn
 import cv2
+import signal
+import time
 
 # Import process and thread functions from their respective modules
 from http_client import NonBlockingHttpClient
@@ -14,11 +16,36 @@ from processing_worker import calculation_worker
 from api_server import create_app
 from rejection_controller import RejectionController
 
+# 全局变量，用于在信号处理器中访问
+stop_event = None
+processes = []
+rejection_controller = None
+http_client = None
+
 def main():
     """Main function to initialize shared resources, start child processes, and run the API server."""
     multiprocessing.freeze_support()
     cv2.setUseOptimized(True)
     print("[主进程]: 应用程序启动...")
+    
+    # 全局变量，用于信号处理
+    global stop_event, processes, rejection_controller, http_client
+    
+    # 设置信号处理器，优雅处理CTRL+C和Windows关闭事件
+    def signal_handler(sig, frame):
+        print(f"\n[主进程]: 收到信号 {sig}，开始优雅关闭...")
+        if stop_event:
+            stop_event.set()
+        # 给2秒钟让子进程开始清理
+        time.sleep(2)
+    
+    # 注册SIGINT(Ctrl+C)和SIGTERM(终止)信号处理器
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # 在Windows上特殊处理CTRL+BREAK信号
+    if hasattr(signal, 'SIGBREAK'):  # Windows特有
+        signal.signal(signal.SIGBREAK, signal_handler)
 
     try:
         with open('config.json', 'r', encoding='utf-8') as f:
@@ -68,62 +95,40 @@ def main():
 
     # --- Setup Multiprocessing Manager and Shared State ---
     cs = config.get('camera_setup', {})
-    # 直接使用 expected_cameras 作为“期望的逻辑相机数量”（在无物理相机时用于模拟）
     try:
-        cfg_cam_count = int(cs.get('expected_cameras', 1) or 1)
+        # 以配置文件中的绑定数量或 expected_cameras 为准
+        num_bindings = len(cs.get('camera_bindings', []))
+        NUM_CAMERAS = num_bindings if num_bindings > 0 else int(cs.get('expected_cameras', 1))
     except Exception:
-        cfg_cam_count = 1
-    if cfg_cam_count <= 0:
-        cfg_cam_count = 1
-
-    # 再尝试通过 SDK 实际枚举相机数量（不修改任何网络/IP 设置）
-    actual_cam_count = 0
-    try:
-        from MVGigE import MVInitLib, MVTerminateLib, MVEnumerateAllDevices, MVUpdateCameraList, MVGetNumOfCameras, MVST_SUCCESS
-        MVInitLib()
-        try:
-            res, n = MVEnumerateAllDevices()
-            if res == MVST_SUCCESS and n is not None and int(n) >= 0:
-                actual_cam_count = int(n)
-            else:
-                MVUpdateCameraList()
-                _, n2 = MVGetNumOfCameras()
-                if n2 is not None:
-                    actual_cam_count = int(n2)
-        finally:
-            MVTerminateLib()
-    except Exception:
-        actual_cam_count = 0
-
-    # 取“实际枚举值”为主，失败则退回配置估计
-    NUM_CAMERAS = actual_cam_count if actual_cam_count > 0 else cfg_cam_count
-
+        NUM_CAMERAS = 1
+    if NUM_CAMERAS <= 0: NUM_CAMERAS = 1
+    
     # --- 计算处理进程数量 NUM_WORKERS ---
-    # 新参数: system_params.process_workers (显式进程数)
-    # 旧参数: system_params.max_roi_workers (兼容, 若新参数缺省时仍可作为进程数指定)
     sys_params = config.get('system_params', {})
     logical_cores = os.cpu_count() or 4
     try:
         configured_proc_workers = int(sys_params.get('process_workers', 0) or 0)
     except Exception:
         configured_proc_workers = 0
-    if configured_proc_workers <= 0:
-        # 兼容旧字段作为进程数（若设置且 >0）
-        try:
-            legacy = int(sys_params.get('max_roi_workers', 0) or 0)
-        except Exception:
-            legacy = 0
-        configured_proc_workers = legacy
+    
     if configured_proc_workers > 0:
         NUM_WORKERS = max(1, configured_proc_workers)
     else:
-        usable_cores = max(1, logical_cores - 2)
-        baseline = min(NUM_CAMERAS, usable_cores)  # 每台相机 1 进程为基准
-        NUM_WORKERS = min(baseline, NUM_CAMERAS * 2)
+        # 自动计算: 核心数-2 和 相机数*2 中取较小值，但不小于1
+        NUM_WORKERS = max(1, min(logical_cores - 2, NUM_CAMERAS * 2))
 
-    print(f"[主进程]: 模式={'实机' if actual_cam_count>0 else '测试'} | Cameras={NUM_CAMERAS} | ProcWorkers={NUM_WORKERS} (CPU={logical_cores}, expected={cfg_cam_count}, actual={actual_cam_count})")
+    print(f"[主进程]: 预期相机数={NUM_CAMERAS} | 计算进程数={NUM_WORKERS} (CPU核心={logical_cores})")
 
     manager = multiprocessing.Manager()
+
+    # 确保存储目录存在
+    storage_path = config.get('storage_path', 'inspection_results')
+    if not os.path.exists(storage_path):
+        try:
+            os.makedirs(storage_path)
+            print(f"[主进程]: 创建存储目录: {storage_path}")
+        except Exception as e:
+            print(f"[主进程]: 警告 - 无法创建存储目录 {storage_path}: {e}")
 
     # Shared settings object, populated directly from config.json
     shared_settings = manager.Namespace()
@@ -155,7 +160,6 @@ def main():
     machine_state_shared = manager.Value('i', 0)
     shared_rejection_mode = manager.Value('i', 2) # Default to manual
     can_late_reject = manager.Value('b', False)
-    # collection_id 使用整数共享类型
     shared_collection_id = manager.Value('i', -1)
     shared_user_id_auto = manager.Value('i', config.get('user_id_auto', 7))
     shared_user_id_manual = manager.Value('i', config.get('user_id_manual', 9999))
@@ -163,6 +167,7 @@ def main():
     # Process control events
     stop_event = multiprocessing.Event()
     run_event = multiprocessing.Event()
+    cameras_ready_event = multiprocessing.Event() # ### NEW ###: For startup synchronization
 
     # Threading lock for stats file access
     stats_lock = threading.Lock()
@@ -170,7 +175,6 @@ def main():
     # Hardware controller (instantiated in the main process)
     rejection_controller = RejectionController()
     
-    # --- (新增) 创建非阻塞HTTP客户端实例 ---
     http_workers = int(system_params.get('http_client_max_workers', 4) or 4)
     http_client = NonBlockingHttpClient(max_workers=http_workers)
 
@@ -180,7 +184,8 @@ def main():
     # 1. Camera Pool Process (1 process)
     pool_proc = multiprocessing.Process(
         target=camera_pool_process,
-        args=(task_queue, stop_event, run_event, config, shared_camera_states)
+        args=(task_queue, stop_event, run_event, cameras_ready_event, config, shared_camera_states),
+        daemon=False  # 不能设置为daemon=True，因为需要创建子进程
     )
     processes.append(pool_proc)
     
@@ -188,7 +193,8 @@ def main():
     for i in range(NUM_WORKERS):
         worker_proc = multiprocessing.Process(
             target=calculation_worker, 
-            args=(i, task_queue, results_queue, stop_event, run_event, config, shared_settings)
+            args=(i, task_queue, results_queue, stop_event, run_event, config, shared_settings),
+            daemon=True
         )
         processes.append(worker_proc)
         
@@ -196,11 +202,10 @@ def main():
         p.start()
 
     # --- Prepare Shared Objects for FastAPI and Background Threads ---
-    # This dictionary bundles all shared objects to cleanly pass them to the API server module.
     shared_objects = {
         'stop_event': stop_event, 'run_event': run_event,
         'camera_states': shared_camera_states,
-    'settings': shared_settings,
+        'settings': shared_settings,
         'counters': (shared_yield_counter, shared_rejection_counter),
         'queues': {'task': task_queue, 'results': results_queue, 'rejection': rejection_queue},
         'flags': (manual_reject_flag, shared_rejection_mode, can_late_reject),
@@ -213,35 +218,93 @@ def main():
 
     app = create_app(num_cameras=NUM_CAMERAS, shared_objects=shared_objects)
 
-    # 将常用服务/HTTP/统计配置注入 shared_settings，供后台线程/模块读取
     shared_settings.stats_push_interval_s = int(system_params.get('stats_push_interval_s', 601) or 601)
     shared_settings.http_get_timeout_s = float(system_params.get('http_get_timeout_s', 5) or 5)
     shared_settings.http_post_timeout_s = float(system_params.get('http_post_timeout_s', 5) or 5)
     shared_settings.http_upload_timeout_s = float(system_params.get('http_upload_timeout_s', 15) or 15)
-    # CORS 与服务监听
     cors_list = config.get('server_config', {}).get('cors_origins', ["*"])
     try:
         shared_settings.cors_origins = list(cors_list)
     except Exception:
         shared_settings.cors_origins = ["*"]
 
-    # --- Run Server and Handle Graceful Shutdown ---
+    # --- ### NEW ###: Wait for all cameras to be ready before starting the API server ---
+    print("[主进程]: 等待相机初始化...")
+    start_time = time.time()
+    timeout = 60  # 给相机60秒来初始化
+
+    # 等待相机就绪事件
+    camera_ready = cameras_ready_event.wait(timeout)
+    
+    if camera_ready:
+        # 显示相机状态概述
+        print("✅ [主进程]: 相机就绪")
+        camera_status = []
+        for i in range(NUM_CAMERAS):
+            if i in shared_camera_states:
+                status = shared_camera_states[i].get('status', 'Unknown')
+                info = ""
+                if 'mac' in shared_camera_states[i]:
+                    info += f"MAC={shared_camera_states[i]['mac']}"
+                if 'ip' in shared_camera_states[i]:
+                    info += f", IP={shared_camera_states[i]['ip']}"
+                camera_status.append(f"相机 {i}: {status} {info}")
+            else:
+                camera_status.append(f"相机 {i}: 未初始化")
+        
+        for status in camera_status:
+            print(f"  - {status}")
+    else:
+        print("⚠️ [主进程]: 等待相机初始化超时")
+    
+    print("[主进程]: 启动API服务器...")
+
+    # --- Run Server and Set Initial State ---
+    # 设置初始运行状态：默认自动开始运行
+    auto_start = config.get('system_params', {}).get('auto_start', True)
+    if auto_start:
+        print("[主进程]: 系统配置为自动启动模式，设置运行事件...")
+        run_event.set()
+    
     try:
         listen_host = config.get('server_config', {}).get('listen_host', '0.0.0.0')
         listen_port = int(config.get('server_config', {}).get('listen_port', 12450) or 12450)
         uvicorn.run(app, host=listen_host, port=listen_port)
+    except KeyboardInterrupt:
+        print("\n[主进程]: 接收到键盘中断信号，正在进行优雅关闭...")
+    except Exception as e:
+        print(f"\n[主进程]: 运行时发生异常: {e}")
     finally:
         print("\n[主进程]: 正在终止所有子进程...")
+        # 首先设置停止信号
         stop_event.set()
-        run_event.set() # Ensure processes don't get stuck waiting on the event
-        for p in processes:
-            p.join(timeout=5) 
-            if p.is_alive():
-                print(f"警告: 进程 {p.pid} 未能在5秒内正常退出，将被强制终止。")
-                p.terminate()
         
-        rejection_controller.close()
-        print("[主进程]: 所有资源已释放。")
+        # 等待进程优雅终止
+        for i, p in enumerate(processes):
+            try:
+                p_name = p.name if hasattr(p, 'name') else f"Process-{i}"
+                print(f"[主进程]: 等待 {p_name} 终止...")
+                p.join(timeout=5.0)
+                if p.is_alive():
+                    print(f"[主进程]: {p_name} 未能在超时时间内终止，尝试强制终止")
+            except Exception as e:
+                print(f"[主进程]: 等待进程终止时出错: {e}")
+        
+        # 关闭硬件控制器
+        try:
+            rejection_controller.close()
+            print("[主进程]: 排废硬件控制器已关闭")
+        except Exception as e:
+            print(f"[主进程]: 关闭排废控制器时出错: {e}")
+        
+        # 关闭HTTP客户端
+        try:
+            http_client.shutdown()
+            print("[主进程]: HTTP客户端已关闭")
+        except Exception as e:
+            print(f"[主进程]: 关闭HTTP客户端时出错: {e}")
+            
+        print("[主进程]: 所有资源已释放，程序退出。")
 
 if __name__ == '__main__':
     main()

@@ -695,7 +695,7 @@ def _calculate_score_advanced(
     加大了动态权重的调整幅度，使保真度对多边形的影响更大。
     """
     num_vertices = len(contour)
-    simplicity_score_map = {3: 0.3, 4: 1.0, 5: 0.8, 6: 0.8, 7:0.3, 8:0.3}
+    simplicity_score_map = {3: 0.15, 4: 1.0, 5: 0.8, 6: 0.8, 7:0.3, 8:0.3}
     score_simplicity = simplicity_score_map.get(num_vertices, 0.8 * (6 / max(num_vertices, 1)))
 
     min_v, max_v = 3, 8
@@ -718,7 +718,7 @@ def _calculate_score_advanced(
         "w_simp": w_simp_dyn, "w_fid": w_fid_dyn, "total": final_score
     }
 
-def find_best_fit_polygon(original_contour, min_edge_length_px=15):
+def find_best_fit_polygon(original_contour, min_edge_length_px=69):
     """
     (已更新) 寻找最佳拟合多边形，核心逻辑更新：
     1. 将三角形(3个顶点)纳入最终候选池。
@@ -1039,7 +1039,8 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
             num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(anomaly_mask, 8, cv2.CV_32S)
 
             for i in range(1, num_labels):
-                if stats[i, cv2.CC_STAT_AREA] < min_defect_area_px:
+                area_px = stats[i, cv2.CC_STAT_AREA]
+                if area_px < min_defect_area_px:
                     continue
 
                 component_points = np.argwhere(labels == i)[:, ::-1]
@@ -1063,6 +1064,18 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
                 simplified_vertices_float = vertices_f32.astype(np.float64, copy=False)
                 local_edge_angle, edge_dist_px = find_closest_edge_numba(simplified_vertices_float, defect_center[0], defect_center[1])
 
+                # 计算缺陷面积（平方毫米）
+                area_mm2 = area_px / (ppmm * ppmm)
+                
+                # 新增：检查小面积缺陷是否距离边缘太远，如果是则忽略
+                max_edge_dist_mm = float(d_cfg.get('MAX_EDGE_DIST_MM_FOR_SMALL_DEFECT', 10.0))
+                min_small_defect_area_mm2 = float(d_cfg.get('MIN_SMALL_DEFECT_AREA_MM2', 10.0))
+                edge_dist_mm = edge_dist_px / ppmm
+                
+                # 如果是小缺陷（<10mm²）且距离边缘太远（>10mm），则忽略
+                if area_mm2 < min_small_defect_area_mm2 and edge_dist_mm > max_edge_dist_mm:
+                    continue
+
                 angle_diff = calculate_angle_difference_numba(
                     normalize_angle_numba(defect_long_axis_angle),
                     normalize_angle_numba(local_edge_angle)
@@ -1072,16 +1085,6 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
                 perpendicular_threshold = 90.0 - parallel_threshold
 
                 defect_type = "B" if angle_diff <= parallel_threshold else ("L" if angle_diff >= perpendicular_threshold else "B")
-
-                # 新增规则：若亮度缺陷面积较小且离边较远，则忽略该缺陷
-                area_px = float(stats[i, cv2.CC_STAT_AREA])
-                area_mm2 = area_px / (ppmm * ppmm) if ppmm > 0 else area_px
-                edge_dist_mm = float(edge_dist_px) / ppmm if ppmm > 0 else float(edge_dist_px)
-                small_area_thr = float(d_cfg.get('SMALL_DEFECT_AREA_MM2', 25.0))
-                far_edge_thr = float(d_cfg.get('SMALL_DEFECT_FAR_EDGE_MM', 10.0))
-                if area_mm2 < small_area_thr and edge_dist_mm > far_edge_thr:
-                    # 跳过：小面积且远离边缘
-                    continue
 
                 # 针对 L 再做长宽比过滤（可配置 MIN_L_ASPECT_RATIO / MAX_L_ASPECT_RATIO），缺省不启用
                 if defect_type == 'L':
