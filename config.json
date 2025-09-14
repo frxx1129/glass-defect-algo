@@ -51,16 +51,16 @@
     "camera_bindings": [
       {
         "index": 0,
-        "physical_index": 1,
+        "physical_index": 2,
         "mac": "94:AA:B8:00:08:A2",
-        "ip": "192.168.4.162",
+        "ip": "192.168.5.162",
         "model": "MV-HP120GM"
       },
       {
         "index": 1,
-        "physical_index": 2,
+        "physical_index": 1,
         "mac": "94:AA:B8:01:FC:E6",
-        "ip": "192.168.5.130",
+        "ip": "192.168.4.130",
         "model": "MV-HP120GM"
       },
       {
@@ -78,7 +78,7 @@
         "frame_rate": 10
       },
       "exposure": {
-        "value_us": 800
+        "value_us": 630
       },
       "gain": {
         "value_db": 1.2
@@ -126,7 +126,7 @@
       "min_points_per_cluster": 50
     },
     "contour_params": {
-      "min_area": 30000
+      "min_area": 50000
     },
     "defect_params": {
       "PIXELS_PER_MM": 2.735,
@@ -135,29 +135,29 @@
       "ANGLE_MIN_THRESHOLD": 10.0,
       "ANGLE_MAX_THRESHOLD": 170.0,
       "ANGLE_BIAS_DEG": 0.0,
-      "ANGLE_SNAP_TO_90_DEADBAND_DEG": 10.0,
+      "ANGLE_SNAP_TO_90_DEADBAND_DEG": 7.0,
       "ANGLE_SOFT_SNAP_GAIN": 0.5,
-      "ANGLE_SOFT_SNAP_MAX_DEVIATION": 12.0,
+      "ANGLE_SOFT_SNAP_MAX_DEVIATION": 10.0,
       "ANGLE_REPORT_ROUND_TO": 0.5,
-      "DEFECT_STD_DEV_THRESHOLD": 2.5,
-      "MIN_DEFECT_AREA_MM2": 9,
-      "MIN_DEFECT_DIMENSION_MM": 3,
-      "MIN_DEFECT_WIDTH_MM": 3,
-      "DEFECT_MERGE_KERNEL_SIZE": 3,
+      "DEFECT_STD_DEV_THRESHOLD": 3,
+      "MIN_DEFECT_AREA_MM2": 4,
+      "MIN_SMALL_DEFECT_AREA_MM2": 30.0,
+      "MAX_EDGE_DIST_MM_FOR_SMALL_DEFECT": 10.0,
+      "MIN_DEFECT_DIMENSION_MM": 2,
+      "MIN_DEFECT_WIDTH_MM": 2,
+      "DEFECT_MERGE_KERNEL_SIZE": 9,
       "ORIENTATION_PARALLEL_THRESHOLD": 10.0,
       "MIN_L_ASPECT_RATIO": 3.0,
       "MAX_L_ASPECT_RATIO": 30.0,
       "BRIGHTNESS_ENHANCE": true,
-      "BRIGHTNESS_CLAHE_CLIP_LIMIT": 8,
+      "BRIGHTNESS_CLAHE_CLIP_LIMIT": 5.5,
       "BRIGHTNESS_CLAHE_TILE_TARGET_PX": 16,
-      "BRIGHTNESS_MEDIAN_KSIZE": 7,
-      "BRIGHTNESS_MEDIAN_BLUR": true,
-      "SMALL_DEFECT_AREA_MM2": 15.0,
-      "SMALL_DEFECT_FAR_EDGE_MM": 3.0
+      "BRIGHTNESS_MEDIAN_KSIZE": 3,
+      "BRIGHTNESS_MEDIAN_BLUR": true
     },
     "drawing_params": {
       "DRAW_RAW_CONTOUR": false,
-      "DRAW_SIMPLIFIED_CONTOUR": true,
+      "DRAW_SIMPLIFIED_CONTOUR": false,
       "HIGHLIGHT_DEFECT_PIXELS": true,
       "DEFECT_PIXEL_ALPHA": 0.5,
       "BOUNDARY_THRESHOLD": 5,
@@ -174,7 +174,7 @@
         255
       ],
       "SIMPLIFIED_CONTOUR_THICKNESS": 1,
-      "DEFECT_CONTOUR_MASK_THICKNESS": 5,
+      "DEFECT_CONTOUR_MASK_THICKNESS": 7,
       "DEBUG_TRACE": false
     }
   }

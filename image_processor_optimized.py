@@ -1039,7 +1039,8 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
             num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(anomaly_mask, 8, cv2.CV_32S)
 
             for i in range(1, num_labels):
-                if stats[i, cv2.CC_STAT_AREA] < min_defect_area_px:
+                area_px = stats[i, cv2.CC_STAT_AREA]
+                if area_px < min_defect_area_px:
                     continue
 
                 component_points = np.argwhere(labels == i)[:, ::-1]
@@ -1062,6 +1063,18 @@ def process_roi_with_defect_detection(roi_idx, roi_template, image_gray, config,
 
                 simplified_vertices_float = vertices_f32.astype(np.float64, copy=False)
                 local_edge_angle, edge_dist_px = find_closest_edge_numba(simplified_vertices_float, defect_center[0], defect_center[1])
+
+                # 计算缺陷面积（平方毫米）
+                area_mm2 = area_px / (ppmm * ppmm)
+                
+                # 新增：检查小面积缺陷是否距离边缘太远，如果是则忽略
+                max_edge_dist_mm = float(d_cfg.get('MAX_EDGE_DIST_MM_FOR_SMALL_DEFECT', 10.0))
+                min_small_defect_area_mm2 = float(d_cfg.get('MIN_SMALL_DEFECT_AREA_MM2', 10.0))
+                edge_dist_mm = edge_dist_px / ppmm
+                
+                # 如果是小缺陷（<10mm²）且距离边缘太远（>10mm），则忽略
+                if area_mm2 < min_small_defect_area_mm2 and edge_dist_mm > max_edge_dist_mm:
+                    continue
 
                 angle_diff = calculate_angle_difference_numba(
                     normalize_angle_numba(defect_long_axis_angle),
