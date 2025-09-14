@@ -1,4 +1,3 @@
-# --- START OF FILE camera_process.py ---
 import time
 import queue
 import traceback
@@ -87,10 +86,17 @@ def _camera_worker_process(cam_index: int, task_queue, stop_event, run_event, co
     except Exception:
         cam.heartbeat_timeout_ms = 30000
     try:
-        if not cam.open():
-            shared_states[cam_index] = {"status": "Open Failed"}
+        open_result = cam.open()
+        if not open_result:
+            shared_states[cam_index] = {"status": "Open Failed", "error": "打开相机失败"}
+            print(f"[相机进程 {cam_index}]: 打开相机失败，MAC: {desired_mac or '未指定'}")
             return
 
+        # 相机已成功打开，更新状态
+        shared_states[cam_index] = {"status": "Opened", "mac": cam.mac, "ip": cam.ip}
+        print(f"[相机进程 {cam_index}]: 成功打开相机，MAC: {cam.mac}, IP: {cam.ip}")
+
+        # 应用相机参数
         unified_params = copy.deepcopy(config.get('camera_setup', {}).get('unified_params', {}) or {})
         if 'network' not in unified_params:
             unified_params['network'] = {}
@@ -143,8 +149,18 @@ def _camera_worker_process(cam_index: int, task_queue, stop_event, run_event, co
         res = MVStartGrab(cam.handle, cb, cam.handle)
         if res != MVST_SUCCESS:
             print(f"[相机进程 {cam_index}]: MVStartGrab 失败: {res}")
+            shared_states[cam_index] = {
+                "status": "Grab Failed", 
+                "error": f"相机启动采集失败: {res}",
+                "mac": cam.mac, 
+                "ip": cam.ip
+            }
             return
 
+        # 更新相机状态为正在采集
+        shared_states[cam_index] = cam.get_full_status()
+        shared_states[cam_index]["status"] = "Grabbing"
+        
         # 计算并输出触发周期
         period_ms = _compute_trigger_period_ms(config)
         period_s = max(0.001, period_ms / 1000.0)
@@ -166,18 +182,25 @@ def _camera_worker_process(cam_index: int, task_queue, stop_event, run_event, co
                 # free-run：无须触发，仅小睡避免空转
                 time.sleep(0.005)
 
-    except Exception:
-        traceback.print_exc()
+    except Exception as e:
+        error_msg = traceback.format_exc()
+        print(f"[相机进程 {cam_index}]: 出现异常: {e}\n{error_msg}")
+        shared_states[cam_index] = {"status": "Error", "error": str(e)}
     finally:
         try:
-            if cam and cam.handle:
+            print(f"[相机进程 {cam_index}]: 正在关闭相机...")
+            if cam and hasattr(cam, 'handle') and cam.handle:
                 try:
                     MVStopGrab(cam.handle)
-                except Exception:
-                    pass
-            cam.close()
-        except Exception:
-            pass
+                    print(f"[相机进程 {cam_index}]: 已停止图像采集")
+                except Exception as e:
+                    print(f"[相机进程 {cam_index}]: 停止采集时出错: {e}")
+            
+            if cam:
+                cam.close()
+                print(f"[相机进程 {cam_index}]: 相机已关闭")
+        except Exception as e:
+            print(f"[相机进程 {cam_index}]: 清理资源时出错: {e}")
 
 
 def _test_camera_worker_process(cam_index: int, task_queue, stop_event, run_event, capture_interval_s: float,
@@ -202,15 +225,17 @@ def _test_camera_worker_process(cam_index: int, task_queue, stop_event, run_even
             time.sleep(0.003)
 
 
-def camera_pool_process(task_queue, stop_event, run_event, config, shared_states):
+def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, config, shared_states):
     """
     多相机采集进程：
     - 初始化与打开相机
-    - 每台相机独立线程采集，抓到就立即投递（非阻塞），保持“只取最新”由处理端合帧
+    - 每台相机独立线程采集，抓到就立即投递（非阻塞），保持"只取最新"由处理端合帧
     - 与相机帧率解耦，不再使用处理节拍节流
+    - 使用 cameras_ready_event 通知主进程相机已就绪
     """
     print("[相机池]: 进程已启动。")
-    # 移除提升进程优先级与额外的资源抢占防护
+    # 提升进程优先级，减少被其他进程抢占的概率
+    _boost_process_priority_windows()
 
     # 取消处理节拍节流，采集线程抓到即投递；如需限速请改在处理端控制
 
@@ -254,7 +279,7 @@ def camera_pool_process(task_queue, stop_event, run_event, config, shared_states
         runtime = (config.get('camera_setup') or {}).get('runtime', {})
         legacy_sys = (config.get('system_params') or {})
         frame_rate = float(acq.get('frame_rate', runtime.get('frame_rate', legacy_sys.get('target_fps', 15))) or runtime.get('target_fps', legacy_sys.get('target_fps', 15)) or 15)
-        # 设定每“行”间隔 = 1/frame_rate 秒 -> 每个相机每秒也近似输出 frame_rate 帧
+        # 设定每"行"间隔 = 1/frame_rate 秒 -> 每个相机每秒也近似输出 frame_rate 帧
         row_interval = 1.0 / max(1.0, frame_rate)
         # 垂直步进像素：使得完整穿过高度大约需要 cam_h / step_px 行；设置为高度 / (frame_rate * 6) 约 6 秒穿过
         step_px = max(1, int(cam_h / (frame_rate * 6)))
@@ -304,6 +329,21 @@ def camera_pool_process(task_queue, stop_event, run_event, config, shared_states
                                     pane_width_factor=pane_width_factor, pane_margin_px=pane_margin_px,
                                     rois_per_cam=rois_per_cam, roi_only=False)
         print(f"[相机池][测试模式]: 玻璃+ROI 模式 | cameras={test_cameras}, size={cam_w}x{cam_h}, roi_loaded={[len(r) for r in rois_per_cam]}")
+        
+        # 初始化所有模拟相机的状态
+        for idx in range(test_cameras):
+            shared_states[idx] = {
+                "status": "Connected (Test Mode)",
+                "type": "Synthetic",
+                "camera_index": idx,
+                "frame_size": f"{cam_w}x{cam_h}",
+                "rois_count": len(rois_per_cam[idx]) if idx < len(rois_per_cam) else 0
+            }
+        
+        # 通知主进程相机已准备就绪
+        print(f"[相机池]: 所有{test_cameras}台模拟相机已就绪，发送就绪事件...")
+        cameras_ready_event.set()
+        
         next_row_t = time.perf_counter()
         while not stop_event.is_set():
             now = time.perf_counter()
@@ -332,13 +372,50 @@ def camera_pool_process(task_queue, stop_event, run_event, config, shared_states
         p.start()
         procs.append(p)
 
+    # 等待所有相机状态更新完成
+    start_time = time.time()
+    timeout = 30  # 30秒超时
+    all_ready = False
+    
+    while not stop_event.is_set() and not all_ready and (time.time() - start_time) < timeout:
+        time.sleep(0.5)  # 每0.5秒检查一次
+        
+        # 检查所有相机是否已更新状态
+        initialized_cameras = 0
+        for i in range(num_cameras):
+            if i in shared_states and shared_states[i]:
+                initialized_cameras += 1
+        
+        if initialized_cameras == num_cameras:
+            all_ready = True
+            print(f"[相机池]: 所有{num_cameras}台相机已初始化完成，发送就绪事件...")
+            cameras_ready_event.set()
+    
+    if not all_ready and not stop_event.is_set():
+        print(f"[相机池]: 警告 - 在{timeout}秒内未能初始化所有相机，但仍继续运行...")
+        # 即使有相机未准备好，也发送就绪事件以避免主进程无限等待
+        cameras_ready_event.set()
+
     # 守护等待退出
     try:
         while not stop_event.is_set():
             time.sleep(0.2)
     finally:
         # 结束所有子进程
+        print("[相机池]: 正在关闭所有相机进程...")
         for p in procs:
-            p.join(timeout=1.0)
-        print("[相机池]: 采集子进程已退出。")
-# --- END OF FILE camera_process.py ---
+            try:
+                p.join(timeout=2.0)
+                if p.is_alive():
+                    print(f"[相机池]: 警告 - 进程 {p.name} 未能在超时时间内退出，将被强制终止")
+            except Exception as e:
+                print(f"[相机池]: 关闭进程 {p.name} 时出错: {e}")
+        
+        # 清理相机设置工具的资源
+        try:
+            setup_tool.cleanup()
+            print("[相机池]: 相机设置工具资源已释放")
+        except Exception as e:
+            print(f"[相机池]: 清理相机设置工具资源时出错: {e}")
+            
+        print("[相机池]: 所有相机资源已释放，采集进程退出。")

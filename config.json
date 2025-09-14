@@ -1,6 +1,9 @@
 {
   "storage_path": "inspection_results",
   "roi_template_file": "roi_averaged_by_group_CORRECTED.json",
+  "lineName": "Line1",
+  "user_id_auto": 7,
+  "user_id_manual": 9999,
   "system_params": {
     "pixels_per_mm": 2.735,
     "queue_size_factor": 2,
@@ -16,65 +19,62 @@
     "coalesce_drain_budget_ms": 5,
     "coalesce_max_drain": 500,
     "process_workers": 5,
-    "roi_threads": 2,
-    "max_roi_workers": 3
+    "roi_threads": 2
   },
-  "user_id_auto": 7,
-  "user_id_manual": 9999,
   "camera_setup": {
+    "expected_cameras": 3,
+    "bootstrap_default_ip": "192.168.200.1",
+    "bootstrap_assign_ips": true,
     "open_retry_count": 3,
     "open_retry_backoff_base_s": 2,
     "heartbeat_timeout_ms": 30000,
-    "auto_configure_nics": false,
-    "auto_assign_ips": false,
-    "expected_cameras": 5,
     "runtime": {
-      "capture_interval_s": 0.1,
       "use_software_trigger": true,
       "frame_rate": 10,
-      "enforce_mono8": true,
-      "default_packet_size_bytes": 8996,
-      "default_packet_delay_us": 120
+      "enforce_mono8": true
     },
-    "mac_bindings": {
-      "0": "94:AA:B8:01:FC:E6",
-      "1": "94:AA:B8:01:3A:DF",
-      "2": "94:AA:B8:00:08:A2"
-    },
+    "camera_bindings": [
+      {
+        "index": 0,
+        "mac": "94:AA:B8:01:FC:E6",
+        "ip": "192.168.10.2"
+      },
+      {
+        "index": 1,
+        "mac": "94:AA:B8:01:3A:DF",
+        "ip": "192.168.11.2"
+      },
+      {
+        "index": 2,
+        "mac": "94:AA:B8:00:08:A2",
+        "ip": "192.168.12.2"
+      }
+    ],
     "unified_params": {
       "acquisition": {
         "width": 2448,
         "height": 2048,
-        "frame_rate": 10,
-        "pixel_format": 17301505
+        "frame_rate": 10
       },
       "exposure": {
-        "value_us": 800.0
+        "value_us": 800
       },
       "gain": {
         "value_db": 1.2
       },
       "gamma": {
-        "value": 1.0
+        "value": 1
       },
       "network": {
-        "packet_size_bytes": 8848,
+        "packet_size_bytes": 8996,
         "packet_delay_us": 120
       }
-    },
-    "ip_bindings": {
-      "0": "192.168.1.201",
-      "1": "192.168.1.200",
-      "2": "192.168.1.202"
     }
   },
-  "lineName": "Line1",
   "camera_rois": {
     "0": "roi_averaged_by_group_CORRECTED.json",
     "1": "roi_averaged_by_group_CORRECTED.json",
-    "2": "roi_averaged_by_group_CORRECTED.json",
-    "3": "roi_averaged_by_group_CORRECTED.json",
-    "4": "roi_averaged_by_group_CORRECTED.json"
+    "2": "roi_averaged_by_group_CORRECTED.json"
   },
   "server_config": {
     "server": "202.115.65.101",
@@ -88,8 +88,7 @@
     "heartbeat_url": "http://202.115.65.101:3200/fastapi/system/heartbeat"
   },
   "rejection_params": {
-    "max_defect_size_mm": 20.0,
-    "angle_deviation_deg": 1.0,
+    "max_defect_size_mm": 20,
     "REJECTION_PULSE_MS": 100,
     "REJECTION_DELAY_S": 2
   },

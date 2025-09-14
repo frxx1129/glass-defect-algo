@@ -102,8 +102,13 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         threshold_str = str(initial_state.get("rejectionThreshold", 20.0)).replace("mm", "").strip()
         shared_settings.max_defect_size_mm = float(threshold_str) if threshold_str else 20.0
         shared_user_id_auto.value = initial_state.get("algUserVO", {}).get("userId", 7)
-        if initial_state.get("enable") == 1: run_event_proxy.set()
-        else: run_event_proxy.clear()
+        # 如果服务器返回enabled=1，则启动运行；但不会停止已运行的系统
+        if initial_state.get("enable") == 1: 
+            run_event_proxy.set()
+            print("[状态机]: 从服务器获取到启用状态，设置运行事件。")
+    else:
+        # 如果服务器通信失败，保持当前运行状态
+        print("[状态机]: 未能从服务器获取状态，保持当前运行状态。")
     
     while not stop_event.is_set():
         # Handle late manual rejection
