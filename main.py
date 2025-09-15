@@ -5,6 +5,7 @@ import json
 import sys
 import os
 import uvicorn
+import msvcrt  # Windows 按键检测
 import cv2
 import signal
 import time
@@ -256,7 +257,26 @@ def main():
     else:
         print("⚠️ [主进程]: 等待相机初始化超时")
     
-    print("[主进程]: 启动API服务器...")
+    # 根据DEBUG_MODE_ON控制前台/后台行为
+    debug_mode = bool(config.get('DEBUG_MODE_ON', True))
+    if not debug_mode:
+        print("相机启动完成，按任意键继续...")
+        try:
+            # 等待任意键
+            msvcrt.getch()
+        except Exception:
+            pass
+        # 尝试将控制台隐藏（在nuitka打包成exe时生效最佳）
+        try:
+            import ctypes
+            whnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if whnd:
+                SW_HIDE = 0
+                ctypes.windll.user32.ShowWindow(whnd, SW_HIDE)
+        except Exception:
+            pass
+    else:
+        print("[主进程]: 启动API服务器...")
 
     # --- Run Server ---
     auto_start = config.get('system_params', {}).get('auto_start', True)
@@ -267,7 +287,11 @@ def main():
     try:
         listen_host = config.get('server_config', {}).get('listen_host', '0.0.0.0')
         listen_port = int(config.get('server_config', {}).get('listen_port', 12450) or 12450)
-        uvicorn.run(app, host=listen_host, port=listen_port)
+        # 在非调试模式下，避免uvicorn的冗余日志输出
+        if not debug_mode:
+            uvicorn.run(app, host=listen_host, port=listen_port, log_level="warning")
+        else:
+            uvicorn.run(app, host=listen_host, port=listen_port)
     except KeyboardInterrupt:
         print("\n[主进程]: 接收到键盘中断信号，正在进行优雅关闭...")
     except Exception as e:
