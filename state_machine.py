@@ -11,6 +11,12 @@ from server_comms import send_report_to_server, fetch_collection_id_from_server,
 
 def results_and_state_machine_thread(num_cameras, results_queue, connection_manager, stop_event, loop, shared_settings, counters, queues, flags, machine_state_shared, stats_lock, metadata, run_event_proxy, http_client):
     print("[状态机线程]: 已启动。")
+
+    # 从主模块获取共享的硬件控制器实例
+    # 这是确保线程能访问在主进程中初始化的对象的直接方法
+    import main as main_module
+    alarm_light_controller = main_module.alarm_light_controller
+    
     STORAGE_PATH = shared_settings.storage_path
     (shared_yield_counter, shared_rejection_counter) = counters
     (rejection_queue,) = queues
@@ -29,6 +35,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     
     max_complexity_snapshot = np.zeros(num_cameras, dtype=np.int32)
     is_current_event_rejected = False
+    is_ng_alarm_triggered_for_pane = False # <-- 新增标志，确保NG报警每片玻璃只触发一次
     rejection_details = {}
     saved_for_this_pane = False
     
@@ -59,9 +66,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         label_parts = [p for p in [size_part, "X" if has_x_defect else "", "Q" if has_q_defect else ""] if p]
         final_size_label = ",".join(label_parts)
         
-        # 处理 collection_id：共享内存中存储为 bytes，需要转换为可 JSON 序列化的 str / int
         raw_cid = shared_collection_id.value
-        # 直接解析为整数，不可解析则为 -1
         try:
             if isinstance(raw_cid, (bytes, bytearray)):
                 collection_id = int(raw_cid.decode('utf-8', errors='ignore').strip() or -1)
@@ -102,12 +107,10 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         threshold_str = str(initial_state.get("rejectionThreshold", 20.0)).replace("mm", "").strip()
         shared_settings.max_defect_size_mm = float(threshold_str) if threshold_str else 20.0
         shared_user_id_auto.value = initial_state.get("algUserVO", {}).get("userId", 7)
-        # 如果服务器返回enabled=1，则启动运行；但不会停止已运行的系统
         if initial_state.get("enable") == 1: 
             run_event_proxy.set()
             print("[状态机]: 从服务器获取到启用状态，设置运行事件。")
     else:
-        # 如果服务器通信失败，保持当前运行状态
         print("[状态机]: 未能从服务器获取状态，保持当前运行状态。")
     
     while not stop_event.is_set():
@@ -131,10 +134,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             cam_index = result["camera_index"]
             ws_data = {k:v for k,v in result.items() if k != 'annotated_image_buffer'}
             try:
-                # 投递到事件循环，忽略返回值，保证主逻辑不阻塞
                 asyncio.run_coroutine_threadsafe(connection_manager.broadcast(json.dumps(ws_data), cam_index), loop)
             except Exception:
-                # 即使事件循环未就绪/关闭，也不要阻塞主循环
                 pass
             
             # Daily stat reset logic
@@ -149,16 +150,27 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     yield_manager.save_stats(now_str, total_yield, total_rejections)
             
             # 动态确保数组容量充足，防越界
-            if cam_index >= last_camera_states.shape[0]:
-                last_camera_states = np.pad(last_camera_states, (0, cam_index - last_camera_states.shape[0] + 1), mode='constant')
-                max_complexity_snapshot.resize(last_camera_states.shape[0], refcheck=False)
+            if cam_index >= len(last_camera_states):
+                last_camera_states.resize(cam_index + 1, refcheck=False)
+                max_complexity_snapshot.resize(cam_index + 1, refcheck=False)
+
             last_camera_states[cam_index] = result['state_code']
             current_total_panes = np.sum(last_camera_states)
             
-            # State machine logic
+            # --- 状态机核心逻辑 (集成报警器控制) ---
             if machine_state == "PANE_DETECTED" and current_total_panes == 0:
                 print(f"--- [状态机]: 玻璃离开事件 ---")
                 machine_state = "WAITING_FOR_PANE"; machine_state_shared.value = 0
+                
+                # --- 根据是否剔废，设置报警器状态 ---
+                if alarm_light_controller:
+                    if is_current_event_rejected:
+                        # 如果剔废了，亮红灯 + 蜂鸣
+                        alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
+                    else:
+                        # 如果没剔废（无论是OK还是NG），都恢复绿灯
+                        alarm_light_controller.set_normal_state()
+
                 if not is_current_event_rejected:
                     yield_this = min(np.count_nonzero(max_complexity_snapshot == 2) + (1 if np.count_nonzero(max_complexity_snapshot == 1) > 0 else 0), 3)
                     if yield_this > 0:
@@ -180,7 +192,14 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     print(f"    [状态机]: 上一片玻璃存在NG，已暂存信息，等待可能的滞后剔废指令。")
 
             elif machine_state == "PANE_DETECTED":
-                if result['image_status'] == 'NG': current_pane_ng_buffer.append(result)
+                if result['image_status'] == 'NG': 
+                    current_pane_ng_buffer.append(result)
+                    # --- 如果是本片玻璃第一次检测到NG，触发黄色报警 ---
+                    if not is_ng_alarm_triggered_for_pane:
+                        if alarm_light_controller:
+                            alarm_light_controller.set_ng_detected_state(shared_settings.ng_buzz_duration_s)
+                        is_ng_alarm_triggered_for_pane = True
+
                 if np.sum(last_camera_states) > np.sum(max_complexity_snapshot):
                     max_complexity_snapshot = last_camera_states.copy()
                 
@@ -211,7 +230,13 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 machine_state = "PANE_DETECTED"; machine_state_shared.value = 1
                 current_pane_ng_buffer.clear(); max_complexity_snapshot.fill(0)
                 is_current_event_rejected = False; rejection_details = {}; saved_for_this_pane = False
+                is_ng_alarm_triggered_for_pane = False # <-- 重置NG报警标志
                 can_late_reject.value = False
+                
+                # --- 玻璃进入时，确保恢复到绿色常亮状态 ---
+                if alarm_light_controller:
+                    alarm_light_controller.set_normal_state()
+                
                 print(f"--- [状态机]: 玻璃进入事件 ---")
         except Empty: 
             pass

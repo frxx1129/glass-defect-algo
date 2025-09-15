@@ -21,6 +21,11 @@
     "process_workers": 5,
     "roi_threads": 2
   },
+  "alarm_light_params": {
+    "port": "COM1",
+    "ng_buzz_duration_s": 1.0,
+    "rejection_buzz_duration_s": 3.0
+},
   "camera_setup": {
     "expected_cameras": 3,
     "bootstrap_default_ip": "192.168.1.200",

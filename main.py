@@ -15,12 +15,14 @@ from camera_process import camera_pool_process
 from processing_worker import calculation_worker
 from api_server import create_app
 from rejection_controller import RejectionController
+from alarm_light_controller import AlarmLightController # <-- 新增导入
 
 # 全局变量，用于在信号处理器中访问
 stop_event = None
 processes = []
 rejection_controller = None
 http_client = None
+alarm_light_controller = None # <-- 新增全局变量
 
 def main():
     """Main function to initialize shared resources, start child processes, and run the API server."""
@@ -29,7 +31,7 @@ def main():
     print("[主进程]: 应用程序启动...")
     
     # 全局变量，用于信号处理
-    global stop_event, processes, rejection_controller, http_client
+    global stop_event, processes, rejection_controller, http_client, alarm_light_controller # <-- 添加到全局
     
     # 设置信号处理器，优雅处理CTRL+C和Windows关闭事件
     def signal_handler(sig, frame):
@@ -145,6 +147,12 @@ def main():
     shared_settings.upload_url = server_config.get('upload_url', f'http://{shared_settings.server}:5000/upload')
     shared_settings.stats_push_url = server_config.get('stats_push_url', f'http://{shared_settings.server}:8085/fastapi/glass/updateYieldAndRejections')
     shared_settings.heartbeat_url = server_config.get('heartbeat_url', f'http://{shared_settings.server}:8085/fastapi/system/heartbeat')
+    
+    # --- 新增: 读取报警器配置并添加到 shared_settings ---
+    alarm_params = config.get('alarm_light_params', {})
+    shared_settings.alarm_port = alarm_params.get('port') # 从config中读取port
+    shared_settings.ng_buzz_duration_s = float(alarm_params.get('ng_buzz_duration_s', 1.0))
+    shared_settings.rejection_buzz_duration_s = float(alarm_params.get('rejection_buzz_duration_s', 3.0))
 
     # Queues for data flow between processes
     queue_size_factor = int(system_params.get('queue_size_factor', 2) or 2)
@@ -167,14 +175,23 @@ def main():
     # Process control events
     stop_event = multiprocessing.Event()
     run_event = multiprocessing.Event()
-    cameras_ready_event = multiprocessing.Event() # ### NEW ###: For startup synchronization
+    cameras_ready_event = multiprocessing.Event() # For startup synchronization
 
     # Threading lock for stats file access
     stats_lock = threading.Lock()
 
-    # Hardware controller (instantiated in the main process)
+    # Hardware controllers (instantiated in the main process)
     rejection_controller = RejectionController()
     
+    # --- 新增: 实例化报警器控制器 ---
+    if shared_settings.alarm_port:
+        alarm_light_controller = AlarmLightController(port=shared_settings.alarm_port)
+        # 执行启动时的声光报警状态
+        alarm_light_controller.set_startup_state()
+    else:
+        print("[主进程]: 警告 - 未在config.json中配置声光报警器端口(alarm_light_params.port)，将不启用该功能。")
+        alarm_light_controller = None # 明确设置为None
+
     http_workers = int(system_params.get('http_client_max_workers', 4) or 4)
     http_client = NonBlockingHttpClient(max_workers=http_workers)
 
@@ -185,7 +202,7 @@ def main():
     pool_proc = multiprocessing.Process(
         target=camera_pool_process,
         args=(task_queue, stop_event, run_event, cameras_ready_event, config, shared_camera_states),
-        daemon=False  # 不能设置为daemon=True，因为需要创建子进程
+        daemon=False
     )
     processes.append(pool_proc)
     
@@ -213,6 +230,7 @@ def main():
         'stats_lock': stats_lock,
         'metadata': (shared_collection_id, shared_user_id_auto, shared_user_id_manual),
         'rejection_controller': rejection_controller,
+        'alarm_light_controller': alarm_light_controller, # <-- 将报警器实例传递给API/状态机
         'http_client': http_client
     }
 
@@ -228,7 +246,7 @@ def main():
     except Exception:
         shared_settings.cors_origins = ["*"]
 
-    # --- ### NEW ###: Wait for all cameras to be ready before starting the API server ---
+    # --- Wait for all cameras to be ready before starting the API server ---
     print("[主进程]: 等待相机初始化...")
     start_time = time.time()
     timeout = 60  # 给相机60秒来初始化
@@ -297,6 +315,14 @@ def main():
         except Exception as e:
             print(f"[主进程]: 关闭排废控制器时出错: {e}")
         
+        # --- 新增: 关闭报警器控制器 ---
+        try:
+            if alarm_light_controller:
+                alarm_light_controller.close()
+                print("[主进程]: 声光报警器控制器已关闭")
+        except Exception as e:
+            print(f"[主进程]: 关闭声光报警器时出错: {e}")
+            
         # 关闭HTTP客户端
         try:
             http_client.shutdown()
