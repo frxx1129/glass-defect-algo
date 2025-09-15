@@ -26,5 +26,6 @@ dependencies = [
 	# Clustering (DBSCAN used) - 正确包名是 scikit-learn 不是 scikit
 	"scikit-learn>=1.4.0",
 	"nuitka>=2.3",
-	"scipy>=1.12.0"  # 打包命令中引用 --include-package=scipy
+	"scipy>=1.12.0",  # 打包命令中引用 --include-package=scipy
+	"pyserial"
 ]
