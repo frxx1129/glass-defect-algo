@@ -22,7 +22,7 @@
     "roi_threads": 2
   },
   "alarm_light_params": {
-    "port": "COM1",
+    "port": "COM3",
     "ng_buzz_duration_s": 1.0,
     "rejection_buzz_duration_s": 3.0
 },

@@ -9,13 +9,10 @@ from datetime import datetime
 import yield_manager
 from server_comms import send_report_to_server, fetch_collection_id_from_server, fetch_initial_state_from_server, broadcast_yield_and_rejection
 
-def results_and_state_machine_thread(num_cameras, results_queue, connection_manager, stop_event, loop, shared_settings, counters, queues, flags, machine_state_shared, stats_lock, metadata, run_event_proxy, http_client):
+def results_and_state_machine_thread(num_cameras, results_queue, connection_manager, stop_event, loop, shared_settings, counters, queues, flags, machine_state_shared, stats_lock, metadata, run_event_proxy, http_client, alarm_light_controller):
     print("[状态机线程]: 已启动。")
-
-    # 从主模块获取共享的硬件控制器实例
-    # 这是确保线程能访问在主进程中初始化的对象的直接方法
-    import main as main_module
-    alarm_light_controller = main_module.alarm_light_controller
+    
+    # alarm_light_controller 实例现在通过函数参数直接传入
     
     STORAGE_PATH = shared_settings.storage_path
     (shared_yield_counter, shared_rejection_counter) = counters
@@ -35,7 +32,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     
     max_complexity_snapshot = np.zeros(num_cameras, dtype=np.int32)
     is_current_event_rejected = False
-    is_ng_alarm_triggered_for_pane = False # <-- 新增标志，确保NG报警每片玻璃只触发一次
+    is_ng_alarm_triggered_for_pane = False # 确保NG报警每片玻璃只触发一次
     rejection_details = {}
     saved_for_this_pane = False
     
@@ -56,7 +53,6 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         has_x_defect = any(d.get('type') == 'X' for d in defects)
         has_q_defect = any(d.get('type') == 'Q' for d in defects)
         
-        # Create label logic
         size_part = ""
         if max_defect_size > 0:
             if max_defect_size >= 100: size_part = "100mm"
@@ -138,7 +134,6 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             except Exception:
                 pass
             
-            # Daily stat reset logic
             now_str = datetime.now().strftime('%Y-%m-%d')
             if now_str != last_reset_date_str:
                 with stats_lock:
@@ -149,26 +144,22 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     last_reset_date_str = now_str
                     yield_manager.save_stats(now_str, total_yield, total_rejections)
             
-            # 动态确保数组容量充足，防越界
             if cam_index >= len(last_camera_states):
-                last_camera_states.resize(cam_index + 1, refcheck=False)
-                max_complexity_snapshot.resize(cam_index + 1, refcheck=False)
-
+                last_camera_states = np.pad(last_camera_states, (0, cam_index - len(last_camera_states) + 1), 'constant')
+                max_complexity_snapshot = np.pad(max_complexity_snapshot, (0, cam_index - len(max_complexity_snapshot) + 1), 'constant')
+            
             last_camera_states[cam_index] = result['state_code']
             current_total_panes = np.sum(last_camera_states)
             
-            # --- 状态机核心逻辑 (集成报警器控制) ---
+            # State machine logic with integrated alarm control
             if machine_state == "PANE_DETECTED" and current_total_panes == 0:
                 print(f"--- [状态机]: 玻璃离开事件 ---")
                 machine_state = "WAITING_FOR_PANE"; machine_state_shared.value = 0
                 
-                # --- 根据是否剔废，设置报警器状态 ---
-                if alarm_light_controller:
+                if alarm_light_controller and alarm_light_controller.is_active:
                     if is_current_event_rejected:
-                        # 如果剔废了，亮红灯 + 蜂鸣
                         alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
                     else:
-                        # 如果没剔废（无论是OK还是NG），都恢复绿灯
                         alarm_light_controller.set_normal_state()
 
                 if not is_current_event_rejected:
@@ -194,9 +185,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             elif machine_state == "PANE_DETECTED":
                 if result['image_status'] == 'NG': 
                     current_pane_ng_buffer.append(result)
-                    # --- 如果是本片玻璃第一次检测到NG，触发黄色报警 ---
                     if not is_ng_alarm_triggered_for_pane:
-                        if alarm_light_controller:
+                        if alarm_light_controller and alarm_light_controller.is_active:
                             alarm_light_controller.set_ng_detected_state(shared_settings.ng_buzz_duration_s)
                         is_ng_alarm_triggered_for_pane = True
 
@@ -204,7 +194,6 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     max_complexity_snapshot = last_camera_states.copy()
                 
                 if not is_current_event_rejected:
-                    # Auto rejection
                     if shared_rejection_mode.value == 1 and result.get('should_reject', False):
                         is_current_event_rejected = True; saved_for_this_pane = True
                         rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
@@ -215,7 +204,6 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
                         broadcast_yield_and_rejection(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
                         print(f"    [状态机]: 自动剔废触发！")
-                    # Immediate manual rejection
                     elif manual_reject_flag.value and shared_rejection_mode.value == 2:
                         is_current_event_rejected = True; manual_reject_flag.value = False
                         rejection_details = {"rejection_time": datetime.now(), "rejection_type": "2"}
@@ -230,11 +218,10 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 machine_state = "PANE_DETECTED"; machine_state_shared.value = 1
                 current_pane_ng_buffer.clear(); max_complexity_snapshot.fill(0)
                 is_current_event_rejected = False; rejection_details = {}; saved_for_this_pane = False
-                is_ng_alarm_triggered_for_pane = False # <-- 重置NG报警标志
+                is_ng_alarm_triggered_for_pane = False
                 can_late_reject.value = False
                 
-                # --- 玻璃进入时，确保恢复到绿色常亮状态 ---
-                if alarm_light_controller:
+                if alarm_light_controller and alarm_light_controller.is_active:
                     alarm_light_controller.set_normal_state()
                 
                 print(f"--- [状态机]: 玻璃进入事件 ---")

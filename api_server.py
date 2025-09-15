@@ -33,6 +33,7 @@ def create_app(num_cameras, shared_objects):
     stats_lock = shared_objects['stats_lock']
     metadata = shared_objects['metadata']
     rejection_controller = shared_objects['rejection_controller']
+    alarm_light_controller = shared_objects['alarm_light_controller'] # <-- 解包代理对象
     http_client = shared_objects['http_client']
 
     connection_manager = ConnectionManager(num_cameras)
@@ -56,14 +57,18 @@ def create_app(num_cameras, shared_objects):
         # Start all background threads
         threading.Thread(target=event_proxy, daemon=True).start()
         threading.Thread(target=rejection_handler_thread, args=(queues['rejection'], rejection_controller, thread_stop_event, shared_settings), daemon=True).start()
+        
+        # --- 修改: 将 alarm_light_controller 作为新参数传递给状态机线程 ---
         app.state.state_machine_thread = threading.Thread(target=results_and_state_machine_thread, args=(
             num_cameras, queues['results'], connection_manager, thread_stop_event, loop, shared_settings,
             counters, (queues['rejection'],), flags, machine_state_shared, stats_lock, metadata, app.state.run_event,
-            http_client # <-- 传递http_client
+            http_client,
+            alarm_light_controller # <-- 将代理对象作为新参数传递
         ), daemon=True)
         app.state.state_machine_thread.start()
+
         threading.Thread(target=periodic_stats_pusher, args=(
-            thread_stop_event, counters, shared_settings, metadata[0], http_client # <-- 传递http_client
+            thread_stop_event, counters, shared_settings, metadata[0], http_client
         ), daemon=True).start()
         
         yield
@@ -151,12 +156,10 @@ def create_app(num_cameras, shared_objects):
     @app.post("/control/reject")
     async def manual_reject_trigger(current_user: CurrentUser):
         try:
-            # --- START OF MODIFICATIONS ---
-
             # 1. First, check if the system is in manual mode.
             if flags[1].value != 2: # flags[1] is shared_rejection_mode
                 return {
-                    "code": 403, # 403 Forbidden is a good code for this
+                    "code": 403,
                     "message": "当前为自动模式，无法进行手动剔废",
                     "data": None
                 }
@@ -186,7 +189,6 @@ def create_app(num_cameras, shared_objects):
                 "message": "正在处理上一个剔废信号，请稍候",
                 "data": {"reject_triggered": False}
             }
-            # --- END OF MODIFICATIONS ---
 
         except Exception as e:
             print(f"[API /control/reject] 处理手动剔废请求时出错: {e}")
@@ -207,7 +209,6 @@ def create_app(num_cameras, shared_objects):
             print(f"[状态上报]: 正在提交心跳状态任务: {status_data}")
             http_client.post(shared_settings.heartbeat_url, json=status_data, timeout=shared_settings.http_post_timeout_s)
         except Exception as e:
-            # 这里的异常只会发生在组装数据阶段，非常罕见
             print(f"[状态上报]: 提交任务时发生本地错误: {e}")
 
     return app
