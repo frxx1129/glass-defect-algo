@@ -9,6 +9,7 @@ import msvcrt  # Windows 按键检测
 import cv2
 import signal
 import time
+import ctypes
 
 # Import process and thread functions from their respective modules
 from http_client import NonBlockingHttpClient
@@ -27,11 +28,87 @@ alarm_light_controller = None  # 这将是代理对象
 alarm_light_service_thread = None # 新增：服务线程
 alarm_light_service_instance = None # 新增：服务实例
 
+# --- Windows 单实例与 Job 对象，确保主进程退出时自动清理子进程 ---
+_global_job_handle = None
+_global_mutex_handle = None
+
+def _ensure_single_instance_and_job():
+    """在 Windows 上：
+    1) 使用命名互斥量保证单实例运行；
+    2) 创建 Job 对象并设置 KillOnJobClose，确保主进程被任务管理器结束时，所有子进程自动被终止。
+    非 Windows 平台则跳过。
+    """
+    global _global_job_handle, _global_mutex_handle
+    try:
+        if os.name != 'nt':
+            return
+        kernel32 = ctypes.windll.kernel32
+        # 1) 单实例：命名互斥量（全局命名空间）
+        mutex_name = "Global\\GlassAlgo_v4_MainMutex"
+        kernel32.SetLastError(0)
+        _global_mutex_handle = kernel32.CreateMutexW(None, False, ctypes.c_wchar_p(mutex_name))
+        last_err = ctypes.GetLastError()
+        ERROR_ALREADY_EXISTS = 183
+        if last_err == ERROR_ALREADY_EXISTS or _global_mutex_handle == 0:
+            # 已有实例在运行
+            sys.exit("检测到已有实例在运行，已退出。")
+
+        # 2) Job 对象：Kill on close
+        job_name = None  # 匿名即可
+        _global_job_handle = kernel32.CreateJobObjectW(None, job_name)
+        if not _global_job_handle:
+            return
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", ctypes.c_uint),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_uint),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", ctypes.c_uint),
+                ("SchedulingClass", ctypes.c_uint)
+            ]
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong)
+            ]
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t)
+            ]
+        JobObjectExtendedLimitInformation = 9
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        res = kernel32.SetInformationJobObject(_global_job_handle, JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info))
+        if not res:
+            return
+        # 将当前进程加入 Job
+        hProcess = kernel32.GetCurrentProcess()
+        kernel32.AssignProcessToJobObject(_global_job_handle, hProcess)
+    except Exception:
+        # 任一失败不影响主流程
+        pass
+
 def main():
     """Main function to initialize shared resources, start child processes, and run the API server."""
     multiprocessing.freeze_support()
     cv2.setUseOptimized(True)
     print("[主进程]: 应用程序启动...")
+    # Windows: 确保单实例并启用 Job 清理
+    _ensure_single_instance_and_job()
     
     # 全局变量，用于信号处理
     global stop_event, processes, rejection_controller, http_client, alarm_light_controller, alarm_light_service_thread, alarm_light_service_instance

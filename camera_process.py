@@ -472,7 +472,19 @@ def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, 
             try:
                 p.join(timeout=2.0)
                 if p.is_alive():
-                    print(f"[相机池]: 进程 {p.name} 未能在超时时间内退出")
+                    print(f"[相机池]: 进程 {p.name} 未能在超时时间内退出，执行 terminate()")
+                    try:
+                        p.terminate()
+                        p.join(timeout=2.0)
+                        if p.is_alive():
+                            print(f"[相机池]: 进程 {p.name} 仍未退出，尝试 kill()")
+                            try:
+                                p.kill()
+                                p.join(timeout=1.0)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             except Exception:
                 pass
         
