@@ -36,6 +36,12 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     rejection_details = {}
     saved_for_this_pane = False
     
+    # 进入/离开 去抖（帧）——避免算法偶发抖动导致反复进入/离开
+    ENTER_CONFIRM_FRAMES = int(getattr(shared_settings, 'enter_confirm_frames', 5))
+    LEAVE_CONFIRM_FRAMES = int(getattr(shared_settings, 'leave_confirm_frames', 5))
+    presence_streak = 0
+    absence_streak = 0
+    
     def get_defect_size(defect):
         defect_type = defect.get('type')
         if defect_type in ['B', 'L']:
@@ -118,6 +124,12 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 best_result = find_best_ng_result(last_pane_data["ng_buffer"])
                 if best_result:
                     save_and_upload_report(best_result, {"rejection_time": datetime.now(), "rejection_type": "2"})
+                    # 剃废即刻触发红灯报警（与状态无关）
+                    if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                        try:
+                            alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
+                        except Exception:
+                            pass
                     with stats_lock:
                         total_rejections += 1; shared_rejection_counter.value = total_rejections
                         yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
@@ -151,43 +163,56 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             last_camera_states[cam_index] = result['state_code']
             current_total_panes = np.sum(last_camera_states)
             
-            # State machine logic with integrated alarm control
-            if machine_state == "PANE_DETECTED" and current_total_panes == 0:
-                print(f"--- [状态机]: 玻璃离开事件 ---")
-                machine_state = "WAITING_FOR_PANE"; machine_state_shared.value = 0
-                
-                if alarm_light_controller and alarm_light_controller.is_active:
-                    if is_current_event_rejected:
-                        alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
-                    else:
-                        alarm_light_controller.set_normal_state()
+            # State machine logic with debounce and integrated alarm control
+            if machine_state == "PANE_DETECTED":
+                # 离开事件去抖
+                if current_total_panes == 0:
+                    absence_streak += 1
+                    if absence_streak >= LEAVE_CONFIRM_FRAMES:
+                        print(f"--- [状态机]: 玻璃离开事件 ---")
+                        machine_state = "WAITING_FOR_PANE"; machine_state_shared.value = 0
+                        absence_streak = 0; presence_streak = 0
+                        
+                        if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                            try:
+                                if is_current_event_rejected:
+                                    alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
+                                else:
+                                    alarm_light_controller.set_normal_state()
+                            except Exception:
+                                pass
 
-                if not is_current_event_rejected:
-                    yield_this = min(np.count_nonzero(max_complexity_snapshot == 2) + (1 if np.count_nonzero(max_complexity_snapshot == 1) > 0 else 0), 3)
-                    if yield_this > 0:
-                        with stats_lock:
-                            total_yield += yield_this; shared_yield_counter.value = total_yield
-                            yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
-                        broadcast_yield_and_rejection(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                        print(f"    [状态机]: 本次产量: {yield_this}, 今日总产量: {total_yield}")
+                        if not is_current_event_rejected:
+                            yield_this = min(np.count_nonzero(max_complexity_snapshot == 2) + (1 if np.count_nonzero(max_complexity_snapshot == 1) > 0 else 0), 3)
+                            if yield_this > 0:
+                                with stats_lock:
+                                    total_yield += yield_this; shared_yield_counter.value = total_yield
+                                    yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                                broadcast_yield_and_rejection(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                                print(f"    [状态机]: 本次产量: {yield_this}, 今日总产量: {total_yield}")
 
-                if is_current_event_rejected and not saved_for_this_pane:
-                    best_result = find_best_ng_result(current_pane_ng_buffer)
-                    if best_result: save_and_upload_report(best_result, rejection_details)
-                
-                last_pane_data = {}
-                can_late_reject.value = False
-                if not is_current_event_rejected and current_pane_ng_buffer and shared_rejection_mode.value == 2:
-                    last_pane_data = {"ng_buffer": list(current_pane_ng_buffer), "was_rejected_in_view": False}
-                    can_late_reject.value = True
-                    print(f"    [状态机]: 上一片玻璃存在NG，已暂存信息，等待可能的滞后剔废指令。")
-
-            elif machine_state == "PANE_DETECTED":
+                        if is_current_event_rejected and not saved_for_this_pane:
+                            best_result = find_best_ng_result(current_pane_ng_buffer)
+                            if best_result: save_and_upload_report(best_result, rejection_details)
+                        
+                        last_pane_data = {}
+                        can_late_reject.value = False
+                        if not is_current_event_rejected and current_pane_ng_buffer and shared_rejection_mode.value == 2:
+                            last_pane_data = {"ng_buffer": list(current_pane_ng_buffer), "was_rejected_in_view": False}
+                            can_late_reject.value = True
+                            print(f"    [状态机]: 上一片玻璃存在NG，已暂存信息，等待可能的滞后剔废指令。")
+                    # 若未达到阈值，暂不处理业务逻辑
+                    continue
+                else:
+                    absence_streak = 0
                 if result['image_status'] == 'NG': 
                     current_pane_ng_buffer.append(result)
                     if not is_ng_alarm_triggered_for_pane:
-                        if alarm_light_controller and alarm_light_controller.is_active:
-                            alarm_light_controller.set_ng_detected_state(shared_settings.ng_buzz_duration_s)
+                        if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                            try:
+                                alarm_light_controller.set_ng_detected_state(shared_settings.ng_buzz_duration_s)
+                            except Exception:
+                                pass
                         is_ng_alarm_triggered_for_pane = True
 
                 if np.sum(last_camera_states) > np.sum(max_complexity_snapshot):
@@ -199,6 +224,12 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
                         save_and_upload_report(result, rejection_details)
                         rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index))
+                        # 剃废即刻触发红灯报警（与状态无关）
+                        if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                            try:
+                                alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
+                            except Exception:
+                                pass
                         with stats_lock:
                             total_rejections += 1; shared_rejection_counter.value = total_rejections
                             yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
@@ -208,23 +239,39 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         is_current_event_rejected = True; manual_reject_flag.value = False
                         rejection_details = {"rejection_time": datetime.now(), "rejection_type": "2"}
                         rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, -1))
+                        # 剃废即刻触发红灯报警（与状态无关）
+                        if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                            try:
+                                alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
+                            except Exception:
+                                pass
                         with stats_lock:
                             total_rejections += 1; shared_rejection_counter.value = total_rejections
                             yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
                         broadcast_yield_and_rejection(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
                         print(f"    [状态机]: 即时手动剔废触发！")
 
-            elif machine_state == "WAITING_FOR_PANE" and current_total_panes > 0:
-                machine_state = "PANE_DETECTED"; machine_state_shared.value = 1
-                current_pane_ng_buffer.clear(); max_complexity_snapshot.fill(0)
-                is_current_event_rejected = False; rejection_details = {}; saved_for_this_pane = False
-                is_ng_alarm_triggered_for_pane = False
-                can_late_reject.value = False
-                
-                if alarm_light_controller and alarm_light_controller.is_active:
-                    alarm_light_controller.set_normal_state()
-                
-                print(f"--- [状态机]: 玻璃进入事件 ---")
+            elif machine_state == "WAITING_FOR_PANE":
+                # 进入事件去抖
+                if current_total_panes > 0:
+                    presence_streak += 1
+                    if presence_streak >= ENTER_CONFIRM_FRAMES:
+                        machine_state = "PANE_DETECTED"; machine_state_shared.value = 1
+                        current_pane_ng_buffer.clear(); max_complexity_snapshot.fill(0)
+                        is_current_event_rejected = False; rejection_details = {}; saved_for_this_pane = False
+                        is_ng_alarm_triggered_for_pane = False
+                        can_late_reject.value = False
+                        presence_streak = 0; absence_streak = 0
+                        
+                        if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                            try:
+                                alarm_light_controller.set_normal_state()
+                            except Exception:
+                                pass
+                        
+                        print(f"--- [状态机]: 玻璃进入事件 ---")
+                else:
+                    presence_streak = 0
         except Empty: 
             pass
         except Exception as e:

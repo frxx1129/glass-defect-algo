@@ -253,7 +253,6 @@ def main():
     
     if camera_ready:
         print("✅ [主进程]: 相机就绪")
-        # ... (打印相机状态的代码保持不变)
     else:
         print("⚠️ [主进程]: 等待相机初始化超时")
     
@@ -279,7 +278,7 @@ def main():
         print("[主进程]: 启动API服务器...")
 
     # --- Run Server ---
-    auto_start = config.get('system_params', {}).get('auto_start', True)
+    auto_start = config.get('system_params', {}).get('auto_start', False)
     if auto_start:
         print("[主进程]: 系统配置为自动启动模式，设置运行事件...")
         run_event.set()
