@@ -1,5 +1,4 @@
-{
-  "DEBUG_MODE_ON": true,
+{ "DEBUG_MODE_ON": false,
   "storage_path": "inspection_results",
   "roi_template_file": "roi_averaged_by_group_CORRECTED.json",
   "lineName": "Line1",
@@ -14,13 +13,14 @@
     "http_upload_timeout_s": 15,
     "stats_push_interval_s": 601,
     "opencv_threads": 1,
-    "preview_width": 1200,
-    "jpeg_quality_main": 85,
-    "jpeg_quality_preview": 75,
+    "preview_width": 1600,
+    "jpeg_quality_main": 95,
+    "jpeg_quality_preview": 85,
     "coalesce_drain_budget_ms": 5,
     "coalesce_max_drain": 500,
     "process_workers": 5,
-    "roi_threads": 2
+    "roi_threads": 2,
+    "auto_start": false
   },
   "alarm_light_params": {
     "port": "COM3",
@@ -28,7 +28,7 @@
     "rejection_buzz_duration_s": 3.0
   },
   "camera_setup": {
-    "expected_cameras": 3,
+    "expected_cameras": 5,
     "bootstrap_default_ip": "192.168.1.200",
     "bootstrap_assign_ips": true,
     "open_retry_count": 3,
@@ -46,35 +46,59 @@
       },
       {
         "index": 1,
-        "ip": "192.168.4.100"
+        "ip": "192.168.5.100"
       },
       {
         "index": 2,
-        "ip": "192.168.5.100"
+        "ip": "192.168.6.100"
+      },
+      {
+        "index": 3,
+        "ip": "192.168.7.100"
+      },
+      {
+        "index": 4,
+        "ip": "192.168.8.100"
       }
     ],
-    "camera_nic_bindings": {},
+    "camera_nic_bindings": {
+      "4": 4
+    },
     "camera_bindings": [
       {
         "index": 0,
         "physical_index": 0,
-        "mac": "94:AA:B8:00:08:A2",
-        "ip": "192.168.3.162",
-        "model": "MV-HP120GM"
+        "mac": "94:AA:B8:03:DD:F7",
+        "ip": "192.168.3.147",
+        "model": "MV-HP500GM"
       },
       {
         "index": 1,
         "physical_index": 1,
-        "mac": "94:AA:B8:01:FC:E6",
-        "ip": "192.168.4.130",
-        "model": "MV-HP120GM"
+        "mac": "94:AA:B8:07:9E:73",
+        "ip": "192.168.5.115",
+        "model": "MV-HP500GM"
       },
       {
         "index": 2,
         "physical_index": 2,
-        "mac": "94:AA:B8:01:3A:DF",
-        "ip": "192.168.5.123",
-        "model": "MV-HP120GM"
+        "mac": "94:AA:B8:04:11:95",
+        "ip": "192.168.6.149",
+        "model": "MV-HP500GM"
+      },
+      {
+        "index": 3,
+        "physical_index": 3,
+        "mac": "94:AA:B8:04:6B:18",
+        "ip": "192.168.7.124",
+        "model": "MV-HP500GM"
+      },
+      {
+        "index": 4,
+        "physical_index": 4,
+        "mac": "94:AA:B8:04:87:AE",
+        "ip": "192.168.8.174",
+        "model": "MV-HP500GM"
       }
     ],
     "unified_params": {
@@ -84,35 +108,37 @@
         "frame_rate": 10
       },
       "exposure": {
-        "value_us": 630
+        "value_us": 200
       },
       "gain": {
         "value_db": 1.2
       },
       "gamma": {
-        "value": 1
+        "value": 0.92
       },
       "network": {
         "packet_size_bytes": 8996,
-        "packet_delay_us": 120
+        "packet_delay_us": 100
       }
     }
   },
   "camera_rois": {
-    "0": "roi_averaged_by_group_CORRECTED.json",
-    "1": "roi_averaged_by_group_CORRECTED.json",
-    "2": "roi_averaged_by_group_CORRECTED.json"
+    "0": "cam1_roi_averaged_by_group.json",
+    "1": "cam2_roi_averaged_by_group.json",
+    "2": "cam3_roi_averaged_by_group.json",
+    "3": "cam4_roi_averaged_by_group.json",
+    "4": "cam5_roi_averaged_by_group.json"
   },
   "server_config": {
-    "server": "202.115.65.101",
+    "server": "127.0.0.1",
     "listen_host": "0.0.0.0",
     "listen_port": 12450,
     "cors_origins": [
       "*"
     ],
-    "upload_url": "http://202.115.65.101:3200/fastapi/glass/uploadWithDefects",
-    "stats_push_url": "http://202.115.65.101:3200/fastapi/glass/updateYieldAndRejections",
-    "heartbeat_url": "http://202.115.65.101:3200/fastapi/system/heartbeat"
+    "upload_url": "http://127.0.0.1:8085/fastapi/glass/uploadWithDefects",
+    "stats_push_url": "http://127.0.0.1:8085/fastapi/glass/updateYieldAndRejections",
+    "heartbeat_url": "http://127.0.0.1:8085/fastapi/system/heartbeat"
   },
   "rejection_params": {
     "max_defect_size_mm": 20,
@@ -121,7 +147,7 @@
   },
   "defect_detection_params": {
     "preprocess_params": {
-      "GAMMA_VALUE": 0.6,
+      "GAMMA_VALUE": 1.1,
       "CANNY_SIGMA": 0.45,
       "CLAHE_CLIP_LIMIT": 1.5,
       "CLAHE_TILE_TARGET_PX": 16
@@ -132,33 +158,33 @@
       "min_points_per_cluster": 50
     },
     "contour_params": {
-      "min_area": 50000
+      "min_area": 75000
     },
     "defect_params": {
       "PIXELS_PER_MM": 2.735,
-      "ANGLE_NORMAL_TOLERANCE": 2,
-      "ANGLE_BEVEL_TOLERANCE": 10,
+      "ANGLE_NORMAL_TOLERANCE": 4,
+      "ANGLE_BEVEL_TOLERANCE": 8,
       "ANGLE_MIN_THRESHOLD": 10.0,
       "ANGLE_MAX_THRESHOLD": 170.0,
       "ANGLE_BIAS_DEG": 0.0,
-      "ANGLE_SNAP_TO_90_DEADBAND_DEG": 7.0,
+      "ANGLE_SNAP_TO_90_DEADBAND_DEG": 4.0,
       "ANGLE_SOFT_SNAP_GAIN": 0.5,
-      "ANGLE_SOFT_SNAP_MAX_DEVIATION": 10.0,
+      "ANGLE_SOFT_SNAP_MAX_DEVIATION": 8.0,
       "ANGLE_REPORT_ROUND_TO": 0.5,
       "DEFECT_STD_DEV_THRESHOLD": 3,
-      "MIN_DEFECT_AREA_MM2": 4,
-      "MIN_SMALL_DEFECT_AREA_MM2": 30.0,
+      "MIN_DEFECT_AREA_MM2": 22.5,
+      "MIN_SMALL_DEFECT_AREA_MM2": 22.5,
       "MAX_EDGE_DIST_MM_FOR_SMALL_DEFECT": 10.0,
-      "MIN_DEFECT_DIMENSION_MM": 2,
-      "MIN_DEFECT_WIDTH_MM": 2,
-      "DEFECT_MERGE_KERNEL_SIZE": 9,
+      "MIN_DEFECT_DIMENSION_MM": 4.5,
+      "MIN_DEFECT_WIDTH_MM": 4.5,
+      "DEFECT_MERGE_KERNEL_SIZE": 1,
       "ORIENTATION_PARALLEL_THRESHOLD": 10.0,
       "MIN_L_ASPECT_RATIO": 3.0,
       "MAX_L_ASPECT_RATIO": 30.0,
       "BRIGHTNESS_ENHANCE": true,
-      "BRIGHTNESS_CLAHE_CLIP_LIMIT": 5,
-      "BRIGHTNESS_CLAHE_TILE_TARGET_PX": 16,
-      "BRIGHTNESS_MEDIAN_KSIZE": 3,
+      "BRIGHTNESS_CLAHE_CLIP_LIMIT": 1.1,
+      "BRIGHTNESS_CLAHE_TILE_TARGET_PX": 64,
+      "BRIGHTNESS_MEDIAN_KSIZE": 127,
       "BRIGHTNESS_MEDIAN_BLUR": true
     },
     "drawing_params": {
