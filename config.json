@@ -25,7 +25,7 @@
     "port": "COM3",
     "ng_buzz_duration_s": 1.0,
     "rejection_buzz_duration_s": 3.0
-},
+  },
   "camera_setup": {
     "expected_cameras": 3,
     "bootstrap_default_ip": "192.168.1.200",
@@ -56,9 +56,9 @@
     "camera_bindings": [
       {
         "index": 0,
-        "physical_index": 2,
+        "physical_index": 0,
         "mac": "94:AA:B8:00:08:A2",
-        "ip": "192.168.5.162",
+        "ip": "192.168.3.162",
         "model": "MV-HP120GM"
       },
       {
@@ -70,9 +70,9 @@
       },
       {
         "index": 2,
-        "physical_index": 0,
+        "physical_index": 2,
         "mac": "94:AA:B8:01:3A:DF",
-        "ip": "192.168.3.123",
+        "ip": "192.168.5.123",
         "model": "MV-HP120GM"
       }
     ],
