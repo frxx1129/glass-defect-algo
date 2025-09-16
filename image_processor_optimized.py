@@ -477,7 +477,7 @@ def connect_border_points_advanced(edges_image, direction='cw'):
                 elif is_left_right and start_edge == "left": p_start, p_end = p_end, p_start
                 _connect_points_along_border(closed_edges_image, p_start, p_end, direction, h, w)
 
-        elif 10 <= max_intra_edge_dist < 25:
+        elif 10 <= max_intra_edge_dist < 75:
             # --- 情况B: 特殊情况 -> 两次连接，经过所有角 ---
             if len(side1_pts) >= 2 and len(side2_pts) >= 2:
                 pairs = _find_closest_pairs_between_sets(side1_pts, side2_pts)
@@ -532,7 +532,7 @@ def connect_border_points_advanced(edges_image, direction='cw'):
         if len(points) >= 2:
             for i in range(0, len(points) // 2 * 2, 2):
                 p1, p2 = points[i], points[i+1]
-                if np.linalg.norm(np.array(p1) - np.array(p2)) >= 25:
+                if np.linalg.norm(np.array(p1) - np.array(p2)) >= 75:
                     cv2.line(closed_edges_image, p1, p2, 255, 1)
         return closed_edges_image
 
