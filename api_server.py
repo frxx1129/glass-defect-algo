@@ -11,7 +11,6 @@ from pydantic import BaseModel
 from utils import ConnectionManager
 from rejection_control import rejection_handler_thread
 from state_machine import results_and_state_machine_thread
-from server_comms import periodic_stats_pusher
 
 class CurrentUser(BaseModel):
     sessionId: str
@@ -67,9 +66,7 @@ def create_app(num_cameras, shared_objects):
         ), daemon=True)
         app.state.state_machine_thread.start()
 
-        threading.Thread(target=periodic_stats_pusher, args=(
-            thread_stop_event, counters, shared_settings, metadata[0], http_client
-        ), daemon=True).start()
+    # 删除产量推送线程：仅保留剔废统计，不再周期推送产量
         
         yield
         
@@ -116,13 +113,9 @@ def create_app(num_cameras, shared_objects):
         app.state.run_event.clear()
         return {"code": 200, "message": "检测已暂停", "data": {"status": "stopped"}}
 
-    @app.get("/yield")
-    def get_yield(): 
-        return {"code": 200, "message": "获取产量成功", "data": {"yield": counters[0].value}}
-
     @app.get("/rejections")
     def get_rejections(): 
-        return {"code": 200, "message": "获取剔废数量成功", "data": {"rejections": counters[1].value}}
+        return {"code": 200, "message": "获取剔废数量成功", "data": {"rejections": counters[0].value}}
             
     @app.websocket("/ws/stream/{cam_index}")
     async def websocket_endpoint(websocket: WebSocket, cam_index: int):

@@ -220,7 +220,8 @@ def main():
     shared_settings.lineName = config.get('lineName', 'UNKNOWN_LINE')
     shared_settings.server = server_config.get('server', '127.0.0.1')
     shared_settings.upload_url = server_config.get('upload_url', f'http://{shared_settings.server}:5000/upload')
-    shared_settings.stats_push_url = server_config.get('stats_push_url', f'http://{shared_settings.server}:8085/fastapi/glass/updateYieldAndRejections')
+    # 修改：仅剔废上报端点
+    shared_settings.stats_push_url = server_config.get('stats_push_url', f'http://{shared_settings.server}:8085/fastapi/glass/updateRejections')
     shared_settings.heartbeat_url = server_config.get('heartbeat_url', f'http://{shared_settings.server}:8085/fastapi/system/heartbeat')
     
     # 读取报警器配置
@@ -238,7 +239,7 @@ def main():
     
     # Shared state
     shared_camera_states = manager.dict()
-    shared_yield_counter = manager.Value('i', 0)
+    # 仅保留剔废统计（删除产量统计）
     shared_rejection_counter = manager.Value('i', 0)
     manual_reject_flag = manager.Value('b', False)
     machine_state_shared = manager.Value('i', 0)
@@ -301,7 +302,8 @@ def main():
         'stop_event': stop_event, 'run_event': run_event,
         'camera_states': shared_camera_states,
         'settings': shared_settings,
-        'counters': (shared_yield_counter, shared_rejection_counter),
+    # 仅剔废计数
+    'counters': (shared_rejection_counter,),
         'queues': {'task': task_queue, 'results': results_queue, 'rejection': rejection_queue},
         'flags': (manual_reject_flag, shared_rejection_mode, can_late_reject),
         'machine_state': machine_state_shared,

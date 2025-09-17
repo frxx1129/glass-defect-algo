@@ -7,7 +7,7 @@ import numpy as np
 from queue import Empty
 from datetime import datetime
 import yield_manager
-from server_comms import send_report_to_server, fetch_collection_id_from_server, fetch_initial_state_from_server, broadcast_yield_and_rejection
+from server_comms import send_report_to_server, fetch_collection_id_from_server, fetch_initial_state_from_server, broadcast_rejections
 
 def results_and_state_machine_thread(num_cameras, results_queue, connection_manager, stop_event, loop, shared_settings, counters, queues, flags, machine_state_shared, stats_lock, metadata, run_event_proxy, http_client, alarm_light_controller):
     print("[状态机线程]: 已启动。")
@@ -15,7 +15,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     # alarm_light_controller 实例现在通过函数参数直接传入
     
     STORAGE_PATH = shared_settings.storage_path
-    (shared_yield_counter, shared_rejection_counter) = counters
+    # 修改：移除产量计数，仅保留剔废计数
+    (shared_rejection_counter,) = counters
     (rejection_queue,) = queues
     (manual_reject_flag, shared_rejection_mode, can_late_reject) = flags
     (shared_collection_id, shared_user_id_auto, shared_user_id_manual) = metadata
@@ -27,8 +28,9 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     last_pane_data = {}
     
     with stats_lock:
-        last_reset_date_str, total_yield, total_rejections = yield_manager.load_stats()
-        shared_yield_counter.value, shared_rejection_counter.value = total_yield, total_rejections
+        last_reset_date_str, _legacy_yield, total_rejections = yield_manager.load_stats()
+        shared_rejection_counter.value = total_rejections
+    total_yield = 0  # 产量统计已废弃
     
     max_complexity_snapshot = np.zeros(num_cameras, dtype=np.int32)
     is_current_event_rejected = False
@@ -132,8 +134,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             pass
                     with stats_lock:
                         total_rejections += 1; shared_rejection_counter.value = total_rejections
-                        yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
-                    broadcast_yield_and_rejection(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                        yield_manager.save_stats(last_reset_date_str, 0, total_rejections)
+                    broadcast_rejections(shared_settings, shared_collection_id, shared_rejection_counter, http_client)
                     print(f"    [状态机]: 滞后剔废计数+1, 今日总剔废: {total_rejections}")
             last_pane_data = {}
 
@@ -150,11 +152,11 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             if now_str != last_reset_date_str:
                 with stats_lock:
                     print(f"--- [状态机]: 日期已变更，正在保存 {last_reset_date_str} 的最终报告... ---")
-                    yield_manager.save_daily_report(last_reset_date_str, total_yield, total_rejections)
-                    total_yield, total_rejections = 0, 0
-                    shared_yield_counter.value, shared_rejection_counter.value = 0, 0
+                    yield_manager.save_daily_report(last_reset_date_str, 0, total_rejections)
+                    total_rejections = 0
+                    shared_rejection_counter.value = 0
                     last_reset_date_str = now_str
-                    yield_manager.save_stats(now_str, total_yield, total_rejections)
+                    yield_manager.save_stats(now_str, 0, total_rejections)
             
             if cam_index >= len(last_camera_states):
                 last_camera_states = np.pad(last_camera_states, (0, cam_index - len(last_camera_states) + 1), 'constant')
@@ -182,14 +184,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             except Exception:
                                 pass
 
-                        if not is_current_event_rejected:
-                            yield_this = min(np.count_nonzero(max_complexity_snapshot == 2) + (1 if np.count_nonzero(max_complexity_snapshot == 1) > 0 else 0), 3)
-                            if yield_this > 0:
-                                with stats_lock:
-                                    total_yield += yield_this; shared_yield_counter.value = total_yield
-                                    yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
-                                broadcast_yield_and_rejection(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                                print(f"    [状态机]: 本次产量: {yield_this}, 今日总产量: {total_yield}")
+                        # 产量统计移除
 
                         if is_current_event_rejected and not saved_for_this_pane:
                             best_result = find_best_ng_result(current_pane_ng_buffer)
@@ -232,8 +227,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                 pass
                         with stats_lock:
                             total_rejections += 1; shared_rejection_counter.value = total_rejections
-                            yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
-                        broadcast_yield_and_rejection(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                            yield_manager.save_stats(last_reset_date_str, 0, total_rejections)
+                        broadcast_rejections(shared_settings, shared_collection_id, shared_rejection_counter, http_client)
                         print(f"    [状态机]: 自动剔废触发！")
                     elif manual_reject_flag.value and shared_rejection_mode.value == 2:
                         is_current_event_rejected = True; manual_reject_flag.value = False
@@ -247,8 +242,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                 pass
                         with stats_lock:
                             total_rejections += 1; shared_rejection_counter.value = total_rejections
-                            yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
-                        broadcast_yield_and_rejection(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                            yield_manager.save_stats(last_reset_date_str, 0, total_rejections)
+                        broadcast_rejections(shared_settings, shared_collection_id, shared_rejection_counter, http_client)
                         print(f"    [状态机]: 即时手动剔废触发！")
 
             elif machine_state == "WAITING_FOR_PANE":

@@ -1,109 +1,91 @@
+"""统计管理器 (精简版)
+
+仅保留剔废(rejections) 计数的持久化/报告功能。
+对历史版本兼容：旧文件含有 yield 字段与旧签名(无 rejections 或不同签名算法)时，读取后产量直接忽略并返回 0。
+返回接口保持 (date, yield, rejections) 形式以避免外部调用崩溃，但 yield 恒为 0。
+"""
+
 import json
 import hashlib
 import base64
 from datetime import datetime
-import os # <-- Import the os module
+import os
 
-# Used for signing, can be any complex string
-SECRET_KEY = "$$SWJTU$$GLASS&&" 
+SECRET_KEY = "$$SWJTU$$GLASS&&"
 STATS_FILE_PATH = "persistent_stats.dat"
-REPORTS_DIR = "daily_reports" # <-- New: Define a directory for reports
+REPORTS_DIR = "daily_reports"
+FORMAT_VERSION = 2  # 1: 旧(含 yield) 2: 新(仅 rejections)
 
-def save_stats(date_str, yield_count, rejection_count):
-    """Saves the current operational stats to a secure binary file."""
+def save_stats(date_str: str, _unused_yield: int, rejection_count: int):
+    """保存当日实时剔废统计 (兼容旧签名字段, yield 固定写 0)。"""
     try:
-        data = {'date': date_str, 'yield': yield_count, 'rejections': rejection_count}
+        data = {
+            'date': date_str,
+            'yield': 0,  # 占位保持字段，固定0
+            'rejections': int(rejection_count),
+            'ver': FORMAT_VERSION
+        }
         verify_str = f"{data['date']}-{data['yield']}-{data['rejections']}-{SECRET_KEY}"
         signature = hashlib.sha256(verify_str.encode('utf-8')).hexdigest()
-        
         payload = {'data': data, 'signature': signature}
-        encoded_payload = base64.b64encode(json.dumps(payload).encode('utf-8'))
-        
+        encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
         with open(STATS_FILE_PATH, 'wb') as f:
-            f.write(encoded_payload)
-        
+            f.write(encoded)
     except Exception as e:
-        print(f"❌ [统计管理器]: 保存实时统计文件时发生错误: {e}")
+        print(f"❌ [统计管理器]: 保存实时统计失败: {e}")
 
-# --- NEW FUNCTION ---
-def save_daily_report(date_str, yield_count, rejection_count):
-    """
-    Saves the final counts for a given day to a human-readable, signed JSON report.
-    This file is for archival and external viewing.
-    """
+def save_daily_report(date_str: str, _unused_yield: int, rejection_count: int):
+    """保存每日归档报告 (只含剔废)。"""
     try:
-        # Ensure the reports directory exists
         os.makedirs(REPORTS_DIR, exist_ok=True)
-        
-        report_data = {
-            "report_date": date_str,
-            "total_yield": yield_count,
-            "total_rejections": rejection_count
+        report = {
+            'report_date': date_str,
+            'total_rejections': int(rejection_count),
+            'ver': FORMAT_VERSION
         }
-        
-        # Create a signature to verify the integrity of the report
-        verify_str = f"{report_data['report_date']}-{report_data['total_yield']}-{report_data['total_rejections']}-{SECRET_KEY}"
+        verify_str = f"{report['report_date']}-{report['total_rejections']}-{SECRET_KEY}"
         signature = hashlib.sha256(verify_str.encode('utf-8')).hexdigest()
-        
-        # Add the signature to the report
-        report_data_with_signature = {
-            "report": report_data,
-            "signature": signature
-        }
-        
-        # Define the file path
-        report_path = os.path.join(REPORTS_DIR, f"stats_report_{date_str}.json")
-        
-        # Write the JSON file
-        with open(report_path, 'w', encoding='utf-8') as f:
-            json.dump(report_data_with_signature, f, indent=4)
-            
-        print(f"✅ [统计管理器]: 已保存 {date_str} 的每日报告到 {report_path}")
-
+        wrapped = {'report': report, 'signature': signature}
+        path = os.path.join(REPORTS_DIR, f"stats_report_{date_str}.json")
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(wrapped, f, ensure_ascii=False, indent=4)
+        print(f"✅ [统计管理器]: 已保存每日报告 -> {path}")
     except Exception as e:
-        print(f"❌ [统计管理器]: 保存每日报告时发生错误: {e}")
-
+        print(f"❌ [统计管理器]: 保存每日报告失败: {e}")
 
 def load_stats():
-    """
-    Loads the operational stats from the secure binary file.
-    Resets stats if the date has changed or the file is invalid.
-    """
-    # ... (This function remains unchanged) ...
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    
+    """读取实时统计；失败/跨日返回 (today,0,0)。"""
+    today = datetime.now().strftime('%Y-%m-%d')
     try:
         with open(STATS_FILE_PATH, 'rb') as f:
-            encoded_payload = f.read()
-        
-        payload = json.loads(base64.b64decode(encoded_payload).decode('utf-8'))
-        data = payload['data']
-        signature_from_file = payload['signature']
-        
-        rejections = data.get('rejections', 0)
-        verify_str_new = f"{data['date']}-{data['yield']}-{rejections}-{SECRET_KEY}"
-        expected_signature_new = hashlib.sha256(verify_str_new.encode('utf-8')).hexdigest()
+            raw = f.read()
+        payload = json.loads(base64.b64decode(raw).decode('utf-8'))
+        data = payload.get('data', {})
+        sig = payload.get('signature', '')
+        date_str = data.get('date')
+        rej = int(data.get('rejections', 0))
+        old_yield = int(data.get('yield', 0))  # 兼容读取
 
-        verify_str_old = f"{data['date']}-{data['yield']}-{SECRET_KEY}"
-        expected_signature_old = hashlib.sha256(verify_str_old.encode('utf-8')).hexdigest()
+        # 新签名
+        verify_new = f"{date_str}-{0}-{rej}-{SECRET_KEY}"
+        sig_new = hashlib.sha256(verify_new.encode('utf-8')).hexdigest()
+        # 旧签名(含 yield 但无 rejections 或不同结构)
+        verify_old = f"{date_str}-{old_yield}-{rej}-{SECRET_KEY}"
+        sig_old_variant = hashlib.sha256(verify_old.encode('utf-8')).hexdigest()
+        verify_old_legacy = f"{date_str}-{old_yield}-{SECRET_KEY}"
+        sig_old_legacy = hashlib.sha256(verify_old_legacy.encode('utf-8')).hexdigest()
 
-        if signature_from_file != expected_signature_new and signature_from_file != expected_signature_old:
-            print("⚠️ [统计管理器]: 统计文件校验失败！文件可能已被修改。将从0开始计数。")
-            return today_str, 0, 0
-            
-        if data['date'] != today_str:
-            print(f"ℹ️ [统计管理器]: 新的一天开始，统计将从0重新计数。")
-            # The calling function in state_machine will handle saving the report
-            return today_str, 0, 0
-            
-        loaded_yield = int(data['yield'])
-        loaded_rejections = int(data.get('rejections', 0))
-        print(f"✅ [统计管理器]: 成功加载本日统计: 产量 {loaded_yield}, 剔废 {loaded_rejections}")
-        return data['date'], loaded_yield, loaded_rejections
-
+        if sig not in (sig_new, sig_old_variant, sig_old_legacy):
+            print("⚠️ [统计管理器]: 校验失败，重置计数。")
+            return today, 0, 0
+        if date_str != today:
+            print("ℹ️ [统计管理器]: 跨日，重置计数。")
+            return today, 0, 0
+        print(f"✅ [统计管理器]: 加载成功 (剔废={rej})")
+        return date_str, 0, rej
     except FileNotFoundError:
-        print("ℹ️ [统计管理器]: 未找到统计文件，将从0开始计数。")
-        return today_str, 0, 0
+        print("ℹ️ [统计管理器]: 无历史文件，初始化。")
+        return today, 0, 0
     except Exception as e:
-        print(f"❌ [统计管理器]: 读取统计文件时发生错误: {e}。将从0开始计数。")
-        return today_str, 0, 0
+        print(f"❌ [统计管理器]: 读取失败: {e}")
+        return today, 0, 0

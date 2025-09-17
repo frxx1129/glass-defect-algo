@@ -97,35 +97,7 @@ def fetch_collection_id_from_server(settings, collection_id_var):
 # --- 以下函数被修改为非阻塞 ---
 # =================================================================
 
-def periodic_stats_pusher(stop_event, counters, settings, metadata_vars, http_client):
-    """(修改) 后台线程，周期性地将产量推送到服务器。"""
-    (yield_counter, rejection_counter) = counters
-    collection_id_var = metadata_vars
-    push_interval = int(getattr(settings, 'stats_push_interval_s', 601) or 601)
-    print(f"[统计推送线程]: 已启动，推送周期: {push_interval}秒。")
-
-    while not stop_event.is_set():
-        if stop_event.wait(timeout=push_interval):
-            break
-
-        # 获取ID仍然是同步的，因为我们需要它来构建payload
-        fetch_collection_id_from_server(settings, collection_id_var)
-        if int(collection_id_var.value) < 0:
-            print("    [统计推送]: 获取 collection_id 失败，跳过本次推送。")
-            continue
-
-        payload = {
-            "collectionId": int(collection_id_var.value),
-            "lineName": settings.lineName,
-            "yield": int(yield_counter.value),
-            "rejection": int(rejection_counter.value)
-        }
-
-        # 使用非阻塞客户端发送请求
-        print(f"    [统计推送]: 准备推送数据")
-        http_client.post(settings.stats_push_url, json=payload, timeout=getattr(settings, 'http_post_timeout_s', 10))
-
-    print("[统计推送线程]: 已停止。")
+## 删除 periodic_stats_pusher：仅保留事件触发剔废广播。
 
 
 def send_report_to_server(json_report, image_buffer, server_url, http_client, upload_timeout_s: float | None = None):
@@ -153,9 +125,8 @@ def send_report_to_server(json_report, image_buffer, server_url, http_client, up
     http_client.post_files(server_url, files=file_data, json_payload=json_report, timeout_s=upload_timeout_s)
 
 
-def broadcast_yield_and_rejection(settings, collection_id, yield_count, rejection_count, http_client):
-    """(修改) 使用非阻塞客户端广播最新的产量和剔废量。"""
-    # 兼容多种类型，解析为整数
+def broadcast_rejections(settings, collection_id, rejection_count, http_client):
+    """广播剔废数量（删除产量字段）。"""
     try:
         cid_raw = getattr(collection_id, 'value', collection_id)
         if isinstance(cid_raw, (bytes, bytearray)):
@@ -168,10 +139,7 @@ def broadcast_yield_and_rejection(settings, collection_id, yield_count, rejectio
 
     payload = {
         "collectionId": cid_int,
-        "yield": int(yield_count.value),
         "rejection": int(rejection_count.value)
     }
-    target_url = f"http://{settings.server}:8085/fastapi/glass/updateYieldAndRejections"
-    
-    # 提交非阻塞POST请求
+    target_url = f"http://{settings.server}:8085/fastapi/glass/updateRejections"
     http_client.post(target_url, json=payload, timeout=getattr(settings, 'http_post_timeout_s', 5))
