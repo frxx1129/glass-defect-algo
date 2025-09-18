@@ -213,9 +213,9 @@ def create_app(num_cameras, shared_objects):
     class AlgoModeBody(BaseModel):
         mode: int
 
-    @app.post("/algorithmMode")
-    async def set_algorithm_mode(body: AlgoModeBody):
-        new_mode = int(body.mode)
+    @app.post("/control/algorithmMode")
+    async def set_algorithm_mode(algorithmMode: int = Body(...)):
+        new_mode = algorithmMode
         if new_mode not in (1, 2):
             return {"code": 400, "message": "mode 只能为 1(浅色) 或 2(深色)"}
         old_mode = int(getattr(shared_settings, 'algorithm_mode', 1))

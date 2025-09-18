@@ -14,7 +14,7 @@
     "http_upload_timeout_s": 15,
     "stats_push_interval_s": 601,
     "opencv_threads": 1,
-    "preview_width": 1600,
+    "preview_width": 1000,
     "jpeg_quality_main": 95,
     "jpeg_quality_preview": 85,
     "coalesce_drain_budget_ms": 5,
@@ -87,10 +87,10 @@
   "hough_inspector_params": {
     "PREPROCESSING": {
       "MEDIAN_BLUR_KSIZE": 3,
-      "CLAHE_CLIP_LIMIT": 2,
+      "CLAHE_CLIP_LIMIT": 2.0,
       "CLAHE_GRID_SIZE": [8, 8],
-      "CANNY_THRESHOLD_LOW": 30,
-      "CANNY_THRESHOLD_HIGH": 90
+      "CANNY_THRESHOLD_LOW": 35,
+      "CANNY_THRESHOLD_HIGH": 96
     },
     "HOUGH_TRANSFORM": {
       "THRESHOLD": 40,

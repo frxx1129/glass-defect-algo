@@ -100,7 +100,11 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                 if frame_data is None:
                     continue
 
-                if cam_idx not in roi_cache:
+                # 如果任务中直接提供了统一 ROI（模拟模式），优先使用
+                supplied_rois = task_data.get('rois')
+                if supplied_rois is not None and isinstance(supplied_rois, list) and len(supplied_rois) > 0:
+                    roi_cache[cam_idx] = supplied_rois
+                elif cam_idx not in roi_cache:
                     roi_cache[cam_idx] = load_rois_for_cam(cam_idx)
                 
                 # 根据共享模式 (1=浅色,2=深色) 选择算法

@@ -383,8 +383,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         # --- FIX: Stricter MIN_DEFECT_SIZE_MM filter for Q-type defects ---
         min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
         if new_defect['type'] == 'Q':
-            #如果Q型缺陷的面积小于7.5平方毫米，则忽略
-            if location.get('length_mm', 0) * location.get('width_mm', 0) < 7.5:
+            if location.get('length_mm', 0) * location.get('width_mm', 0) < 4 or location.get('length_mm', 0) / location.get('width_mm', 1) > 2.5:
                 continue
         elif new_defect['type'] in ['L', 'B']:
             if location.get('length_mm', 0) < min_size_mm:
@@ -397,7 +396,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             area_mm2 = length_mm * width_mm
             aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
             
-            if area_mm2 > 100 and aspect_ratio > 4.0:
+            if area_mm2 > 80 and aspect_ratio > 3.2:
+                continue
+            if aspect_ratio > 6.0:
                 continue
 
         new_defect['raw_defect'] = defect 
