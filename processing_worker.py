@@ -5,7 +5,8 @@ import cv2
 import traceback
 from queue import Empty
 import time
-import image_processor_hough as image_processor # <-- 修改点：导入新的处理模块
+import image_processor_hough as image_processor 
+import image_processor_hough_dark as dark_glass_processor
 
 def should_reject_pane(pane_json, shared_settings, pixels_per_mm):
     """Determines if a pane should be rejected based on defect size and type."""

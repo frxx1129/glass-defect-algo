@@ -135,9 +135,9 @@ def create_app(num_cameras, shared_objects):
         return {"code": 200, "message": msg, "data": {"rejection_mode": rejectionMode}}
 
     @app.post("/control/thresholds")
-    async def set_rejection_thresholds(rejectionThreshold: str = Body(...)):
+    async def set_rejection_thresholds(rejectionThreshold: int = Body(...)):
         try:
-            new_threshold = int(rejectionThreshold.replace("mm", "").strip())
+            new_threshold = rejectionThreshold
             old_value = shared_settings.max_defect_size_mm
             shared_settings.max_defect_size_mm = new_threshold
             msg = f"剔废阈值已更新: {old_value} -> {new_threshold}"
