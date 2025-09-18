@@ -22,14 +22,24 @@ import image_processor_hough_dark as dark_impl
 def _run_light(image_gray, rois, config):
     return light_impl.process_image_from_memory_parallel(image_gray, rois, config)
 
-def _run_dark(image_gray, rois, config):
-    # 深色实现文件当前不完整; 若存在关键属性缺失, 回退到浅色
+def _run_dark(image_gray, rois, full_config):
+    """调用深色玻璃实现。
+    之前错误：仅传入 full_config['hough_inspector_dark_params'] 子字典，
+    dark_impl 内部再次调用 config.get('hough_inspector_dark_params') 导致找不到 -> 抛异常 -> 回退浅色。
+    修复：传递完整 full_config，必要参数由深色实现自行解析。
+    若缺少配置或执行失败，记录一次日志并回退浅色。
+    """
     try:
-        if hasattr(dark_impl, 'process_image_from_memory_parallel'):
-            return dark_impl.process_image_from_memory_parallel(image_gray, rois, config.get('hough_inspector_dark_params', {}))
-    except Exception:
-        pass
-    return _run_light(image_gray, rois, config)
+        if not hasattr(dark_impl, 'process_image_from_memory_parallel'):
+            print("[fused_image_processor] 深色实现缺失接口, 回退浅色")
+            return _run_light(image_gray, rois, full_config)
+        if 'hough_inspector_dark_params' not in full_config:
+            print("[fused_image_processor] 配置缺少 hough_inspector_dark_params, 回退浅色")
+            return _run_light(image_gray, rois, full_config)
+        return dark_impl.process_image_from_memory_parallel(image_gray, rois, full_config)
+    except Exception as e:
+        print(f"[fused_image_processor] 深色模式执行异常, 回退浅色: {e}")
+        return _run_light(image_gray, rois, full_config)
 
 def process_image(image_gray, rois, full_config: Dict[str, Any], mode: int):
     """统一入口.
