@@ -25,8 +25,8 @@
   },
   "alarm_light_params": {
     "port": "COM3",
-    "ng_buzz_duration_s": 1,
-    "rejection_buzz_duration_s": 3
+    "ng_buzz_duration_s": 0.75,
+    "rejection_buzz_duration_s": 2.0
   },
   "camera_setup": {
     "expected_cameras": 5,
@@ -64,7 +64,7 @@
     }
   },
   "camera_rois": {
-    "0": "cam5_roi_averaged_by_group.json",
+    "0": "cam1_roi_averaged_by_group.json",
     "1": "cam2_roi_averaged_by_group.json",
     "2": "cam3_roi_averaged_by_group.json",
     "3": "cam4_roi_averaged_by_group.json",

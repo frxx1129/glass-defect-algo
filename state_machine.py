@@ -34,7 +34,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     
     max_complexity_snapshot = np.zeros(num_cameras, dtype=np.int32)
     is_current_event_rejected = False
-    is_ng_alarm_triggered_for_pane = False # 确保NG报警每片玻璃只触发一次
+    # 黄灯策略：每出现一帧新的 NG 图像就刷新黄灯持续时间，直到剔废(红灯)或玻璃离开
+    # 不再使用单次触发标志
     rejection_details = {}
     saved_for_this_pane = False
     
@@ -210,13 +211,12 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     absence_streak = 0
                 if result['image_status'] == 'NG': 
                     current_pane_ng_buffer.append(result)
-                    if not is_ng_alarm_triggered_for_pane:
-                        if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
-                            try:
-                                alarm_light_controller.set_ng_detected_state(shared_settings.ng_buzz_duration_s)
-                            except Exception:
-                                pass
-                        is_ng_alarm_triggered_for_pane = True
+                    if not is_current_event_rejected and alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                        # 每帧 NG 都调用一次，内部应重置计时（需要 alarm_light_controller 实现为幂等/续期）
+                        try:
+                            alarm_light_controller.set_ng_detected_state(shared_settings.ng_buzz_duration_s)
+                        except Exception:
+                            pass
 
                 if np.sum(last_camera_states) > np.sum(max_complexity_snapshot):
                     max_complexity_snapshot = last_camera_states.copy()
@@ -265,7 +265,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         machine_state = "PANE_DETECTED"; machine_state_shared.value = 1
                         current_pane_ng_buffer.clear(); max_complexity_snapshot.fill(0)
                         is_current_event_rejected = False; rejection_details = {}; saved_for_this_pane = False
-                        is_ng_alarm_triggered_for_pane = False
+                        # 无需重置黄灯标志（策略改为帧级刷新）
                         can_late_reject.value = False
                         presence_streak = 0; absence_streak = 0
                         

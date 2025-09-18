@@ -2,8 +2,7 @@ import cv2
 import json
 import time
 import os
-import multiprocessing
-import queue
+import argparse
 from datetime import datetime
 import base64
 import numpy as np
@@ -92,101 +91,124 @@ def process_frame_task(frame_data_gray, cam_index, config, shared_settings, roi_
     return result
 
 def main():
-    config_file = 'config.json'
-    video_file = '5.avi' # 替换为你的视频文件路径
-    output_dir = 'video_hough_results'
-    os.makedirs(output_dir, exist_ok=True)
+    # --- FIX: 使用 argparse 处理命令行参数 ---
+    parser = argparse.ArgumentParser(description="处理视频文件或图片文件夹中的玻璃缺陷。")
+    parser.add_argument('-i', '--input', required=True, help="输入视频文件或图片文件夹的路径。")
+    parser.add_argument('-o', '--output', default='hough_results', help="保存结果的输出文件夹路径。")
+    parser.add_argument('--config', default='config.json', help="配置文件的路径。")
+    args = parser.parse_args()
 
-    # 1. 加载配置文件
+    # 1. 检查输入路径是否存在
+    if not os.path.exists(args.input):
+        print(f"错误: 输入路径 '{args.input}' 不存在。")
+        return
+        
+    os.makedirs(args.output, exist_ok=True)
+
+    # 2. 加载配置文件
     try:
-        with open(config_file, 'r', encoding='utf-8') as f:
+        with open(args.config, 'r', encoding='utf-8') as f:
             config = json.load(f)
-        print(f"成功加载配置: {config_file}")
+        print(f"成功加载配置: {args.config}")
     except FileNotFoundError:
-        print(f"错误: 配置文件 '{config_file}' 未找到。请确保文件存在。")
+        print(f"错误: 配置文件 '{args.config}' 未找到。")
         return
     except json.JSONDecodeError as e:
-        print(f"错误: 解析配置文件 '{config_file}' 失败: {e}")
+        print(f"错误: 解析配置文件 '{args.config}' 失败: {e}")
         return
 
-    # 2. 模拟 SharedSettings
+    # 3. 模拟 SharedSettings 和 ROI 缓存
     shared_settings = MockSharedSettings()
-
-    # 3. 初始化视频捕获
-    cap = cv2.VideoCapture(video_file)
-    if not cap.isOpened():
-        print(f"错误: 无法打开视频文件 '{video_file}'。请检查路径和文件是否存在。")
-        return
-
-    frame_count = 0
-    start_time = time.time()
-    
-    # 模拟ROI缓存，实际多进程中每个进程独立加载
     roi_cache = {} 
     
-    # 获取config中配置的ROI线程数，用于ThreadPoolExecutor
-    sys_params = config.get('system_params', {})
-    # 这里我们只是模拟调用，image_processor_hough内部已经处理了多线程
-    # 所以这里的ThreadPoolExecutor主要是为了并行处理“多路相机”的场景
-    # 对于视频文件，我们模拟单路相机（cam_index = 0）
+    # 模拟单路相机，相机索引为0
+    cam_index = 0 
     
-    print("\n--- 开始处理视频帧 ---")
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("视频处理完成或读取失败。")
-            break
+    start_time = time.time()
+    total_items = 0
 
-        frame_count += 1
-        print(f"处理帧 {frame_count}...")
-
-        # 转换为灰度图 (Hough算法通常在灰度图上操作)
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # 模拟单路相机，相机索引为0
-        cam_index = 0 
+    # --- FIX: 根据输入路径是文件夹还是文件，执行不同逻辑 ---
+    if os.path.isdir(args.input):
+        print(f"\n--- 开始处理文件夹: {args.input} ---")
         
-        # 实际的并行处理发生在 `image_processor.process_image_from_memory_parallel` 内部
-        # 这里我们直接调用它，并模拟 `processing_worker` 对结果的封装
-        result = process_frame_task(gray_frame, cam_index, config, shared_settings, roi_cache)
+        supported_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
+        image_files = sorted([f for f in os.listdir(args.input) if f.lower().endswith(supported_extensions)])
         
-        print(f"  帧 {frame_count} 报告: 状态={result['image_status']}, state_code={result['state_code']}, 缺陷数={len(result['defects'])}, 是否拒绝={result['should_reject']}")
+        if not image_files:
+            print("错误: 在指定文件夹中未找到支持的图片文件。")
+            return
         
-        # 保存标注后的图像 (原始尺寸)
-        output_image_path = os.path.join(output_dir, f"frame_{frame_count:05d}_annotated.jpg")
-        with open(output_image_path, 'wb') as f:
-            f.write(result['annotated_image_buffer_raw'])
+        total_items = len(image_files)
+        for i, filename in enumerate(image_files):
+            print(f"处理图片 {i+1}/{total_items}: {filename}...")
+            image_path = os.path.join(args.input, filename)
+            frame = cv2.imread(image_path)
             
-        # 保存报告 (JSON)
-        report_output_path = os.path.join(output_dir, f"frame_{frame_count:05d}_report.json")
-        # 移除大的base64图片字符串和原始图片buffer，只保存报告核心数据
-        report_to_save = result.copy()
-        report_to_save.pop('image', None)
-        report_to_save.pop('annotated_image_buffer_raw', None)
-        with open(report_output_path, 'w', encoding='utf-8') as f:
-            json.dump(report_to_save, f, indent=2, ensure_ascii=False)
+            if frame is None:
+                print(f"  警告: 无法读取图片 {filename}, 跳过。")
+                continue
+            
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            result = process_frame_task(gray_frame, cam_index, config, shared_settings, roi_cache)
+            
+            print(f"  报告: 状态={result['image_status']}, state_code={result['state_code']}, 缺陷数={len(result['defects'])}")
+            
+            base_filename = os.path.splitext(filename)[0]
+            output_image_path = os.path.join(args.output, f"{base_filename}_annotated.jpg")
+            report_output_path = os.path.join(args.output, f"{base_filename}_report.json")
+            
+            # 保存结果
+            with open(output_image_path, 'wb') as f: f.write(result['annotated_image_buffer_raw'])
+            report_to_save = result.copy()
+            report_to_save.pop('image', None)
+            report_to_save.pop('annotated_image_buffer_raw', None)
+            with open(report_output_path, 'w', encoding='utf-8') as f: json.dump(report_to_save, f, indent=2, ensure_ascii=False)
 
-        # 显示预览图（如果需要）
-        # preview_base64 = result['image'] # 这是base64编码的预览图
-        # decoded_preview = base64.b64decode(preview_base64.split(',')[1])
-        # np_arr = np.frombuffer(decoded_preview, np.uint8)
-        # preview_img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        # cv2.imshow('Processed Frame', preview_img)
+    elif os.path.isfile(args.input):
+        print(f"\n--- 开始处理视频: {args.input} ---")
+        cap = cv2.VideoCapture(args.input)
+        if not cap.isOpened():
+            print(f"错误: 无法打开视频文件 '{args.input}'。")
+            return
         
-        # if cv2.waitKey(1) & 0xFF == ord('q'):
-        #     break
+        total_items = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("视频处理完成或读取失败。")
+                break
+
+            frame_count += 1
+            print(f"处理帧 {frame_count}/{total_items}...")
+            
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            result = process_frame_task(gray_frame, cam_index, config, shared_settings, roi_cache)
+            
+            print(f"  报告: 状态={result['image_status']}, state_code={result['state_code']}, 缺陷数={len(result['defects'])}")
+            
+            output_image_path = os.path.join(args.output, f"frame_{frame_count:05d}_annotated.jpg")
+            report_output_path = os.path.join(args.output, f"frame_{frame_count:05d}_report.json")
+
+            with open(output_image_path, 'wb') as f: f.write(result['annotated_image_buffer_raw'])
+            report_to_save = result.copy()
+            report_to_save.pop('image', None)
+            report_to_save.pop('annotated_image_buffer_raw', None)
+            with open(report_output_path, 'w', encoding='utf-8') as f: json.dump(report_to_save, f, indent=2, ensure_ascii=False)
+        
+        cap.release()
+    
+    else:
+        print(f"错误: 输入路径 '{args.input}' 既不是文件也不是文件夹。")
+        return
 
     end_time = time.time()
     total_time = end_time - start_time
-    print(f"\n--- 视频处理完成 ---")
-    print(f"总帧数: {frame_count}")
+    print(f"\n--- 处理完成 ---")
+    print(f"总处理项目数: {total_items}")
     print(f"总耗时: {total_time:.2f} 秒")
-    if frame_count > 0:
-        print(f"平均每帧处理时间: {total_time / frame_count:.4f} 秒")
-
-    cap.release()
-    # cv2.destroyAllWindows()
+    if total_items > 0:
+        print(f"平均每项处理时间: {total_time / total_items:.4f} 秒")
 
 if __name__ == "__main__":
     main()
