@@ -239,7 +239,8 @@ def main():
     
     # Shared state
     shared_camera_states = manager.dict()
-    # 仅保留剔废统计（删除产量统计）
+    # 恢复产量 + 剔废统计
+    shared_yield_counter = manager.Value('i', 0)
     shared_rejection_counter = manager.Value('i', 0)
     manual_reject_flag = manager.Value('b', False)
     machine_state_shared = manager.Value('i', 0)
@@ -302,8 +303,7 @@ def main():
         'stop_event': stop_event, 'run_event': run_event,
         'camera_states': shared_camera_states,
         'settings': shared_settings,
-    # 仅剔废计数
-    'counters': (shared_rejection_counter,),
+        'counters': (shared_rejection_counter, shared_yield_counter),  # 顺序: 0=rejections 1=yield
         'queues': {'task': task_queue, 'results': results_queue, 'rejection': rejection_queue},
         'flags': (manual_reject_flag, shared_rejection_mode, can_late_reject),
         'machine_state': machine_state_shared,
@@ -311,7 +311,7 @@ def main():
         'metadata': (shared_collection_id, shared_user_id_auto, shared_user_id_manual),
         'rejection_controller': rejection_controller,
         'alarm_light_controller': alarm_light_controller, # <-- 传递安全的代理对象
-        'http_client': http_client
+    'http_client': http_client
     }
 
     app = create_app(num_cameras=NUM_CAMERAS, shared_objects=shared_objects)

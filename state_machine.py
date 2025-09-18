@@ -7,7 +7,7 @@ import numpy as np
 from queue import Empty
 from datetime import datetime
 import yield_manager
-from server_comms import send_report_to_server, send_reports_batch_to_server, fetch_collection_id_from_server, fetch_initial_state_from_server, broadcast_rejections
+from server_comms import send_report_to_server, send_reports_batch_to_server, fetch_collection_id_from_server, fetch_initial_state_from_server, broadcast_rejections, broadcast_yield_and_rejections
 
 def results_and_state_machine_thread(num_cameras, results_queue, connection_manager, stop_event, loop, shared_settings, counters, queues, flags, machine_state_shared, stats_lock, metadata, run_event_proxy, http_client, alarm_light_controller):
     print("[状态机线程]: 已启动。")
@@ -16,7 +16,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     
     STORAGE_PATH = shared_settings.storage_path
     # 修改：移除产量计数，仅保留剔废计数
-    (shared_rejection_counter,) = counters
+    (shared_rejection_counter, shared_yield_counter) = counters  # 0=rejections 1=yield
     (rejection_queue,) = queues
     (manual_reject_flag, shared_rejection_mode, can_late_reject) = flags
     (shared_collection_id, shared_user_id_auto, shared_user_id_manual) = metadata
@@ -24,13 +24,16 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     machine_state = "WAITING_FOR_PANE"
     machine_state_shared.value = 0 
     last_camera_states = np.zeros(num_cameras, dtype=np.int32)
-    current_pane_ng_buffer = []
+    current_pane_ng_buffer = []  # 收集该片玻璃所有 NG 帧的原始结果（含图像缓冲）
+    current_pane_reports = []    # 收集该片玻璃所有 NG 报告（即时写入 JSON）
+    current_pane_folder = None   # 当前玻璃的存储文件夹
+    pane_ng_frame_counter = 0    # 当前玻璃 NG 帧计数
     last_pane_data = {}
     
     with stats_lock:
-        last_reset_date_str, _legacy_yield, total_rejections = yield_manager.load_stats()
+        last_reset_date_str, total_yield, total_rejections = yield_manager.load_stats()
         shared_rejection_counter.value = total_rejections
-    total_yield = 0  # 产量统计已废弃
+        shared_yield_counter.value = total_yield
     
     max_complexity_snapshot = np.zeros(num_cameras, dtype=np.int32)
     is_current_event_rejected = False
@@ -89,34 +92,35 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             'camera_index': result_obj['camera_index']
         }
 
-    def save_and_upload_reports_batch(results_list, rejection_details_to_save):
-        if not results_list:
+    def upload_current_pane_if_needed():
+        """在玻璃离开时上传该片期间所有已保存的 NG 报告与图像。"""
+        nonlocal current_pane_ng_buffer, current_pane_reports, current_pane_folder
+        if not current_pane_ng_buffer or not current_pane_reports:
             return
-        save_dir = os.path.join(STORAGE_PATH, datetime.now().strftime('%Y-%m-%d'))
-        os.makedirs(save_dir, exist_ok=True)
-        reports = []
-        images = []
-        for res in results_list:
-            rpt = build_report_for_frame(res, rejection_details_to_save)
-            reports.append(rpt)
-            img_buf = res.get('annotated_image_buffer')
-            images.append(img_buf)
-            base_name = f"{datetime.strptime(rpt['rejection_time'], '%Y-%m-%d %H:%M:%S').strftime('%H%M%S')}_{rpt['collection_id']}_Cam{rpt['camera_index']}"
-            if img_buf:
-                with open(os.path.join(save_dir, f"{base_name}.jpg"), 'wb') as f:
-                    f.write(img_buf)
-            with open(os.path.join(save_dir, f"{base_name}.json"), 'w', encoding='utf-8') as f:
-                json.dump(rpt, f, ensure_ascii=False, indent=4, default=str)
-        send_reports_batch_to_server(reports, images, shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
-        print(f"    [状态机]: 批量上传完成，数量: {len(reports)}")
+        # 统一使用最终剔废类型（若发生剔废则全部标记其类型；否则保持各自已有）
+        final_type = None
+        if is_current_event_rejected and rejection_details.get('rejection_type'):
+            final_type = rejection_details.get('rejection_type')
+        reports_for_upload = []
+        images_for_upload = []
+        for rpt, res in zip(current_pane_reports, current_pane_ng_buffer):
+            if final_type and rpt.get('rejection_type') in ('0', 'pending', 'unknown'):
+                rpt['rejection_type'] = final_type
+                # 统一 rejection_time 为剔废时间
+                if 'rejection_time' in rejection_details:
+                    rpt['rejection_time'] = rejection_details['rejection_time'].strftime('%Y-%m-%d %H:%M:%S')
+            reports_for_upload.append(rpt)
+            images_for_upload.append(res.get('annotated_image_buffer'))
+        send_reports_batch_to_server(reports_for_upload, images_for_upload, shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
+        print(f"    [状态机]: 本片玻璃上传完成，共 {len(reports_for_upload)} 张 NG 图像。")
 
     # Initial state fetch
     fetch_collection_id_from_server(shared_settings, shared_collection_id)
     initial_state = fetch_initial_state_from_server(shared_settings)
     if initial_state:
         shared_rejection_mode.value = initial_state.get("rejectionMode", 1)
-        threshold_str = str(initial_state.get("rejectionThreshold", 20.0)).replace("mm", "").strip()
-        shared_settings.max_defect_size_mm = float(threshold_str) if threshold_str else 20.0
+        threshold_int = initial_state.get("rejectionThreshold", 20)
+        shared_settings.max_defect_size_mm = threshold_int if threshold_int else 20
         shared_user_id_auto.value = initial_state.get("algUserVO", {}).get("userId", 7)
         if initial_state.get("enable") == 1: 
             run_event_proxy.set()
@@ -125,64 +129,86 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         print("[状态机]: 未能从服务器获取状态，保持当前运行状态。")
     
     while not stop_event.is_set():
-        # Handle late manual rejection
+        # 处理滞后剔废（在等待新玻璃状态下）
         if machine_state == "WAITING_FOR_PANE" and manual_reject_flag.value and can_late_reject.value:
-            manual_reject_flag.value = False; can_late_reject.value = False
+            manual_reject_flag.value = False
+            can_late_reject.value = False
             print(f"--- [状态机]: 检测到滞后手动剔废指令 ---")
-            if last_pane_data and not last_pane_data.get("was_rejected_in_view"):
-                # 批量滞后上传整片期间所有 NG 帧
-                ng_buf = last_pane_data.get("ng_buffer") or []
-                if ng_buf:
-                    save_and_upload_reports_batch(list(ng_buf), {"rejection_time": datetime.now(), "rejection_type": "2"})
-                    # 剃废即刻触发红灯报警（与状态无关）
-                    if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
-                        try:
-                            alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
-                        except Exception:
-                            pass
-                    with stats_lock:
-                        total_rejections += 1; shared_rejection_counter.value = total_rejections
-                        yield_manager.save_stats(last_reset_date_str, 0, total_rejections)
-                    broadcast_rejections(shared_settings, shared_collection_id, shared_rejection_counter, http_client)
-                    print(f"    [状态机]: 滞后剔废计数+1, 今日总剔废: {total_rejections}")
-            last_pane_data = {}
+            if current_pane_ng_buffer and not is_current_event_rejected:
+                # 更新所有已缓存报告的剔废类型并上传（之前未上传因为处于模式2下且未剔废）
+                rejection_details = {"rejection_time": datetime.now(), "rejection_type": "2"}
+                for rpt in current_pane_reports:
+                    rpt['rejection_type'] = '2'
+                    rpt['rejection_time'] = rejection_details['rejection_time'].strftime('%Y-%m-%d %H:%M:%S')
+                send_reports_batch_to_server(current_pane_reports, [r.get('annotated_image_buffer') for r in current_pane_ng_buffer], shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
+                if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                    try:
+                        alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
+                    except Exception:
+                        pass
+                with stats_lock:
+                    total_rejections += 1
+                    # 之前离开时已把该片计为产量 +1，此处回滚 -1
+                    if total_yield > 0:
+                        total_yield -= 1
+                        shared_yield_counter.value = total_yield
+                    shared_rejection_counter.value = total_rejections
+                    yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                print(f"    [状态机]: 滞后剔废完成并上传。本片NG帧数量: {len(current_pane_ng_buffer)}")
+                # 上传后清空，为下一片做准备
+                current_pane_ng_buffer.clear()
+                current_pane_reports.clear()
+                current_pane_folder = None
+                pane_ng_frame_counter = 0
+            continue
 
         try:
             result = results_queue.get(timeout=0.04)
+        except Empty:
+            continue
+        except Exception as e:
+            print(f"[状态机]: 从队列获取结果出错: {e}")
+            continue
+
+        try:
             cam_index = result["camera_index"]
-            ws_data = {k:v for k,v in result.items() if k != 'annotated_image_buffer'}
+            ws_data = {k: v for k, v in result.items() if k != 'annotated_image_buffer'}
             try:
                 asyncio.run_coroutine_threadsafe(connection_manager.broadcast(json.dumps(ws_data), cam_index), loop)
             except Exception:
                 pass
-            
+
             now_str = datetime.now().strftime('%Y-%m-%d')
             if now_str != last_reset_date_str:
                 with stats_lock:
-                    print(f"--- [状态机]: 日期已变更，正在保存 {last_reset_date_str} 的最终报告... ---")
-                    yield_manager.save_daily_report(last_reset_date_str, 0, total_rejections)
+                    print(f"--- [状态机]: 日期变更，保存 {last_reset_date_str} 日志并重置计数 ---")
+                    yield_manager.save_daily_report(last_reset_date_str, total_yield, total_rejections)
                     total_rejections = 0
+                    total_yield = 0
                     shared_rejection_counter.value = 0
+                    shared_yield_counter.value = 0
                     last_reset_date_str = now_str
-                    yield_manager.save_stats(now_str, 0, total_rejections)
-            
+                    yield_manager.save_stats(now_str, total_yield, total_rejections)
+
             if cam_index >= len(last_camera_states):
                 last_camera_states = np.pad(last_camera_states, (0, cam_index - len(last_camera_states) + 1), 'constant')
                 max_complexity_snapshot = np.pad(max_complexity_snapshot, (0, cam_index - len(max_complexity_snapshot) + 1), 'constant')
-            
+
             last_camera_states[cam_index] = result['state_code']
-            current_total_panes = np.sum(last_camera_states)
-            
-            # State machine logic with debounce and integrated alarm control
+            current_total_panes = int(np.sum(last_camera_states))
+
             if machine_state == "PANE_DETECTED":
-                # 离开事件去抖
+                # 检测离开
                 if current_total_panes == 0:
                     absence_streak += 1
                     if absence_streak >= LEAVE_CONFIRM_FRAMES:
-                        print(f"--- [状态机]: 玻璃离开事件 ---")
-                        machine_state = "WAITING_FOR_PANE"; machine_state_shared.value = 0
-                        absence_streak = 0; presence_streak = 0
-                        
+                        print("--- [状态机]: 玻璃离开事件 ---")
+                        machine_state = "WAITING_FOR_PANE"
+                        machine_state_shared.value = 0
+                        absence_streak = 0
+                        presence_streak = 0
+
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                             try:
                                 if is_current_event_rejected:
@@ -192,27 +218,68 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             except Exception:
                                 pass
 
-                        # 产量统计移除
-
-                        if is_current_event_rejected and not saved_for_this_pane:
-                            if current_pane_ng_buffer:
-                                save_and_upload_reports_batch(list(current_pane_ng_buffer), rejection_details)
-                                saved_for_this_pane = True
-                        
-                        last_pane_data = {}
-                        can_late_reject.value = False
-                        if not is_current_event_rejected and current_pane_ng_buffer and shared_rejection_mode.value == 2:
-                            last_pane_data = {"ng_buffer": list(current_pane_ng_buffer), "was_rejected_in_view": False}
+                        # 离开时：若为模式2且未剔废，允许滞后剔废 -> 不立即上传
+                        if shared_rejection_mode.value == 2 and not is_current_event_rejected and current_pane_ng_buffer:
                             can_late_reject.value = True
-                            print(f"    [状态机]: 上一片玻璃存在NG，已暂存信息，等待可能的滞后剔废指令。")
-                    # 若未达到阈值，暂不处理业务逻辑
-                    continue
+                            print("    [状态机]: 等待可能的滞后剔废（模式2），暂不上传。")
+                        else:
+                            upload_current_pane_if_needed()
+                            # 上传后清理
+                            current_pane_ng_buffer.clear()
+                            current_pane_reports.clear()
+                            current_pane_folder = None
+                            pane_ng_frame_counter = 0
+                            can_late_reject.value = False
+                            # 若没有被剔废（包括未触发滞后），计入产量
+                            if not is_current_event_rejected:
+                                with stats_lock:
+                                    total_yield += 1
+                                    shared_yield_counter.value = total_yield
+                                    yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                                broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                            is_current_event_rejected = False
+                        continue
                 else:
                     absence_streak = 0
-                if result['image_status'] == 'NG': 
+
+                # NG 帧处理
+                if result['image_status'] == 'NG':
+                    if current_pane_folder is None:
+                        pane_start_ts = datetime.now()
+                        raw_cid = shared_collection_id.value
+                        try:
+                            if isinstance(raw_cid, (bytes, bytearray)):
+                                cid_int = int(raw_cid.decode('utf-8', errors='ignore').strip() or -1)
+                            else:
+                                cid_int = int(raw_cid)
+                        except Exception:
+                            cid_int = -1
+                        date_dir = os.path.join(STORAGE_PATH, pane_start_ts.strftime('%Y-%m-%d'))
+                        os.makedirs(date_dir, exist_ok=True)
+                        current_pane_folder = os.path.join(date_dir, f"pane_{pane_start_ts.strftime('%H%M%S')}_{cid_int}")
+                        os.makedirs(current_pane_folder, exist_ok=True)
+                        pane_ng_frame_counter = 0
                     current_pane_ng_buffer.append(result)
+                    frame_ts = datetime.now()
+                    temp_rej_details = {
+                        'rejection_time': frame_ts,
+                        'rejection_type': (rejection_details.get('rejection_type') if is_current_event_rejected else '0')
+                    }
+                    rpt = build_report_for_frame(result, temp_rej_details)
+                    current_pane_reports.append(rpt)
+                    try:
+                        cam_disp = int(result['camera_index']) + 1
+                    except Exception:
+                        cam_disp = result.get('camera_index', 'X')
+                    pane_ng_frame_counter += 1
+                    base_name = f"{pane_ng_frame_counter:04d}_Cam{cam_disp}"
+                    img_buf = result.get('annotated_image_buffer')
+                    if img_buf:
+                        with open(os.path.join(current_pane_folder, base_name + '.jpg'), 'wb') as f:
+                            f.write(img_buf)
+                    with open(os.path.join(current_pane_folder, base_name + '.json'), 'w', encoding='utf-8') as f:
+                        json.dump(rpt, f, ensure_ascii=False, indent=2, default=str)
                     if not is_current_event_rejected and alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
-                        # 每帧 NG 都调用一次，内部应重置计时（需要 alarm_light_controller 实现为幂等/续期）
                         try:
                             alarm_light_controller.set_ng_detected_state(shared_settings.ng_buzz_duration_s)
                         except Exception:
@@ -220,65 +287,81 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
 
                 if np.sum(last_camera_states) > np.sum(max_complexity_snapshot):
                     max_complexity_snapshot = last_camera_states.copy()
-                
+
                 if not is_current_event_rejected:
+                    # 自动剔废
                     if shared_rejection_mode.value == 1 and result.get('should_reject', False):
-                        is_current_event_rejected = True; saved_for_this_pane = True
+                        is_current_event_rejected = True
+                        saved_for_this_pane = True
                         rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
-                        if current_pane_ng_buffer:
-                            save_and_upload_reports_batch(list(current_pane_ng_buffer), rejection_details)
-                        else:
-                            save_and_upload_reports_batch([result], rejection_details)
                         rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index))
-                        # 剃废即刻触发红灯报警（与状态无关）
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                             try:
                                 alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
                             except Exception:
                                 pass
                         with stats_lock:
-                            total_rejections += 1; shared_rejection_counter.value = total_rejections
-                            yield_manager.save_stats(last_reset_date_str, 0, total_rejections)
-                        broadcast_rejections(shared_settings, shared_collection_id, shared_rejection_counter, http_client)
-                        print(f"    [状态机]: 自动剔废触发！")
+                            total_rejections += 1
+                            shared_rejection_counter.value = total_rejections
+                            yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                        broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                        print("    [状态机]: 自动剔废触发！")
+                    # 即时手动剔废（模式2）
                     elif manual_reject_flag.value and shared_rejection_mode.value == 2:
-                        is_current_event_rejected = True; manual_reject_flag.value = False
+                        is_current_event_rejected = True
+                        manual_reject_flag.value = False
                         rejection_details = {"rejection_time": datetime.now(), "rejection_type": "2"}
                         rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, -1))
-                        # 剃废即刻触发红灯报警（与状态无关）
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                             try:
                                 alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
                             except Exception:
                                 pass
                         with stats_lock:
-                            total_rejections += 1; shared_rejection_counter.value = total_rejections
-                            yield_manager.save_stats(last_reset_date_str, 0, total_rejections)
-                        broadcast_rejections(shared_settings, shared_collection_id, shared_rejection_counter, http_client)
-                        print(f"    [状态机]: 即时手动剔废触发！")
+                            total_rejections += 1
+                            shared_rejection_counter.value = total_rejections
+                            yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                        broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                        print("    [状态机]: 即时手动剔废触发！")
 
             elif machine_state == "WAITING_FOR_PANE":
-                # 进入事件去抖
                 if current_total_panes > 0:
                     presence_streak += 1
                     if presence_streak >= ENTER_CONFIRM_FRAMES:
-                        machine_state = "PANE_DETECTED"; machine_state_shared.value = 1
-                        current_pane_ng_buffer.clear(); max_complexity_snapshot.fill(0)
-                        is_current_event_rejected = False; rejection_details = {}; saved_for_this_pane = False
-                        # 无需重置黄灯标志（策略改为帧级刷新）
+                        # 若上一片玻璃存在 NG 但处于滞后等待且最终未被剔废，应当此时补记产量并上传（不再等待滞后剔废）。
+                        if can_late_reject.value and not is_current_event_rejected and current_pane_ng_buffer:
+                            upload_current_pane_if_needed()
+                            current_pane_ng_buffer.clear()
+                            current_pane_reports.clear()
+                            current_pane_folder = None
+                            pane_ng_frame_counter = 0
+                            with stats_lock:
+                                total_yield += 1
+                                shared_yield_counter.value = total_yield
+                                yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                            broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                            can_late_reject.value = False
+                            print("    [状态机]: 上一片未滞后剔废，已自动计入产量并上传。")
+                        machine_state = "PANE_DETECTED"
+                        machine_state_shared.value = 1
+                        current_pane_ng_buffer.clear()
+                        current_pane_reports.clear()
+                        current_pane_folder = None
+                        pane_ng_frame_counter = 0
+                        max_complexity_snapshot.fill(0)
+                        is_current_event_rejected = False
+                        rejection_details = {}
+                        saved_for_this_pane = False
                         can_late_reject.value = False
-                        presence_streak = 0; absence_streak = 0
-                        
+                        presence_streak = 0
+                        absence_streak = 0
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                             try:
                                 alarm_light_controller.set_normal_state()
                             except Exception:
                                 pass
-                        
-                        print(f"--- [状态机]: 玻璃进入事件 ---")
+                        print("--- [状态机]: 玻璃进入事件 ---")
                 else:
                     presence_streak = 0
-        except Empty: 
-            pass
         except Exception as e:
             print(f"[状态机]: 处理结果时出错: {e}")

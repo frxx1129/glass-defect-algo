@@ -25,7 +25,7 @@ def create_app(num_cameras, shared_objects):
     stop_event_mp, run_event_mp = shared_objects['stop_event'], shared_objects['run_event']
     shared_camera_states = shared_objects['camera_states']
     shared_settings = shared_objects['settings']
-    counters = shared_objects['counters']
+    counters = shared_objects['counters']  # (rejection_counter, yield_counter)
     queues = shared_objects['queues']
     flags = shared_objects['flags']
     machine_state_shared = shared_objects['machine_state']
@@ -115,7 +115,7 @@ def create_app(num_cameras, shared_objects):
 
     @app.get("/rejections")
     def get_rejections(): 
-        return {"code": 200, "message": "获取剔废数量成功", "data": {"rejections": counters[0].value}}
+        return {"code": 200, "message": "获取剔废数量成功", "data": {"rejections": counters[0].value, "yield": counters[1].value}}
             
     @app.websocket("/ws/stream/{cam_index}")
     async def websocket_endpoint(websocket: WebSocket, cam_index: int):

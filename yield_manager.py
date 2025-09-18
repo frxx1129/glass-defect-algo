@@ -1,8 +1,12 @@
-"""统计管理器 (精简版)
+"""统计管理器
 
-仅保留剔废(rejections) 计数的持久化/报告功能。
-对历史版本兼容：旧文件含有 yield 字段与旧签名(无 rejections 或不同签名算法)时，读取后产量直接忽略并返回 0。
-返回接口保持 (date, yield, rejections) 形式以避免外部调用崩溃，但 yield 恒为 0。
+恢复对产量(yield) 与 剔废(rejections) 的双计数持久化：
+ - 每片玻璃进入+离开一次 => 产量 +1 (若之后未被/未曾剔废)
+ - 自动 / 即时手动剔废：不计入该片产量 (本片不+1)
+ - 滞后手动剔废：在先前已 +1 的情况下需回滚产量 (-1) 并增加剔废
+
+兼容旧版本（仅剔废或旧签名）文件：若签名不匹配或缺字段则重置为 0,0。
+返回 (date, yield, rejections)。
 """
 
 import json
@@ -14,14 +18,14 @@ import os
 SECRET_KEY = "$$SWJTU$$GLASS&&"
 STATS_FILE_PATH = "persistent_stats.dat"
 REPORTS_DIR = "daily_reports"
-FORMAT_VERSION = 2  # 1: 旧(含 yield) 2: 新(仅 rejections)
+FORMAT_VERSION = 3  # 1: 旧(含 yield) 2: 仅剔废 3: 恢复双计数
 
-def save_stats(date_str: str, _unused_yield: int, rejection_count: int):
-    """保存当日实时剔废统计 (兼容旧签名字段, yield 固定写 0)。"""
+def save_stats(date_str: str, yield_count: int, rejection_count: int):
+    """保存当日实时统计（产量 + 剔废）。"""
     try:
         data = {
             'date': date_str,
-            'yield': 0,  # 占位保持字段，固定0
+            'yield': int(yield_count),
             'rejections': int(rejection_count),
             'ver': FORMAT_VERSION
         }
@@ -34,16 +38,17 @@ def save_stats(date_str: str, _unused_yield: int, rejection_count: int):
     except Exception as e:
         print(f"❌ [统计管理器]: 保存实时统计失败: {e}")
 
-def save_daily_report(date_str: str, _unused_yield: int, rejection_count: int):
-    """保存每日归档报告 (只含剔废)。"""
+def save_daily_report(date_str: str, yield_count: int, rejection_count: int):
+    """保存每日归档报告 (含产量与剔废)。"""
     try:
         os.makedirs(REPORTS_DIR, exist_ok=True)
         report = {
             'report_date': date_str,
+            'total_yield': int(yield_count),
             'total_rejections': int(rejection_count),
             'ver': FORMAT_VERSION
         }
-        verify_str = f"{report['report_date']}-{report['total_rejections']}-{SECRET_KEY}"
+        verify_str = f"{report['report_date']}-{report['total_yield']}-{report['total_rejections']}-{SECRET_KEY}"
         signature = hashlib.sha256(verify_str.encode('utf-8')).hexdigest()
         wrapped = {'report': report, 'signature': signature}
         path = os.path.join(REPORTS_DIR, f"stats_report_{date_str}.json")
@@ -64,25 +69,23 @@ def load_stats():
         sig = payload.get('signature', '')
         date_str = data.get('date')
         rej = int(data.get('rejections', 0))
-        old_yield = int(data.get('yield', 0))  # 兼容读取
+        yld = int(data.get('yield', 0))
 
-        # 新签名
-        verify_new = f"{date_str}-{0}-{rej}-{SECRET_KEY}"
-        sig_new = hashlib.sha256(verify_new.encode('utf-8')).hexdigest()
-        # 旧签名(含 yield 但无 rejections 或不同结构)
-        verify_old = f"{date_str}-{old_yield}-{rej}-{SECRET_KEY}"
-        sig_old_variant = hashlib.sha256(verify_old.encode('utf-8')).hexdigest()
-        verify_old_legacy = f"{date_str}-{old_yield}-{SECRET_KEY}"
-        sig_old_legacy = hashlib.sha256(verify_old_legacy.encode('utf-8')).hexdigest()
-
-        if sig not in (sig_new, sig_old_variant, sig_old_legacy):
+        # 当前签名（格式3）
+        verify_v3 = f"{date_str}-{yld}-{rej}-{SECRET_KEY}"
+        sig_v3 = hashlib.sha256(verify_v3.encode('utf-8')).hexdigest()
+        # 旧版本兼容（v2: yield 恒为0）
+        verify_v2 = f"{date_str}-{0}-{rej}-{SECRET_KEY}"
+        sig_v2 = hashlib.sha256(verify_v2.encode('utf-8')).hexdigest()
+        # 最旧版本(可能无 rejections) 不再完全兼容，只要匹配 v3/v2 即接受
+        if sig not in (sig_v3, sig_v2):
             print("⚠️ [统计管理器]: 校验失败，重置计数。")
             return today, 0, 0
         if date_str != today:
             print("ℹ️ [统计管理器]: 跨日，重置计数。")
             return today, 0, 0
-        print(f"✅ [统计管理器]: 加载成功 (剔废={rej})")
-        return date_str, 0, rej
+        print(f"✅ [统计管理器]: 加载成功 (产量={yld}, 剔废={rej})")
+        return date_str, yld, rej
     except FileNotFoundError:
         print("ℹ️ [统计管理器]: 无历史文件，初始化。")
         return today, 0, 0

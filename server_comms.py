@@ -114,7 +114,11 @@ def send_report_to_server(json_report, image_buffer, server_url, http_client, up
     except ValueError:
         time_str = "000000"
     cam_index = json_report.get("camera_index", "X")
-    image_filename = f"{time_str}_{collection_id}_Cam{cam_index}.jpg"
+    try:
+        cam_display = int(cam_index) + 1
+    except Exception:
+        cam_display = cam_index
+    image_filename = f"{time_str}_{collection_id}_Cam{cam_display}.jpg"
 
     # 文件内容和名称
     file_data = (image_filename, image_buffer, 'image/jpeg')
@@ -126,7 +130,10 @@ def send_report_to_server(json_report, image_buffer, server_url, http_client, up
 
 
 def send_reports_batch_to_server(json_reports, image_buffers, server_url, http_client, upload_timeout_s: float | None = None):
-    """批量上传：json_reports 与 image_buffers 对应；最终 multipart 中 files & payload 都为数组"""
+    """批量上传：json_reports 与 image_buffers 对应；form-data 中：
+    - 多个 fileList 字段，每个一张图片 (filename, bytes, 'image/jpeg')
+    - 一个 payload 字段，内容为 JSON 数组字符串
+    不附加其他冗余字段。"""
     files_list = []
     sanitized_reports = []
     for rpt, img_buf in zip(json_reports, image_buffers):
@@ -142,13 +149,17 @@ def send_reports_batch_to_server(json_reports, image_buffers, server_url, http_c
         except ValueError:
             time_str = "000000"
         cam_index = rpt.get("camera_index", "X")
-        image_filename = f"{time_str}_{collection_id}_Cam{cam_index}.jpg"
+        try:
+            cam_display = int(cam_index) + 1
+        except Exception:
+            cam_display = cam_index
+        image_filename = f"{time_str}_{collection_id}_Cam{cam_display}.jpg"
         if img_buf:
             files_list.append((image_filename, img_buf, 'image/jpeg'))
         sanitized_reports.append(rpt)
     if not sanitized_reports:
         return
-    print(f"    [上传模块]: 正在批量提交 {len(sanitized_reports)} 份报告")
+    print(f"    [上传模块]: 正在批量提交 {len(sanitized_reports)} 份报告 (fileList 模式)")
     http_client.post_files_batch(server_url, files_list, sanitized_reports, timeout_s=upload_timeout_s)
 
 
@@ -169,4 +180,23 @@ def broadcast_rejections(settings, collection_id, rejection_count, http_client):
         "rejection": int(rejection_count.value)
     }
     target_url = f"http://{settings.server}:8085/fastapi/glass/updateRejections"
+    http_client.post(target_url, json=payload, timeout=getattr(settings, 'http_post_timeout_s', 5))
+
+def broadcast_yield_and_rejections(settings, collection_id, yield_counter, rejection_counter, http_client):
+    """同时广播产量与剔废到 /updateYieldAndRejections 接口。"""
+    try:
+        cid_raw = getattr(collection_id, 'value', collection_id)
+        if isinstance(cid_raw, (bytes, bytearray)):
+            cid_str = cid_raw.decode('utf-8', errors='replace')
+        else:
+            cid_str = str(cid_raw)
+        cid_int = int(cid_str)
+    except Exception:
+        cid_int = -1
+    payload = {
+        'collectionId': cid_int,
+        'yield': int(yield_counter.value),
+        'rejection': int(rejection_counter.value)
+    }
+    target_url = f"http://{settings.server}:8085/fastapi/glass/updateYieldAndRejections"
     http_client.post(target_url, json=payload, timeout=getattr(settings, 'http_post_timeout_s', 5))

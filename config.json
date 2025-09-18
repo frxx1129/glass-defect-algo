@@ -71,13 +71,13 @@
     "4": "cam5_roi_averaged_by_group.json"
   },
   "server_config": {
-    "server": "127.0.0.1",
+    "server": "192.168.31.70",
     "listen_host": "0.0.0.0",
     "listen_port": 12450,
     "cors_origins": ["*"],
-    "upload_url": "http://127.0.0.1:8085/fastapi/glass/uploadWithDefects",
-    "stats_push_url": "http://127.0.0.1:8085/fastapi/glass/updateYieldAndRejections",
-    "heartbeat_url": "http://127.0.0.1:8085/fastapi/system/heartbeat"
+    "upload_url": "http://192.168.31.70:8085/fastapi/glass/uploadWithDefects",
+    "stats_push_url": "http://192.168.31.70:8085/fastapi/glass/updateYieldAndRejections",
+    "heartbeat_url": "http://192.168.31.70:8085/fastapi/system/heartbeat"
   },
   "rejection_params": {
     "max_defect_size_mm": 20,
@@ -103,6 +103,46 @@
       "TOP_N_EDGES": 8
     },
     "CRACK_CLASSIFICATION": { "ENDPOINT_SHIELD_RATIO": 0.1 },
+    "DEFECT_DETECTION": {
+      "ANGLE_DEVIATION_TOLERANCE": 2.0,
+      "MIN_DEFECT_SIZE_MM": 3.0,
+      "CORNER_MAX_PHYSICAL_GAP": 3,
+      "CORNER_MAX_EXTENSION_DIST_NORMAL": 100,
+      "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR": 500,
+      "PERPENDICULAR_ANGLE_TOLERANCE": 10,
+      "CORNER_SECTOR_RADIUS": 40,
+      "LUMINOSITY_SCAN_WIDTH": 30,
+      "LUMINOSITY_STD_DEV_MULTIPLIER": 2.4,
+      "LUMINOSITY_MIN_AREA": 50,
+      "LUMINOSITY_EDGE_IGNORE_WIDTH": 2,
+      "MERGE_DEFECTS_KERNEL_SIZE": [5, 5],
+      "FALSE_DEFECT_MAX_WIDTH": 8,
+      "FALSE_DEFECT_MIN_ASPECT_RATIO": 5,
+      "CHIPPING_ENDPOINT_SHIELD_RADIUS": 30
+    },
+    "VISUALIZATION": {
+      "EDGE_ENDPOINT_FIXED_LENGTH": 20,
+      "DEFECT_OVERLAY_ALPHA": 0.25,
+      "RETREAT_DISTANCE_THRESHOLD": 100
+    }
+  },
+  "hough_inspector_dark_params": {
+    "PREPROCESSING": {
+      "OPENING_KERNEL_SIZE": [21, 21]
+    },
+    "HOUGH_TRANSFORM": {
+      "THRESHOLD": 30,
+      "MIN_LINE_LENGTH": 25,
+      "MAX_LINE_GAP": 20
+    },
+    "LINE_MERGING": {
+      "ANGLE_TOLERANCE": 5,
+      "MAX_LATERAL_DISTANCE": 30,
+      "TOP_N_EDGES": 8
+    },
+    "CRACK_CLASSIFICATION": {
+      "ENDPOINT_SHIELD_RATIO": 0.1
+    },
     "DEFECT_DETECTION": {
       "ANGLE_DEVIATION_TOLERANCE": 2.0,
       "MIN_DEFECT_SIZE_MM": 3.0,

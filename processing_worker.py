@@ -9,17 +9,25 @@ import image_processor_hough as image_processor
 import image_processor_hough_dark as dark_glass_processor
 
 def should_reject_pane(pane_json, shared_settings, pixels_per_mm):
-    """Determines if a pane should be rejected based on defect size and type."""
-    if pane_json['image_status'] == 'OK': return False
-    max_size_thresh = shared_settings.max_defect_size_mm
+    """根据缺陷类型与尺寸判定是否剔废。
+    规则：
+    - Q(缺角)、X(斜边) 直接判定剔废。
+    - B(崩边)、L(裂纹) 若任一缺陷的 length_mm 或 width_mm >= 阈值(max_defect_size_mm) 判定剔废。
+    - 其余或无缺陷 => 不剔废。
+    """
+    if pane_json.get('image_status') == 'OK':
+        return False
+    max_size_thresh = float(getattr(shared_settings, 'max_defect_size_mm', 20))
     for defect in pane_json.get('defects', []):
         defect_type = defect.get('type')
-        if defect_type in ['Q', 'X']: return True
-        # 注意：新算法不直接提供length_mm/width_mm，此处的L/B型缺陷剔除逻辑可能需要根据新报告格式调整
-        if defect_type in ['B', 'L']:
-            # 这是一个示例，可以根据需要扩展
-            # 由于新算法的缺陷报告不包含尺寸信息，这里我们仅基于类型就触发剔除
+        if defect_type in ('X'):
             return True
+        if defect_type in ('Q', 'B', 'L'):
+            loc = defect.get('location', {})
+            length_mm = float(loc.get('length_mm', 0) or 0)
+            width_mm = float(loc.get('width_mm', 0) or 0)
+            if max(length_mm, width_mm) >= max_size_thresh:
+                return True
     return False
 
 def calculation_worker(process_index, task_queue, results_queue, stop_event, run_event, config, shared_settings):

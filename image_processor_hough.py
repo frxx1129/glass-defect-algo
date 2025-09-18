@@ -348,8 +348,14 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     p1, p2 = defect['endpoints']
                     dist_leg1_px = np.linalg.norm(np.array(center) - np.array(p1))
                     dist_leg2_px = np.linalg.norm(np.array(center) - np.array(p2))
-                    length_px = max(dist_leg1_px, dist_leg2_px)
-                    width_px = min(dist_leg1_px, dist_leg2_px)
+                    # 修改：若绘制阶段会因为“过长”回退到固定长度，这里尺寸同样应用回退规则，确保报告尺寸与最终三角形一致。
+                    p_vis_local = params.get("VISUALIZATION", {})
+                    retreat_threshold = p_vis_local.get("RETREAT_DISTANCE_THRESHOLD", 100.0)
+                    retreat_len_px = p_vis_local.get("EDGE_ENDPOINT_FIXED_LENGTH", 20)
+                    adj_leg1 = retreat_len_px if dist_leg1_px > retreat_threshold else dist_leg1_px
+                    adj_leg2 = retreat_len_px if dist_leg2_px > retreat_threshold else dist_leg2_px
+                    length_px = max(adj_leg1, adj_leg2)
+                    width_px  = min(adj_leg1, adj_leg2)
                 else:
                     length_px, width_px = 0.0, 0.0
             elif defect['type'] == 'L':
@@ -428,6 +434,14 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 if dist2 > retreat_threshold:
                     vec2 = (p2_orig - center) / dist2
                     v2_final = center + vec2 * retreat_len
+                # 调试：写入调整后两条边的像素长度，供后续需要时参考（不进入最终上报）
+                try:
+                    defect_report.setdefault('_adjusted_q_lengths_px', [
+                        float(np.linalg.norm(v1_final - center)),
+                        float(np.linalg.norm(v2_final - center))
+                    ])
+                except Exception:
+                    pass
 
             triangle_vertices = np.array([tuple(map(int, center)), tuple(map(int, v1_final)), tuple(map(int, v2_final))], dtype=np.int32)
             overlay = roi_color.copy()

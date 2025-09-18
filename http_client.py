@@ -137,7 +137,9 @@ class NonBlockingHttpClient:
         self.executor.submit(_upload_task)
 
     def post_files_batch(self, url, files_list, json_payload_list, timeout_s: float | None = None):
-        """批量上传：files_list 为 [(filename, bytes, mime), ...]; json_payload_list 为 [report1, report2, ...]"""
+        """批量上传：files_list 为 [(filename, bytes, mime), ...]; json_payload_list 为 [report1, report2, ...]
+        服务器要求: form-data 中多次出现字段名 fileList 作为图片数组；payload 字段为 JSON 数组字符串。
+        不再附带额外字段。"""
         def _upload_task_batch():
             try:
                 def _sanitize(obj):
@@ -157,12 +159,15 @@ class NonBlockingHttpClient:
                 safe_payloads = _sanitize(json_payload_list)
 
                 multipart_parts = []
-                # 按服务器需求：files 是数组 => 多个同名字段
+                # 仅添加图片
                 for f in files_list:
-                    if not f: continue
-                    multipart_parts.append(('files', f))
-                # payload 是数组（JSON 序列化）
+                    if not f:
+                        continue
+                    # f: (filename, bytes, mime)
+                    multipart_parts.append(('fileList', f))
+                # 添加 payload JSON 数组
                 multipart_parts.append(('payload', (None, json.dumps(safe_payloads, ensure_ascii=False), 'application/json')))
+
                 to = 30 if timeout_s is None else float(timeout_s)
                 response = requests.post(url, files=multipart_parts, timeout=to)
                 if response.status_code == 200:

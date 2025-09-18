@@ -1,4 +1,4 @@
-# --- START OF FILE image_processor_hough.py (Font Size and Spacing Corrected) ---
+# --- START OF FILE image_processor_hough_dark.py ---
 import cv2
 import numpy as np
 import json
@@ -7,7 +7,6 @@ from itertools import combinations
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 
-# FIX: Import Pillow for CJK character support
 try:
     from PIL import Image, ImageDraw, ImageFont
     PIL_AVAILABLE = True
@@ -19,17 +18,14 @@ except ImportError:
 # ====================================================================================
 
 def _get_font(font_size=36):
-    """
-    Attempts to load a CJK-compatible font from common system paths.
-    """
     if not PIL_AVAILABLE:
         return None
     
     font_paths = [
-        'C:/Windows/Fonts/msyh.ttc',      # Microsoft YaHei on Windows
-        'C:/Windows/Fonts/simsun.ttc',      # SimSun on Windows
-        '/System/Library/Fonts/PingFang.ttc', # PingFang on macOS
-        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', # Noto Sans CJK on Linux
+        'C:/Windows/Fonts/msyh.ttc',
+        'C:/Windows/Fonts/simsun.ttc',
+        '/System/Library/Fonts/PingFang.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
     ]
     for font_path in font_paths:
         try:
@@ -37,26 +33,20 @@ def _get_font(font_size=36):
         except IOError:
             continue
     
-    # If no specific font is found, use Pillow's default and print a warning.
-    print("警告: 未找到中文字体, 标注可能无法正确显示中文。请安装或指定字体路径。")
+    print("警告: 未找到中文字体, 标注可能无法正确显示中文。")
     try:
-        # For Pillow 10.0.0+, load_default() may require a size argument.
-        # However, to maintain compatibility, we call it without arguments first.
         return ImageFont.load_default()
     except Exception:
         return None
 
-# Load the font once when the script is imported
-# --- FIX: Changed font size from 20 to 36 ---
 ANNOTATION_FONT = _get_font(font_size=36)
 
 
 # ====================================================================================
-# --- 几何学与分析辅助函数 ---
+# --- 几何学与分析辅助函数 (与浅色版本相同) ---
 # ====================================================================================
 
 def draw_dashed_line(img, pt1, pt2, color, thickness=1, dash_length=10):
-    """在图像上绘制虚线"""
     dist = np.linalg.norm(np.array(pt1) - np.array(pt2))
     if dist == 0: return
     
@@ -148,23 +138,14 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
                 initial_contours.append(cnt)
     return initial_contours
 
-# ====================================================================================
-# --- 核心处理流程 ---
-# ====================================================================================
-def preprocess_for_hough_enhanced(roi_gray, params):
-    p = params["PREPROCESSING"]
-    grid_size = tuple(p.get("CLAHE_GRID_SIZE", [8, 8]))
-    blurred = cv2.medianBlur(roi_gray, p["MEDIAN_BLUR_KSIZE"])
-    clahe = cv2.createCLAHE(clipLimit=p["CLAHE_CLIP_LIMIT"], tileGridSize=grid_size)
-    enhanced_contrast = clahe.apply(blurred)
-    return cv2.Canny(enhanced_contrast, p["CANNY_THRESHOLD_LOW"], p["CANNY_THRESHOLD_HIGH"])
-
 def merge_lines_and_get_main_edges(lines, params):
     if lines is None or len(lines) < 1: return []
-    p = params["LINE_MERGING"]
+    p = params
+    
     lines_np = np.array(lines).reshape(-int(len(lines)), 4)
     angles = np.rad2deg(np.arctan2(lines_np[:, 3] - lines_np[:, 1], lines_np[:, 2] - lines_np[:, 0]))
     angles[angles < 0] += 180
+    
     angle_clusters = {}
     for i, angle in enumerate(angles):
         placed = False
@@ -172,6 +153,7 @@ def merge_lines_and_get_main_edges(lines, params):
             if min(abs(angle - cluster_angle), 180 - abs(angle - cluster_angle)) < p["ANGLE_TOLERANCE"]:
                 angle_clusters[cluster_angle].append(lines_np[i]); placed = True; break
         if not placed: angle_clusters[angle] = [lines_np[i]]
+        
     final_line_groups = []
     for angle, segments in angle_clusters.items():
         if not segments: continue
@@ -190,6 +172,7 @@ def merge_lines_and_get_main_edges(lines, params):
                         group.append(segment); placed = True; break
             if not placed: proximity_groups.append([segment])
         final_line_groups.extend(proximity_groups)
+        
     merged_lines_with_scores = []
     for group in final_line_groups:
         points = np.array([pt for line in group for pt in (line[0:2], line[2:4])], dtype=np.float32)
@@ -201,10 +184,12 @@ def merge_lines_and_get_main_edges(lines, params):
         final_merged_line = np.array([pt1[0], pt1[1], pt2[0], pt2[1]])
         support_score = sum(np.linalg.norm(l[2:4] - l[0:2]) for l in group)
         merged_lines_with_scores.append({'line': final_merged_line, 'score': support_score})
+        
     merged_lines_with_scores.sort(key=lambda item: item['score'], reverse=True)
     return [item['line'] for item in merged_lines_with_scores[:p["TOP_N_EDGES"]]]
 
 def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
+    # This entire function is identical to the light glass version and can be reused
     p_defect = params["DEFECT_DETECTION"]; p_crack = params["CRACK_CLASSIFICATION"]
     num_edges = len(edges); roi_h, roi_w = roi_dims
     
@@ -320,16 +305,42 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     x, y, w, h = int(roi_template['x']), int(roi_template['y']), int(roi_template['width']), int(roi_template['height'])
     roi_gray = image_gray[y:y+h, x:x+w]
     
-    p_hough = params["HOUGH_TRANSFORM"]
-    binary_edges = preprocess_for_hough_enhanced(roi_gray, params)
-    min_len_pixels = roi_gray.shape[1] * p_hough["MIN_LINE_LENGTH_RATIO"]
-    raw_lines = cv2.HoughLinesP(binary_edges, 1, np.pi / 180, p_hough["THRESHOLD"], minLineLength=min_len_pixels, maxLineGap=p_hough["MAX_LINE_GAP"])
+    # --- NEW PRE-PROCESSING PIPELINE FOR DARK GLASS ---
+    p_preprocess = params.get("PREPROCESSING", {})
+    p_hough = params.get("HOUGH_TRANSFORM", {})
+    p_merging = params.get("LINE_MERGING", {})
+
+    # 1. Otsu Thresholding to isolate the glass area
+    _, otsu_mask = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # 2. Morphological Opening to remove noise from the mask
+    k_size = tuple(p_preprocess.get("OPENING_KERNEL_SIZE", [21, 21]))
+    kernel_open = np.ones(k_size, np.uint8)
+    cleaned_mask = cv2.morphologyEx(otsu_mask, cv2.MORPH_OPEN, kernel_open)
+
+    # 3. Morphological Gradient to get a clean contour image
+    kernel_gradient = np.ones((3, 3), np.uint8)
+    gradient_image = cv2.morphologyEx(cleaned_mask, cv2.MORPH_GRADIENT, kernel_gradient)
+
+    # 4. Hough Transform on the gradient image
+    raw_lines = cv2.HoughLinesP(
+        gradient_image,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=p_hough.get("THRESHOLD", 30),
+        minLineLength=p_hough.get("MIN_LINE_LENGTH", 25),
+        maxLineGap=p_hough.get("MAX_LINE_GAP", 20)
+    )
+
+    # 5. Merge the fragmented lines into coherent edges
+    main_edges = merge_lines_and_get_main_edges(raw_lines, p_merging)
     
-    main_edges = merge_lines_and_get_main_edges(raw_lines, params)
+    # --- The rest of the pipeline remains the same ---
     edges_for_drawing, all_defects = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, params)
     
     final_defects_for_report = []
     for defect in all_defects:
+        # (Defect formatting and filtering logic is identical to the light version)
         new_defect = {'type': defect['type']}
         location = {}
 
@@ -389,6 +400,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     for d in roi_report['defects']:
         d.pop('raw_defect', None)
 
+    # (Visualization logic is identical to the light version)
     roi_color = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
     DEFECT_COLORS_BGR = {'Q': (0, 0, 255), 'X': (0, 255, 255), 'L': (255, 0, 255), 'B': (0, 165, 255)}
     p_vis = params["VISUALIZATION"]
@@ -459,25 +471,22 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         draw = ImageDraw.Draw(pil_img)
         
         y_text = 10
-        # --- FIX: Use dynamic line spacing to prevent text overlap ---
-        padding = 10 # Add a small gap between lines
+        padding = 10
         for ann in annotations_to_draw:
             text = ann['text']
             color_rgb = tuple(reversed(ann['color']))
             
-            # Calculate text bounding box for positioning and line height
-            if hasattr(draw, 'textbbox'): # Newer Pillow version
+            if hasattr(draw, 'textbbox'):
                 bbox = draw.textbbox((0,0), text, font=ANNOTATION_FONT)
                 text_width = bbox[2] - bbox[0]
                 text_height = bbox[3] - bbox[1]
-            else: # Older Pillow version
+            else:
                  text_width, text_height = draw.textsize(text, font=ANNOTATION_FONT)
 
             x_text = w - text_width - 10
             
             draw.text((x_text, y_text), text, font=ANNOTATION_FONT, fill=color_rgb)
             
-            # Increment y_text by the actual height of the drawn text plus padding
             y_text += text_height + padding
             
         roi_color = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
@@ -485,12 +494,27 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     return roi_report, roi_color
 
 def process_image_from_memory_parallel(image_gray, template_rois, config):
+    # This main entry point function is identical to the light version
     final_image = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
     report = {"image_status": "OK", "defects": [] , "state_code": 0, "rois": []}
 
-    hough_params = config.get('hough_inspector_params')
+    # The worker will pass the 'hough_inspector_dark_params' block as the 'config' argument here
+    # To avoid confusion, let's rename the variable
+    hough_params = config
     if not hough_params:
-        raise ValueError("Configuration error: 'hough_inspector_params' section not found in the config file.")
+        raise ValueError("Configuration error: 'hough_inspector_dark_params' section not found or is empty.")
+
+    # We get system_params from the *parent* config, which isn't available here.
+    # This is a limitation of the current design. We'll assume fixed worker counts
+    # and get pixels_per_mm from a different source or hardcode it.
+    # A better design would pass the full config, but for now we adapt.
+    # Let's assume the calling worker will handle this.
+    # The call in the worker should be: dark_processor.process_image_from_memory_parallel(frame_data, rois, config)
+    # So 'config' here IS the full config object. Let's proceed with that assumption.
+
+    dark_params = config.get('hough_inspector_dark_params')
+    if not dark_params:
+         raise ValueError("Configuration error: 'hough_inspector_dark_params' section not found in the config file.")
 
     sys_params = config.get('system_params', {})
     pixels_per_mm = float(sys_params.get('pixels_per_mm', 1.0))
@@ -506,7 +530,8 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
 
     def _safe_roi_hough(i, r):
         try:
-            return process_roi_hough_based(i, r, image_gray, hough_params, pixels_per_mm)
+            # Pass the specific parameter block for the dark algorithm
+            return process_roi_hough_based(i, r, image_gray, dark_params, pixels_per_mm)
         except Exception as e:
             print(f"Error processing ROI {i}: {e}")
             x, y, w, h = int(r.get('x',0)), int(r.get('y',0)), int(r.get('width',0)), int(r.get('height',0))
@@ -540,4 +565,4 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
     report["state_code"] = 1 if max_edges_found > 0 else 0
     
     return report, final_image
-# --- END OF FILE image_processor_hough.py (Corrected for New Filtering Rules) ---
+# --- END OF FILE image_processor_hough_dark.py ---

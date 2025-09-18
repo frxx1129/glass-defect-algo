@@ -319,6 +319,7 @@ def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, 
         print("[相机池]: 未检测到物理相机，进入测试模式...")
         setup_tool.cleanup()
         from synthetic_test_scene import SyntheticGlassScene
+        import cv2
         try:
             test_cameras = int((config.get('camera_setup', {}) or {}).get('expected_cameras', 1) or 1)
         except Exception:
@@ -377,10 +378,25 @@ def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, 
                 roi_path = config.get('roi_template_file', 'roi_averaged_by_group_CORRECTED.json')
             rois_per_cam.append(_load_rois(roi_path))
 
-        scene = SyntheticGlassScene(test_cameras, cam_w, cam_h, step_px=step_px,
-                                    pane_width_factor=pane_width_factor, pane_margin_px=pane_margin_px,
-                                    rois_per_cam=rois_per_cam, roi_only=False)
-        print(f"[相机池][测试模式]: 玻璃+ROI 模式 | cameras={test_cameras}, size={cam_w}x{cam_h}, roi_loaded={[len(r) for r in rois_per_cam]}")
+        # 改造测试模式：前4个相机输出“无玻璃”空画面（仅ROI），第5个相机读取 5.avi 按真实帧率播放
+        # 构建两个场景：一个 ROI-only（无玻璃与缺陷），用于相机0~3；cam4(索引4) 使用视频源
+        blank_scene = SyntheticGlassScene(min(4, test_cameras), cam_w, cam_h, step_px=step_px,
+                                          pane_width_factor=pane_width_factor, pane_margin_px=pane_margin_px,
+                                          rois_per_cam=rois_per_cam[:4], roi_only=True, enable_defects=False)
+        video_cap = None
+        video_frame_interval = 0.1
+        if test_cameras >= 5:
+            video_path = '5.avi'
+            video_cap = cv2.VideoCapture(video_path)
+            if not video_cap.isOpened():
+                print(f"[相机池][测试模式]: ⚠️ 无法打开视频 {video_path}，将回退为黑帧。")
+                video_cap = None
+            else:
+                fps_v = video_cap.get(cv2.CAP_PROP_FPS) or 10.0
+                if fps_v <= 0: fps_v = 10.0
+                video_frame_interval = 1.0 / fps_v
+                print(f"[相机池][测试模式]: 使用 {video_path} 作为相机4源, fps={fps_v:.2f}")
+        print(f"[相机池][测试模式]: 自定义模式 | 空ROI相机数={min(4,test_cameras)} | 视频相机={'1' if test_cameras>=5 else '0'} | size={cam_w}x{cam_h}")
         
         # 初始化所有模拟相机的状态
         for idx in range(test_cameras):
@@ -397,19 +413,50 @@ def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, 
         cameras_ready_event.set()
         
         next_row_t = time.perf_counter()
+        next_video_t = time.perf_counter()
+        video_finished = False
         while not stop_event.is_set():
             now = time.perf_counter()
-            if now < next_row_t:
-                time.sleep(min(next_row_t - now, 0.002))
-                continue
-            frames = scene.next_row_frames()
-            for idx, frame in enumerate(frames):
-                shared_states[idx] = {"status": "Connected (Test Mode)"}
-                try:
-                    task_queue.put_nowait({"data": frame, "cam_index": idx})
-                except queue.Full:
-                    pass
-            next_row_t += row_interval
+            # 处理前4个“空玻璃”相机（若存在）
+            if now >= next_row_t:
+                blank_frames = blank_scene.next_row_frames()
+                for idx, frame in enumerate(blank_frames):
+                    if idx >= test_cameras: break
+                    shared_states[idx] = {"status": "Connected (Test Mode)"}
+                    try:
+                        task_queue.put_nowait({"data": frame, "cam_index": idx})
+                    except queue.Full:
+                        pass
+                next_row_t += row_interval
+
+            # 处理第5个相机的视频帧
+            if test_cameras >= 5 and video_cap is not None and not video_finished and now >= next_video_t:
+                ret, frame_bgr = video_cap.read()
+                if not ret or frame_bgr is None:
+                    print("[相机池][测试模式]: 视频播放结束，循环回放。")
+                    video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame_bgr = video_cap.read()
+                    if not ret or frame_bgr is None:
+                        video_finished = True
+                        print("[相机池][测试模式]: 视频无法重播，停止为相机4提供帧。")
+                if not video_finished:
+                    # 转灰度并按相机尺寸裁剪/缩放
+                    try:
+                        frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                    except Exception:
+                        frame_gray = np.zeros((cam_h, cam_w), dtype=np.uint8)
+                    h_in, w_in = frame_gray.shape
+                    if h_in != cam_h or w_in != cam_w:
+                        frame_gray = cv2.resize(frame_gray, (cam_w, cam_h), interpolation=cv2.INTER_AREA)
+                    cam_idx = 4  # 第5个相机索引
+                    shared_states[cam_idx] = {"status": "Connected (Test Mode)"}
+                    try:
+                        task_queue.put_nowait({"data": frame_gray, "cam_index": cam_idx})
+                    except queue.Full:
+                        pass
+                next_video_t += video_frame_interval
+            # 轻微睡眠避免忙等
+            time.sleep(0.001)
         return
 
     # ---------------------------- 实机模式 ----------------------------
