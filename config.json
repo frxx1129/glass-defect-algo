@@ -1,5 +1,5 @@
 {
-  "DEBUG_MODE_ON": false,
+  "DEBUG_MODE_ON": true,
   "storage_path": "inspection_results",
   "roi_template_file": "roi_averaged_by_group_CORRECTED.json",
   "lineName": "Line1",
