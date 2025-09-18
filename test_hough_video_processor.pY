@@ -6,7 +6,6 @@ import argparse
 from datetime import datetime
 import base64
 import numpy as np
-
 # 假设 image_processor_hough.py 在同一目录下
 import image_processor_hough as image_processor
 
@@ -64,34 +63,19 @@ def process_frame_task(frame_data_gray, cam_index, config, shared_settings, roi_
 
     should_reject_overall = should_reject_pane(pane_json, shared_settings, PIXELS_PER_MM)
 
-    # 编码为主图
-    jpg_q_main = int(config.get('system_params', {}).get('jpeg_quality_main', 85) or 85)
-    success_original, original_buffer_encoded = cv2.imencode('.jpg', annotated_image, [cv2.IMWRITE_JPEG_QUALITY, jpg_q_main])
-    
-    # 编码为预览图
-    PREVIEW_WIDTH = int(config.get('system_params', {}).get('preview_width', 800) or 800)
-    height, width, _ = annotated_image.shape
-    scale = PREVIEW_WIDTH / width
-    preview_image = cv2.resize(annotated_image, (PREVIEW_WIDTH, int(height * scale)), interpolation=cv2.INTER_AREA)
-    jpg_q_preview = int(config.get('system_params', {}).get('jpeg_quality_preview', 75) or 75)
-    success_preview, preview_buffer_encoded = cv2.imencode('.jpg', preview_image, [cv2.IMWRITE_JPEG_QUALITY, jpg_q_preview])
-
-    base64_image_string = base64.b64encode(preview_buffer_encoded if success_preview else original_buffer_encoded).decode('utf-8')
-
     result = {
         "camera_index": cam_index,
         "timestamp": datetime.now().isoformat(),
-        "image": f"data:image/jpeg;base64,{base64_image_string}", # 预览图
         "image_status": pane_json.get('image_status', 'OK'),
         "defects": pane_json.get('defects', []),
         "state_code": pane_json.get('state_code', 0),
         "should_reject": should_reject_overall,
-        "annotated_image_buffer_raw": original_buffer_encoded.tobytes(), # 原始尺寸标注图
     }
-    return result
+    # --- FIX: 返回原始标注图像 (numpy array) 和结果字典 ---
+    return result, annotated_image
 
 def main():
-    # --- FIX: 使用 argparse 处理命令行参数 ---
+    # --- 使用 argparse 处理命令行参数 ---
     parser = argparse.ArgumentParser(description="处理视频文件或图片文件夹中的玻璃缺陷。")
     parser.add_argument('-i', '--input', required=True, help="输入视频文件或图片文件夹的路径。")
     parser.add_argument('-o', '--output', default='hough_results', help="保存结果的输出文件夹路径。")
@@ -127,7 +111,7 @@ def main():
     start_time = time.time()
     total_items = 0
 
-    # --- FIX: 根据输入路径是文件夹还是文件，执行不同逻辑 ---
+    # --- 根据输入路径是文件夹还是文件，执行不同逻辑 ---
     if os.path.isdir(args.input):
         print(f"\n--- 开始处理文件夹: {args.input} ---")
         
@@ -149,7 +133,8 @@ def main():
                 continue
             
             gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            result = process_frame_task(gray_frame, cam_index, config, shared_settings, roi_cache)
+            # 注意：此处返回的 annotated_image 是用于保存的，不是用于视频流
+            result, annotated_image = process_frame_task(gray_frame, cam_index, config, shared_settings, roi_cache)
             
             print(f"  报告: 状态={result['image_status']}, state_code={result['state_code']}, 缺陷数={len(result['defects'])}")
             
@@ -158,11 +143,8 @@ def main():
             report_output_path = os.path.join(args.output, f"{base_filename}_report.json")
             
             # 保存结果
-            with open(output_image_path, 'wb') as f: f.write(result['annotated_image_buffer_raw'])
-            report_to_save = result.copy()
-            report_to_save.pop('image', None)
-            report_to_save.pop('annotated_image_buffer_raw', None)
-            with open(report_output_path, 'w', encoding='utf-8') as f: json.dump(report_to_save, f, indent=2, ensure_ascii=False)
+            cv2.imwrite(output_image_path, annotated_image)
+            with open(report_output_path, 'w', encoding='utf-8') as f: json.dump(result, f, indent=2, ensure_ascii=False)
 
     elif os.path.isfile(args.input):
         print(f"\n--- 开始处理视频: {args.input} ---")
@@ -171,32 +153,43 @@ def main():
             print(f"错误: 无法打开视频文件 '{args.input}'。")
             return
         
+        # --- FIX: 设置视频编写器 (VideoWriter) ---
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v') # 使用 .mp4 编码器
+        
+        base_filename = os.path.splitext(os.path.basename(args.input))[0]
+        output_video_path = os.path.join(args.output, f"{base_filename}_annotated.mp4")
+        out_video = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+        print(f"输出视频将保存至: {output_video_path}")
+
         total_items = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         frame_count = 0
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("视频处理完成或读取失败。")
                 break
 
             frame_count += 1
             print(f"处理帧 {frame_count}/{total_items}...")
             
             gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            result = process_frame_task(gray_frame, cam_index, config, shared_settings, roi_cache)
+            result, annotated_image = process_frame_task(gray_frame, cam_index, config, shared_settings, roi_cache)
+            
+            # --- FIX: 将处理后的帧写入输出视频 ---
+            out_video.write(annotated_image)
             
             print(f"  报告: 状态={result['image_status']}, state_code={result['state_code']}, 缺陷数={len(result['defects'])}")
             
-            output_image_path = os.path.join(args.output, f"frame_{frame_count:05d}_annotated.jpg")
+            # (可选) 仍然可以为每一帧保存JSON报告
             report_output_path = os.path.join(args.output, f"frame_{frame_count:05d}_report.json")
-
-            with open(output_image_path, 'wb') as f: f.write(result['annotated_image_buffer_raw'])
-            report_to_save = result.copy()
-            report_to_save.pop('image', None)
-            report_to_save.pop('annotated_image_buffer_raw', None)
-            with open(report_output_path, 'w', encoding='utf-8') as f: json.dump(report_to_save, f, indent=2, ensure_ascii=False)
+            with open(report_output_path, 'w', encoding='utf-8') as f: json.dump(result, f, indent=2, ensure_ascii=False)
         
+        # --- FIX: 释放视频读取和写入对象 ---
         cap.release()
+        out_video.release()
+        print("\n视频处理完成。")
     
     else:
         print(f"错误: 输入路径 '{args.input}' 既不是文件也不是文件夹。")
@@ -204,7 +197,7 @@ def main():
 
     end_time = time.time()
     total_time = end_time - start_time
-    print(f"\n--- 处理完成 ---")
+    print(f"\n--- 整体处理完成 ---")
     print(f"总处理项目数: {total_items}")
     print(f"总耗时: {total_time:.2f} 秒")
     if total_items > 0:

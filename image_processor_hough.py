@@ -1,4 +1,4 @@
-# --- START OF FILE image_processor_hough.py (Corrected for New Filtering Rules) ---
+# --- START OF FILE image_processor_hough.py (Font Size and Spacing Corrected) ---
 import cv2
 import numpy as np
 import json
@@ -6,6 +6,50 @@ import os
 from itertools import combinations
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
+
+# FIX: Import Pillow for CJK character support
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+# ====================================================================================
+# --- 全局字体加载 ---
+# ====================================================================================
+
+def _get_font(font_size=36):
+    """
+    Attempts to load a CJK-compatible font from common system paths.
+    """
+    if not PIL_AVAILABLE:
+        return None
+    
+    font_paths = [
+        'C:/Windows/Fonts/msyh.ttc',      # Microsoft YaHei on Windows
+        'C:/Windows/Fonts/simsun.ttc',      # SimSun on Windows
+        '/System/Library/Fonts/PingFang.ttc', # PingFang on macOS
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', # Noto Sans CJK on Linux
+    ]
+    for font_path in font_paths:
+        try:
+            return ImageFont.truetype(font_path, font_size)
+        except IOError:
+            continue
+    
+    # If no specific font is found, use Pillow's default and print a warning.
+    print("警告: 未找到中文字体, 标注可能无法正确显示中文。请安装或指定字体路径。")
+    try:
+        # For Pillow 10.0.0+, load_default() may require a size argument.
+        # However, to maintain compatibility, we call it without arguments first.
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+# Load the font once when the script is imported
+# --- FIX: Changed font size from 20 to 36 ---
+ANNOTATION_FONT = _get_font(font_size=36)
+
 
 # ====================================================================================
 # --- 几何学与分析辅助函数 ---
@@ -227,7 +271,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
                 angle = calculate_vertex_angle(p1_far, intersection, p2_far)
                 deviation = abs(angle - 90.0)
                 
-                # --- FIX: Use a single angle tolerance for 'X' defects ---
                 angle_tolerance = p_defect.get("ANGLE_DEVIATION_TOLERANCE", 2.0)
                 if deviation > angle_tolerance:
                     corner_defects.append({"type": "X", "center": tuple(map(int, intersection)), "angle": angle})
@@ -285,11 +328,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     main_edges = merge_lines_and_get_main_edges(raw_lines, params)
     edges_for_drawing, all_defects = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, params)
     
-    roi_report = {
-        "roi_idx": roi_idx, "x": x, "y": y, "w": w, "h": h,
-        "defects": [], "edges_found": len(main_edges)
-    }
-    
+    final_defects_for_report = []
     for defect in all_defects:
         new_defect = {'type': defect['type']}
         location = {}
@@ -301,7 +340,6 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             location['angle'] = float(round(defect.get('angle', 0.0), 2))
         else:
             length_px, width_px = 0.0, 0.0
-            
             if defect['type'] == 'Q':
                 center = defect.get('center', (0, 0))
                 location['x'] = int(center[0] + x)
@@ -314,13 +352,11 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     width_px = min(dist_leg1_px, dist_leg2_px)
                 else:
                     length_px, width_px = 0.0, 0.0
-            
             elif defect['type'] == 'L':
                 lx, ly, lw, lh = defect.get('rect', (0,0,0,0))
                 location['x'] = int(lx + lw//2 + x)
                 location['y'] = int(ly + lh//2 + y)
                 length_px, width_px = max(lw, lh), min(lw, lh)
-            
             elif defect['type'] == 'B':
                 box = defect.get('box_points', [])
                 if len(box) >= 4:
@@ -336,25 +372,47 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
         new_defect['location'] = location
         
-        # --- FIX: Add minimum size filtering for Q, L, B defects ---
         if new_defect['type'] in ['Q', 'L', 'B']:
             min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
             defect_size_mm = location.get('length_mm', 0)
             if defect_size_mm < min_size_mm:
                 continue 
 
-        roi_report['defects'].append(new_defect)
+        new_defect['raw_defect'] = defect 
+        final_defects_for_report.append(new_defect)
+        
+    roi_report = {
+        "roi_idx": roi_idx, "x": x, "y": y, "w": w, "h": h,
+        "defects": [d.copy() for d in final_defects_for_report],
+        "edges_found": len(main_edges)
+    }
+    for d in roi_report['defects']:
+        d.pop('raw_defect', None)
 
-    # Visualization
     roi_color = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
-    DEFECT_COLORS = {'Q': (0, 0, 255), 'X': (0, 255, 255), 'L': (255, 0, 255), 'B': (0, 165, 255)}
+    DEFECT_COLORS_BGR = {'Q': (0, 0, 255), 'X': (0, 255, 255), 'L': (255, 0, 255), 'B': (0, 165, 255)}
     p_vis = params["VISUALIZATION"]
     THICKNESS = 3
     
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
-    for defect in all_defects:
-        color = DEFECT_COLORS.get(defect["type"], (255, 255, 255))
+    
+    annotations_to_draw = []
+    
+    for defect_report in final_defects_for_report:
+        defect = defect_report['raw_defect']
+        color_bgr = DEFECT_COLORS_BGR.get(defect["type"], (255, 255, 255))
         
+        loc = defect_report['location']
+        defect_type_map = {'Q': '缺角', 'B': '崩边', 'X': '斜边', 'L': '裂纹'}
+        type_str = defect_type_map.get(defect_report['type'], '未知')
+        
+        if defect_report['type'] == 'X':
+            text = f"{type_str}: ({loc['x']}, {loc['y']}), 角度: {loc['angle']:.1f}°"
+        else:
+            text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm"
+        
+        annotations_to_draw.append({'text': text, 'color': color_bgr})
+
         if defect["type"] == "Q" and "endpoints" in defect:
             center = np.array(defect["center"])
             p1_orig, p2_orig = np.array(defect["endpoints"][0]), np.array(defect["endpoints"][1])
@@ -372,32 +430,58 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     v2_final = center + vec2 * retreat_len
 
             triangle_vertices = np.array([tuple(map(int, center)), tuple(map(int, v1_final)), tuple(map(int, v2_final))], dtype=np.int32)
-            
             overlay = roi_color.copy()
-            cv2.fillPoly(overlay, [triangle_vertices], color)
+            cv2.fillPoly(overlay, [triangle_vertices], color_bgr)
             cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
-            
             blue_color = (255, 0, 0)
             draw_dashed_line(roi_color, tuple(map(int, center)), tuple(map(int, v1_final)), blue_color, thickness=2, dash_length=8)
             draw_dashed_line(roi_color, tuple(map(int, center)), tuple(map(int, v2_final)), blue_color, thickness=2, dash_length=8)
 
         elif defect["type"] == "X" and "center" in defect:
-            cv2.circle(roi_color, defect["center"], 15, color, THICKNESS)
+            cv2.circle(roi_color, defect["center"], 15, color_bgr, THICKNESS)
             
         elif defect["type"] == "L" and "rect" in defect:
-            x, y, w, h = defect["rect"]
+            x_r, y_r, w_r, h_r = defect["rect"]
             overlay = roi_color.copy()
-            cv2.rectangle(overlay, (x, y), (x + w, y + h), color, -1)
+            cv2.rectangle(overlay, (x_r, y_r), (x_r + w_r, y_r + h_r), color_bgr, -1)
             cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
-            cv2.rectangle(roi_color, (x, y), (x + w, y + h), color, THICKNESS)
+            cv2.rectangle(roi_color, (x_r, y_r), (x_r + w_r, y_r + h_r), color_bgr, THICKNESS)
             
         elif defect["type"] == "B" and "box_points" in defect:
             box_points = defect["box_points"]
             overlay = roi_color.copy()
-            cv2.fillPoly(overlay, [box_points], color)
+            cv2.fillPoly(overlay, [box_points], color_bgr)
             cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
-            cv2.drawContours(roi_color, [box_points], 0, color, THICKNESS)
+            cv2.drawContours(roi_color, [box_points], 0, color_bgr, THICKNESS)
+
+    if annotations_to_draw and PIL_AVAILABLE and ANNOTATION_FONT:
+        pil_img = Image.fromarray(cv2.cvtColor(roi_color, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_img)
+        
+        y_text = 10
+        # --- FIX: Use dynamic line spacing to prevent text overlap ---
+        padding = 10 # Add a small gap between lines
+        for ann in annotations_to_draw:
+            text = ann['text']
+            color_rgb = tuple(reversed(ann['color']))
             
+            # Calculate text bounding box for positioning and line height
+            if hasattr(draw, 'textbbox'): # Newer Pillow version
+                bbox = draw.textbbox((0,0), text, font=ANNOTATION_FONT)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+            else: # Older Pillow version
+                 text_width, text_height = draw.textsize(text, font=ANNOTATION_FONT)
+
+            x_text = w - text_width - 10
+            
+            draw.text((x_text, y_text), text, font=ANNOTATION_FONT, fill=color_rgb)
+            
+            # Increment y_text by the actual height of the drawn text plus padding
+            y_text += text_height + padding
+            
+        roi_color = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
     return roi_report, roi_color
 
 def process_image_from_memory_parallel(image_gray, template_rois, config):
