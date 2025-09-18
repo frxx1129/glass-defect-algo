@@ -204,4 +204,36 @@ def create_app(num_cameras, shared_objects):
         except Exception as e:
             print(f"[状态上报]: 提交任务时发生本地错误: {e}")
 
+    # ========== 算法模式切换 (1=浅色 2=深色) ==========
+    @app.get("/algorithmMode")
+    def get_algorithm_mode():
+        mode = int(getattr(shared_settings, 'algorithm_mode', 1))
+        return {"code": 200, "message": "获取成功", "data": {"mode": mode}}
+
+    class AlgoModeBody(BaseModel):
+        mode: int
+
+    @app.post("/algorithmMode")
+    async def set_algorithm_mode(body: AlgoModeBody):
+        new_mode = int(body.mode)
+        if new_mode not in (1, 2):
+            return {"code": 400, "message": "mode 只能为 1(浅色) 或 2(深色)"}
+        old_mode = int(getattr(shared_settings, 'algorithm_mode', 1))
+        if new_mode == old_mode:
+            return {"code": 200, "message": "模式未变化", "data": {"mode": new_mode}}
+        setattr(shared_settings, 'algorithm_mode', new_mode)
+        print(f"[API]: 算法模式切换 {old_mode} -> {new_mode}")
+        # 通过所有 websocket 通道广播模式变化事件
+        try:
+            payload = {"event": "algorithmModeChanged", "mode": new_mode}
+            # broadcast to all camera groups
+            for cam_idx in range(num_cameras):
+                try:
+                    asyncio.create_task(connection_manager.broadcast_json(payload, cam_idx))
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[API]: 广播算法模式变更失败: {e}")
+        return {"code": 200, "message": "模式已更新", "data": {"old_mode": old_mode, "new_mode": new_mode}}
+
     return app

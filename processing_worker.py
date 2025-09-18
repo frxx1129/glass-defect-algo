@@ -5,8 +5,7 @@ import cv2
 import traceback
 from queue import Empty
 import time
-import image_processor_hough as image_processor 
-import image_processor_hough_dark as dark_glass_processor
+import fused_image_processor
 
 def should_reject_pane(pane_json, shared_settings, pixels_per_mm):
     """根据缺陷类型与尺寸判定是否剔废。
@@ -104,9 +103,13 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                 if cam_idx not in roi_cache:
                     roi_cache[cam_idx] = load_rois_for_cam(cam_idx)
                 
-                # <-- 修改点：调用新的处理函数，并传递完整的 config 对象
-                pane_json, annotated_image = image_processor.process_image_from_memory_parallel(
-                    frame_data, roi_cache[cam_idx], config)
+                # 根据共享模式 (1=浅色,2=深色) 选择算法
+                try:
+                    algo_mode = int(getattr(shared_settings, 'algorithm_mode', 1))
+                except Exception:
+                    algo_mode = 1
+                pane_json, annotated_image = fused_image_processor.process_image(
+                    frame_data, roi_cache[cam_idx], config, algo_mode)
 
                 should_reject_overall = should_reject_pane(pane_json, shared_settings, PIXELS_PER_MM)
 
