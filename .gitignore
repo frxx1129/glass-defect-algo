@@ -56,3 +56,6 @@ inspection_results/
 *.avi
 *.mkv
 *.mov
+
+*_results/
+*_output/
