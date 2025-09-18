@@ -37,7 +37,7 @@
     "heartbeat_timeout_ms": 30000,
     "runtime": {
       "use_software_trigger": true,
-      "frame_rate": 10,
+      "frame_rate": 15,
       "enforce_mono8": true
     },
     "network_interfaces": [
@@ -56,7 +56,7 @@
       { "index": 4, "physical_index": 4, "mac": "94:AA:B8:04:87:AE", "ip": "192.168.8.174", "model": "MV-HP500GM" }
     ],
     "unified_params": {
-      "acquisition": { "width": 2448, "height": 2048, "frame_rate": 10 },
+      "acquisition": { "width": 2448, "height": 2048, "frame_rate": 15 },
       "exposure": { "value_us": 200 },
       "gain": { "value_db": 1.2 },
       "gamma": { "value": 0.92 },

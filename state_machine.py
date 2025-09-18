@@ -122,6 +122,16 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         threshold_int = initial_state.get("rejectionThreshold", 20)
         shared_settings.max_defect_size_mm = threshold_int if threshold_int else 20
         shared_user_id_auto.value = initial_state.get("algUserVO", {}).get("userId", 7)
+        # 新增: 读取算法模式 (1=浅色 2=深色)
+        try:
+            init_algo_mode = int(initial_state.get("algorithmMode", getattr(shared_settings, 'algorithm_mode', 1)) or 1)
+            if init_algo_mode in (1,2):
+                shared_settings.algorithm_mode = init_algo_mode
+                print(f"[状态机]: 初始算法模式设置为 {init_algo_mode}")
+            else:
+                print(f"[状态机]: 初始算法模式值非法 {init_algo_mode}, 使用默认 {getattr(shared_settings,'algorithm_mode',1)}")
+        except Exception as e:
+            print(f"[状态机]: 解析初始算法模式失败: {e}")
         if initial_state.get("enable") == 1: 
             run_event_proxy.set()
             print("[状态机]: 从服务器获取到启用状态，设置运行事件。")

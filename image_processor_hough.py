@@ -1,4 +1,4 @@
-# --- START OF FILE image_processor_hough.py (Font Size and Spacing Corrected) ---
+# --- START OF FILE image_processor_hough.py (Corrected for Q-Defect Reporting and Filtering) ---
 import cv2
 import numpy as np
 import json
@@ -7,7 +7,6 @@ from itertools import combinations
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 
-# FIX: Import Pillow for CJK character support
 try:
     from PIL import Image, ImageDraw, ImageFont
     PIL_AVAILABLE = True
@@ -19,17 +18,14 @@ except ImportError:
 # ====================================================================================
 
 def _get_font(font_size=36):
-    """
-    Attempts to load a CJK-compatible font from common system paths.
-    """
     if not PIL_AVAILABLE:
         return None
     
     font_paths = [
-        'C:/Windows/Fonts/msyh.ttc',      # Microsoft YaHei on Windows
-        'C:/Windows/Fonts/simsun.ttc',      # SimSun on Windows
-        '/System/Library/Fonts/PingFang.ttc', # PingFang on macOS
-        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', # Noto Sans CJK on Linux
+        'C:/Windows/Fonts/msyh.ttc',
+        'C:/Windows/Fonts/simsun.ttc',
+        '/System/Library/Fonts/PingFang.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
     ]
     for font_path in font_paths:
         try:
@@ -37,17 +33,12 @@ def _get_font(font_size=36):
         except IOError:
             continue
     
-    # If no specific font is found, use Pillow's default and print a warning.
-    print("警告: 未找到中文字体, 标注可能无法正确显示中文。请安装或指定字体路径。")
+    print("警告: 未找到中文字体, 标注可能无法正确显示中文。")
     try:
-        # For Pillow 10.0.0+, load_default() may require a size argument.
-        # However, to maintain compatibility, we call it without arguments first.
         return ImageFont.load_default()
     except Exception:
         return None
 
-# Load the font once when the script is imported
-# --- FIX: Changed font size from 20 to 36 ---
 ANNOTATION_FONT = _get_font(font_size=36)
 
 
@@ -56,7 +47,6 @@ ANNOTATION_FONT = _get_font(font_size=36)
 # ====================================================================================
 
 def draw_dashed_line(img, pt1, pt2, color, thickness=1, dash_length=10):
-    """在图像上绘制虚线"""
     dist = np.linalg.norm(np.array(pt1) - np.array(pt2))
     if dist == 0: return
     
@@ -289,16 +279,25 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
         min_aspect_ratio = p_defect.get("FALSE_DEFECT_MIN_ASPECT_RATIO", 5.0)
 
         for cnt in final_contours:
-            if cv2.contourArea(cnt) < p_defect["LUMINOSITY_MIN_AREA"]: continue
+            if cv2.contourArea(cnt) < p_defect["LUMINOSITY_MIN_AREA"]:
+                continue
+
             min_area_rect = cv2.minAreaRect(cnt)
             (w, h) = min_area_rect[1]
             width = min(w, h)
             length = max(w, h)
+            
             if width < 1e-6: continue
+            
             aspect_ratio = length / width
-            if width < max_width and aspect_ratio > min_aspect_ratio: continue
+            
+            if width < max_width and aspect_ratio > min_aspect_ratio:
+                continue
+            
             box_points = cv2.boxPoints(min_area_rect)
             box_points = np.intp(box_points)
+            
+            # --- FIX: Removed pixel_area passing, as it's no longer needed ---
             chipping_defects.append({"type": "B", "box_points": box_points})
     
     final_chipping_defects = []
@@ -322,7 +321,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     p_hough = params["HOUGH_TRANSFORM"]
     binary_edges = preprocess_for_hough_enhanced(roi_gray, params)
-    min_len_pixels = roi_gray.shape[1] * p_hough["MIN_LINE_LENGTH_RATIO"]
+    min_len_pixels = roi_gray.shape[1] * p_hough.get("MIN_LINE_LENGTH_RATIO", 0.05)
     raw_lines = cv2.HoughLinesP(binary_edges, 1, np.pi / 180, p_hough["THRESHOLD"], minLineLength=min_len_pixels, maxLineGap=p_hough["MAX_LINE_GAP"])
     
     main_edges = merge_lines_and_get_main_edges(raw_lines, params)
@@ -348,12 +347,15 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     p1, p2 = defect['endpoints']
                     dist_leg1_px = np.linalg.norm(np.array(center) - np.array(p1))
                     dist_leg2_px = np.linalg.norm(np.array(center) - np.array(p2))
-                    # 修改：若绘制阶段会因为“过长”回退到固定长度，这里尺寸同样应用回退规则，确保报告尺寸与最终三角形一致。
+
+                    # --- FIX: Report size consistent with retreated visualization ---
                     p_vis_local = params.get("VISUALIZATION", {})
                     retreat_threshold = p_vis_local.get("RETREAT_DISTANCE_THRESHOLD", 100.0)
                     retreat_len_px = p_vis_local.get("EDGE_ENDPOINT_FIXED_LENGTH", 20)
-                    adj_leg1 = retreat_len_px if dist_leg1_px > retreat_threshold else dist_leg1_px
-                    adj_leg2 = retreat_len_px if dist_leg2_px > retreat_threshold else dist_leg2_px
+                    
+                    adj_leg1 = retreat_len_px if "distances" in defect and defect["distances"][0] > retreat_threshold else dist_leg1_px
+                    adj_leg2 = retreat_len_px if "distances" in defect and defect["distances"][1] > retreat_threshold else dist_leg2_px
+
                     length_px = max(adj_leg1, adj_leg2)
                     width_px  = min(adj_leg1, adj_leg2)
                 else:
@@ -378,11 +380,25 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
         new_defect['location'] = location
         
-        if new_defect['type'] in ['Q', 'L', 'B']:
-            min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
-            defect_size_mm = location.get('length_mm', 0)
-            if defect_size_mm < min_size_mm:
-                continue 
+        # --- FIX: Stricter MIN_DEFECT_SIZE_MM filter for Q-type defects ---
+        min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
+        if new_defect['type'] == 'Q':
+            #如果Q型缺陷的面积小于7.5平方毫米，则忽略
+            if location.get('length_mm', 0) * location.get('width_mm', 0) < 7.5:
+                continue
+        elif new_defect['type'] in ['L', 'B']:
+            if location.get('length_mm', 0) < min_size_mm:
+                continue
+        
+        # --- FIX: New B-type area calculation and filter ---
+        if new_defect['type'] == 'B':
+            length_mm = location.get('length_mm', 0)
+            width_mm = location.get('width_mm', 0)
+            area_mm2 = length_mm * width_mm
+            aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
+            
+            if area_mm2 > 100 and aspect_ratio > 4.0:
+                continue
 
         new_defect['raw_defect'] = defect 
         final_defects_for_report.append(new_defect)
@@ -434,7 +450,6 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 if dist2 > retreat_threshold:
                     vec2 = (p2_orig - center) / dist2
                     v2_final = center + vec2 * retreat_len
-                # 调试：写入调整后两条边的像素长度，供后续需要时参考（不进入最终上报）
                 try:
                     defect_report.setdefault('_adjusted_q_lengths_px', [
                         float(np.linalg.norm(v1_final - center)),
@@ -473,25 +488,22 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         draw = ImageDraw.Draw(pil_img)
         
         y_text = 10
-        # --- FIX: Use dynamic line spacing to prevent text overlap ---
-        padding = 10 # Add a small gap between lines
+        padding = 10
         for ann in annotations_to_draw:
             text = ann['text']
             color_rgb = tuple(reversed(ann['color']))
             
-            # Calculate text bounding box for positioning and line height
-            if hasattr(draw, 'textbbox'): # Newer Pillow version
+            if hasattr(draw, 'textbbox'):
                 bbox = draw.textbbox((0,0), text, font=ANNOTATION_FONT)
                 text_width = bbox[2] - bbox[0]
                 text_height = bbox[3] - bbox[1]
-            else: # Older Pillow version
+            else:
                  text_width, text_height = draw.textsize(text, font=ANNOTATION_FONT)
 
             x_text = w - text_width - 10
             
             draw.text((x_text, y_text), text, font=ANNOTATION_FONT, fill=color_rgb)
             
-            # Increment y_text by the actual height of the drawn text plus padding
             y_text += text_height + padding
             
         roi_color = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
