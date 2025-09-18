@@ -7,7 +7,7 @@ from datetime import datetime
 import base64
 import numpy as np
 # 假设 image_processor_hough.py 在同一目录下
-import image_processor_hough as image_processor
+import image_processor_hough_demo as image_processor
 
 # --- 模拟 SharedSettings 类 (来自 glass_inspector 项目，简化用于测试) ---
 class MockSharedSettings:
