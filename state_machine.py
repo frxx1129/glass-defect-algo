@@ -7,7 +7,7 @@ import numpy as np
 from queue import Empty
 from datetime import datetime
 import yield_manager
-from server_comms import send_report_to_server, fetch_collection_id_from_server, fetch_initial_state_from_server, broadcast_rejections
+from server_comms import send_report_to_server, send_reports_batch_to_server, fetch_collection_id_from_server, fetch_initial_state_from_server, broadcast_rejections
 
 def results_and_state_machine_thread(num_cameras, results_queue, connection_manager, stop_event, loop, shared_settings, counters, queues, flags, machine_state_shared, stats_lock, metadata, run_event_proxy, http_client, alarm_light_controller):
     print("[状态机线程]: 已启动。")
@@ -55,21 +55,19 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         if not ng_buffer: return None
         return max(ng_buffer, key=lambda r: max([get_defect_size(d) for d in r.get('defects', [])] or [-1]))
 
-    def save_and_upload_report(result_to_save, rejection_details_to_save):
-        defects = result_to_save.get('defects', [])
-        max_defect_size = max([get_defect_size(d) for d in defects] or [0])
+    def build_report_for_frame(result_obj, rejection_details_to_save):
+        defects = result_obj.get('defects', [])
+        def primary_size(d):
+            loc = d.get('location', {})
+            return max(loc.get('length_mm', 0), loc.get('width_mm', 0))
+        max_defect_size = max([primary_size(d) for d in defects] or [0])
         has_x_defect = any(d.get('type') == 'X' for d in defects)
-        has_q_defect = any(d.get('type') == 'Q' for d in defects)
-        
-        size_part = ""
+        size_label_parts = []
         if max_defect_size > 0:
-            if max_defect_size >= 100: size_part = "100mm"
-            elif max_defect_size >= 50: size_part = "50mm"
-            elif max_defect_size >= 20: size_part = "20mm"
-            else: size_part = "<20mm"
-        label_parts = [p for p in [size_part, "X" if has_x_defect else "", "Q" if has_q_defect else ""] if p]
-        final_size_label = ",".join(label_parts)
-        
+            size_label_parts.append(f"{int(round(max_defect_size))}mm")
+        if has_x_defect:
+            size_label_parts.append('X')
+        final_size_label = ','.join(size_label_parts) if size_label_parts else ''
         raw_cid = shared_collection_id.value
         try:
             if isinstance(raw_cid, (bytes, bytearray)):
@@ -78,30 +76,38 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 collection_id = int(raw_cid)
         except Exception:
             collection_id = -1
-        user_id = shared_user_id_manual.value if rejection_details_to_save.get("rejection_type") == "2" else shared_user_id_auto.value
-        
-        report = {
-            "collection_id": int(collection_id),
-            "rejection_type": rejection_details_to_save.get("rejection_type", "unknown"),
-            "rejection_time": rejection_details_to_save.get("rejection_time", datetime.now()).strftime("%Y-%m-%d %H:%M:%S"),
-            "userId": user_id,
-            "size_label": final_size_label,
-            "image_status": result_to_save["image_status"],
-            "defects": defects,
-            "camera_index": result_to_save["camera_index"]
+        user_id = shared_user_id_manual.value if rejection_details_to_save.get('rejection_type') == '2' else shared_user_id_auto.value
+        return {
+            'collection_id': int(collection_id),
+            'rejection_type': rejection_details_to_save.get('rejection_type', 'unknown'),
+            'rejection_time': rejection_details_to_save.get('rejection_time', datetime.now()).strftime('%Y-%m-%d %H:%M:%S'),
+            'userId': user_id,
+            'size_label': final_size_label,
+            'image_status': result_obj['image_status'],
+            'defects': defects,
+            'camera_index': result_obj['camera_index']
         }
 
+    def save_and_upload_reports_batch(results_list, rejection_details_to_save):
+        if not results_list:
+            return
         save_dir = os.path.join(STORAGE_PATH, datetime.now().strftime('%Y-%m-%d'))
         os.makedirs(save_dir, exist_ok=True)
-        base_name = f"{datetime.strptime(report['rejection_time'], '%Y-%m-%d %H:%M:%S').strftime('%H%M%S')}_{collection_id}_Cam{report['camera_index']}"
-        image_buffer = result_to_save.get('annotated_image_buffer')
-
-        if image_buffer:
-            with open(os.path.join(save_dir, f"{base_name}.jpg"), 'wb') as f: f.write(image_buffer)
-            send_report_to_server(report, image_buffer, shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 15))
-        with open(os.path.join(save_dir, f"{base_name}.json"), 'w', encoding='utf-8') as f:
-            json.dump(report, f, ensure_ascii=False, indent=4, default=str)
-        print(f"    [状态机]: 已保存报告 (ID: {collection_id}), 尺寸标签: {final_size_label}")
+        reports = []
+        images = []
+        for res in results_list:
+            rpt = build_report_for_frame(res, rejection_details_to_save)
+            reports.append(rpt)
+            img_buf = res.get('annotated_image_buffer')
+            images.append(img_buf)
+            base_name = f"{datetime.strptime(rpt['rejection_time'], '%Y-%m-%d %H:%M:%S').strftime('%H%M%S')}_{rpt['collection_id']}_Cam{rpt['camera_index']}"
+            if img_buf:
+                with open(os.path.join(save_dir, f"{base_name}.jpg"), 'wb') as f:
+                    f.write(img_buf)
+            with open(os.path.join(save_dir, f"{base_name}.json"), 'w', encoding='utf-8') as f:
+                json.dump(rpt, f, ensure_ascii=False, indent=4, default=str)
+        send_reports_batch_to_server(reports, images, shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
+        print(f"    [状态机]: 批量上传完成，数量: {len(reports)}")
 
     # Initial state fetch
     fetch_collection_id_from_server(shared_settings, shared_collection_id)
@@ -123,9 +129,10 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             manual_reject_flag.value = False; can_late_reject.value = False
             print(f"--- [状态机]: 检测到滞后手动剔废指令 ---")
             if last_pane_data and not last_pane_data.get("was_rejected_in_view"):
-                best_result = find_best_ng_result(last_pane_data["ng_buffer"])
-                if best_result:
-                    save_and_upload_report(best_result, {"rejection_time": datetime.now(), "rejection_type": "2"})
+                # 批量滞后上传整片期间所有 NG 帧
+                ng_buf = last_pane_data.get("ng_buffer") or []
+                if ng_buf:
+                    save_and_upload_reports_batch(list(ng_buf), {"rejection_time": datetime.now(), "rejection_type": "2"})
                     # 剃废即刻触发红灯报警（与状态无关）
                     if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                         try:
@@ -187,8 +194,9 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         # 产量统计移除
 
                         if is_current_event_rejected and not saved_for_this_pane:
-                            best_result = find_best_ng_result(current_pane_ng_buffer)
-                            if best_result: save_and_upload_report(best_result, rejection_details)
+                            if current_pane_ng_buffer:
+                                save_and_upload_reports_batch(list(current_pane_ng_buffer), rejection_details)
+                                saved_for_this_pane = True
                         
                         last_pane_data = {}
                         can_late_reject.value = False
@@ -217,7 +225,10 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     if shared_rejection_mode.value == 1 and result.get('should_reject', False):
                         is_current_event_rejected = True; saved_for_this_pane = True
                         rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
-                        save_and_upload_report(result, rejection_details)
+                        if current_pane_ng_buffer:
+                            save_and_upload_reports_batch(list(current_pane_ng_buffer), rejection_details)
+                        else:
+                            save_and_upload_reports_batch([result], rejection_details)
                         rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index))
                         # 剃废即刻触发红灯报警（与状态无关）
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):

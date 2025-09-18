@@ -136,6 +136,53 @@ class NonBlockingHttpClient:
 
         self.executor.submit(_upload_task)
 
+    def post_files_batch(self, url, files_list, json_payload_list, timeout_s: float | None = None):
+        """批量上传：files_list 为 [(filename, bytes, mime), ...]; json_payload_list 为 [report1, report2, ...]"""
+        def _upload_task_batch():
+            try:
+                def _sanitize(obj):
+                    if isinstance(obj, (bytes, bytearray)):
+                        try:
+                            return obj.decode('utf-8')
+                        except Exception:
+                            import base64
+                            return base64.b64encode(obj).decode('ascii')
+                    if isinstance(obj, dict):
+                        return {k: _sanitize(v) for k, v in obj.items()}
+                    if isinstance(obj, list):
+                        return [_sanitize(v) for v in obj]
+                    if isinstance(obj, tuple):
+                        return tuple(_sanitize(v) for v in obj)
+                    return obj
+                safe_payloads = _sanitize(json_payload_list)
+
+                multipart_parts = []
+                # 按服务器需求：files 是数组 => 多个同名字段
+                for f in files_list:
+                    if not f: continue
+                    multipart_parts.append(('files', f))
+                # payload 是数组（JSON 序列化）
+                multipart_parts.append(('payload', (None, json.dumps(safe_payloads, ensure_ascii=False), 'application/json')))
+                to = 30 if timeout_s is None else float(timeout_s)
+                response = requests.post(url, files=multipart_parts, timeout=to)
+                if response.status_code == 200:
+                    print(f"    [上传模块-后台]: 批量报告发送成功 (数量={len(files_list)}).")
+                else:
+                    body = None
+                    try:
+                        body = response.text
+                        if body is not None and len(body) > 500:
+                            body = body[:500] + f"... (truncated {len(response.text) - 500} chars)"
+                    except Exception:
+                        body = "<unable to read response body>"
+                    print(f"    [上传模块-后台]: 批量上传失败 -> POST {url} | 状态码: {response.status_code} | 原因: {getattr(response, 'reason', '')} | 响应: {body}")
+            except requests.exceptions.RequestException as e:
+                print(f"    [上传模块-后台]: 批量网络异常 -> POST {url} | 异常: {e.__class__.__name__}: {e}")
+            except Exception as e:
+                print(f"    [上传模块-后台]: 批量未知错误 -> POST {url} | 异常: {e.__class__.__name__}: {e}")
+
+        self.executor.submit(_upload_task_batch)
+
 
     def shutdown(self):
         """

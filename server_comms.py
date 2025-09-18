@@ -125,6 +125,33 @@ def send_report_to_server(json_report, image_buffer, server_url, http_client, up
     http_client.post_files(server_url, files=file_data, json_payload=json_report, timeout_s=upload_timeout_s)
 
 
+def send_reports_batch_to_server(json_reports, image_buffers, server_url, http_client, upload_timeout_s: float | None = None):
+    """批量上传：json_reports 与 image_buffers 对应；最终 multipart 中 files & payload 都为数组"""
+    files_list = []
+    sanitized_reports = []
+    for rpt, img_buf in zip(json_reports, image_buffers):
+        collection_id = rpt.get("collection_id", -1)
+        try:
+            collection_id = int(collection_id)
+        except Exception:
+            collection_id = -1
+        rejection_time_str = rpt.get("rejection_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        try:
+            rejection_dt = datetime.strptime(rejection_time_str, "%Y-%m-%d %H:%M:%S")
+            time_str = rejection_dt.strftime('%H%M%S')
+        except ValueError:
+            time_str = "000000"
+        cam_index = rpt.get("camera_index", "X")
+        image_filename = f"{time_str}_{collection_id}_Cam{cam_index}.jpg"
+        if img_buf:
+            files_list.append((image_filename, img_buf, 'image/jpeg'))
+        sanitized_reports.append(rpt)
+    if not sanitized_reports:
+        return
+    print(f"    [上传模块]: 正在批量提交 {len(sanitized_reports)} 份报告")
+    http_client.post_files_batch(server_url, files_list, sanitized_reports, timeout_s=upload_timeout_s)
+
+
 def broadcast_rejections(settings, collection_id, rejection_count, http_client):
     """广播剔废数量（删除产量字段）。"""
     try:
