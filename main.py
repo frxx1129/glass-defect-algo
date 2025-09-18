@@ -225,6 +225,13 @@ def main():
     # 修改：仅剔废上报端点
     shared_settings.stats_push_url = server_config.get('stats_push_url', f'http://{shared_settings.server}:8085/fastapi/glass/updateRejections')
     shared_settings.heartbeat_url = server_config.get('heartbeat_url', f'http://{shared_settings.server}:8085/fastapi/system/heartbeat')
+    # 周期推送控制参数
+    sys_params_root = config.get('system_params', {}) or {}
+    shared_settings.enable_periodic_stats = bool(sys_params_root.get('enable_periodic_stats', True))
+    try:
+        shared_settings.stats_push_interval_s = float(sys_params_root.get('stats_push_interval_s', 30) or 30)
+    except Exception:
+        shared_settings.stats_push_interval_s = 30.0
     
     # 读取报警器配置
     alarm_params = config.get('alarm_light_params', {})

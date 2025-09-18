@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from utils import ConnectionManager
 from rejection_control import rejection_handler_thread
 from state_machine import results_and_state_machine_thread
+from server_comms import periodic_stats_pusher
 
 class CurrentUser(BaseModel):
     sessionId: str
@@ -66,13 +67,47 @@ def create_app(num_cameras, shared_objects):
         ), daemon=True)
         app.state.state_machine_thread.start()
 
-    # 删除产量推送线程：仅保留剔废统计，不再周期推送产量
+        # 启动周期统计推送线程（可配置开关）
+        try:
+            sys_params = getattr(shared_settings, 'system_params', None) or {}
+        except Exception:
+            sys_params = {}
+        enable_stats = True
+        try:
+            enable_stats = bool(getattr(shared_settings, 'enable_periodic_stats'))
+        except Exception:
+            # fallback to config dict if stored
+            enable_stats = bool(sys_params.get('enable_periodic_stats', True)) if isinstance(sys_params, dict) else True
+        interval_s = 30.0
+        try:
+            interval_s = float(getattr(shared_settings, 'stats_push_interval_s'))
+        except Exception:
+            if isinstance(sys_params, dict):
+                try:
+                    interval_s = float(sys_params.get('stats_push_interval_s', 30) or 30)
+                except Exception:
+                    interval_s = 30.0
+        if enable_stats and interval_s > 0:
+            app.state.stats_thread_stop = threading.Event()
+            app.state.stats_thread = threading.Thread(
+                target=periodic_stats_pusher,
+                args=(shared_settings, metadata[0], counters[1], counters[0], http_client, app.state.stats_thread_stop, interval_s),
+                daemon=True
+            )
+            app.state.stats_thread.start()
+        else:
+            app.state.stats_thread = None
+            app.state.stats_thread_stop = None
         
         yield
         
         print("[主进程]: FastAPI 应用关闭...")
         thread_stop_event.set()
         app.state.state_machine_thread.join(timeout=2)
+        if getattr(app.state, 'stats_thread_stop', None):
+            app.state.stats_thread_stop.set()
+        if getattr(app.state, 'stats_thread', None):
+            app.state.stats_thread.join(timeout=2)
 
     app = FastAPI(title="Glass Detection System", lifespan=lifespan)
     try:

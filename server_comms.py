@@ -1,8 +1,10 @@
 # --- START OF FILE server_comms.py (修改后) ---
 import requests
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit
+import time
+import threading
 
 
 def _mask_port(url: str) -> str:
@@ -98,6 +100,44 @@ def fetch_collection_id_from_server(settings, collection_id_var):
 # =================================================================
 
 ## 删除 periodic_stats_pusher：仅保留事件触发剔废广播。
+def periodic_stats_pusher(settings, collection_id_var, yield_counter, rejection_counter, http_client, stop_event, interval_s: float = 30.0):
+    """(改造) 每日 00:00:05 执行一次：
+    1. 重新获取 collection_id
+    2. 推送一次当前产量/剔废统计
+    兼容旧 interval_s 参数但不再按固定秒循环推送，只做日界刷新。"""
+    print("[统计推送线程]: 已启动 (模式=每日定时 00:00:05)")
+    last_run_date = None
+    while not stop_event.is_set():
+        now = datetime.now()
+        current_date = now.date()
+        # 计算今日触发时间点
+        trigger_time = now.replace(hour=0, minute=0, second=5, microsecond=0)
+        # 若当前时间已过触发点且今天还没执行
+        if now >= trigger_time and current_date != last_run_date:
+            try:
+                print("[统计推送线程]: 日切换执行 -> 刷新 collection_id 并推送统计")
+                fetch_collection_id_from_server(settings, collection_id_var)
+            except Exception as e:
+                print(f"[统计推送线程]: 刷新 collection_id 失败: {e}")
+            try:
+                broadcast_yield_and_rejections(settings, collection_id_var, yield_counter, rejection_counter, http_client)
+            except Exception as e:
+                print(f"[统计推送线程]: 推送统计失败: {e}")
+            last_run_date = current_date
+        # 休眠：若未到触发点，按较长间隔睡眠；接近触发点时缩短
+        if stop_event.is_set():
+            break
+        # 距离下一次 00:00:05 的秒数
+        if now < trigger_time:
+            secs = (trigger_time - now).total_seconds()
+            sleep_s =  min(60.0, max(1.0, secs/10))
+        else:
+            # 已执行，睡到明天 00:00:05 附近
+            tomorrow_trigger = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+            secs = (tomorrow_trigger - now).total_seconds()
+            sleep_s = min(300.0, max(5.0, secs/20))
+        time.sleep(sleep_s)
+    print("[统计推送线程]: 已停止")
 
 
 def send_report_to_server(json_report, image_buffer, server_url, http_client, upload_timeout_s: float | None = None):
