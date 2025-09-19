@@ -305,24 +305,17 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     x, y, w, h = int(roi_template['x']), int(roi_template['y']), int(roi_template['width']), int(roi_template['height'])
     roi_gray = image_gray[y:y+h, x:x+w]
     
-    # --- NEW PRE-PROCESSING PIPELINE FOR DARK GLASS ---
+    # --- 预处理流程 (深色玻璃专用，保持不变) ---
     p_preprocess = params.get("PREPROCESSING", {})
     p_hough = params.get("HOUGH_TRANSFORM", {})
     p_merging = params.get("LINE_MERGING", {})
 
-    # 1. Otsu Thresholding to isolate the glass area
     _, otsu_mask = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    # 2. Morphological Opening to remove noise from the mask
     k_size = tuple(p_preprocess.get("OPENING_KERNEL_SIZE", [21, 21]))
     kernel_open = np.ones(k_size, np.uint8)
     cleaned_mask = cv2.morphologyEx(otsu_mask, cv2.MORPH_OPEN, kernel_open)
-
-    # 3. Morphological Gradient to get a clean contour image
     kernel_gradient = np.ones((3, 3), np.uint8)
     gradient_image = cv2.morphologyEx(cleaned_mask, cv2.MORPH_GRADIENT, kernel_gradient)
-
-    # 4. Hough Transform on the gradient image
     raw_lines = cv2.HoughLinesP(
         gradient_image,
         rho=1,
@@ -331,16 +324,13 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         minLineLength=p_hough.get("MIN_LINE_LENGTH", 25),
         maxLineGap=p_hough.get("MAX_LINE_GAP", 20)
     )
-
-    # 5. Merge the fragmented lines into coherent edges
     main_edges = merge_lines_and_get_main_edges(raw_lines, p_merging)
     
-    # --- The rest of the pipeline remains the same ---
+    # --- 缺陷分析 (保持不变) ---
     edges_for_drawing, all_defects = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, params)
     
     final_defects_for_report = []
     for defect in all_defects:
-        # (Defect formatting and filtering logic is identical to the light version)
         new_defect = {'type': defect['type']}
         location = {}
 
@@ -359,8 +349,17 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     p1, p2 = defect['endpoints']
                     dist_leg1_px = np.linalg.norm(np.array(center) - np.array(p1))
                     dist_leg2_px = np.linalg.norm(np.array(center) - np.array(p2))
-                    length_px = max(dist_leg1_px, dist_leg2_px)
-                    width_px = min(dist_leg1_px, dist_leg2_px)
+
+                    # --- FIX: (已更新) 报告尺寸与可视化回退逻辑保持一致 ---
+                    p_vis_local = params.get("VISUALIZATION", {})
+                    retreat_threshold = p_vis_local.get("RETREAT_DISTANCE_THRESHOLD", 100.0)
+                    retreat_len_px = p_vis_local.get("EDGE_ENDPOINT_FIXED_LENGTH", 20)
+                    
+                    adj_leg1 = retreat_len_px if "distances" in defect and defect["distances"][0] > retreat_threshold else dist_leg1_px
+                    adj_leg2 = retreat_len_px if "distances" in defect and defect["distances"][1] > retreat_threshold else dist_leg2_px
+
+                    length_px = max(adj_leg1, adj_leg2)
+                    width_px  = min(adj_leg1, adj_leg2)
                 else:
                     length_px, width_px = 0.0, 0.0
             elif defect['type'] == 'L':
@@ -383,11 +382,30 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
         new_defect['location'] = location
         
-        if new_defect['type'] in ['Q', 'L', 'B']:
-            min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
-            defect_size_mm = location.get('length_mm', 0)
-            if defect_size_mm < min_size_mm:
-                continue 
+        # --- FIX: (已更新) 采用新版更严格的缺陷过滤规则 ---
+        min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
+        if new_defect['type'] == 'Q':
+            # 规则1: 过滤掉面积过小或长宽比过大的Q类缺陷
+            if location.get('length_mm', 0) * location.get('width_mm', 0) < 2.25 or location.get('length_mm', 0) / location.get('width_mm', 1) > 3.0:
+                continue
+        elif new_defect['type'] in ['L', 'B']:
+            # 规则2: 过滤掉尺寸小于阈值的L和B类缺陷
+            if location.get('length_mm', 0) < min_size_mm:
+                continue
+        
+        # --- FIX: (已更新) 新增B类缺陷的专属过滤规则 ---
+        if new_defect['type'] == 'B':
+            length_mm = location.get('length_mm', 0)
+            width_mm = location.get('width_mm', 0)
+            area_mm2 = length_mm * width_mm
+            aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
+            
+            # 规则3: 过滤掉大面积且细长的B类缺陷 (可能是裂纹)
+            if area_mm2 > 80 and aspect_ratio > 3.2:
+                continue
+            # 规则4: 过滤掉过于细长的B类缺陷 (可能是划痕)
+            if aspect_ratio > 6.0:
+                continue
 
         new_defect['raw_defect'] = defect 
         final_defects_for_report.append(new_defect)
@@ -400,7 +418,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     for d in roi_report['defects']:
         d.pop('raw_defect', None)
 
-    # (Visualization logic is identical to the light version)
+    # --- 可视化逻辑 (与新版文件完全相同，保持不变) ---
     roi_color = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
     DEFECT_COLORS_BGR = {'Q': (0, 0, 255), 'X': (0, 255, 255), 'L': (255, 0, 255), 'B': (0, 165, 255)}
     p_vis = params["VISUALIZATION"]
