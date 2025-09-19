@@ -1,4 +1,4 @@
-# --- START OF FILE image_processor_hough.py (Amended with quadrant logic and refined rules) ---
+# --- START OF FILE image_processor_hough.py (Corrected for Q-Defect Reporting and Filtering) ---
 import cv2
 import numpy as np
 import json
@@ -20,52 +20,48 @@ except ImportError:
 def _get_font(font_size=36):
     if not PIL_AVAILABLE:
         return None
-    font_paths = ['C:/Windows/Fonts/msyh.ttc', 'C:/Windows/Fonts/simsun.ttc', '/System/Library/Fonts/PingFang.ttc', '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc']
+    
+    font_paths = [
+        'C:/Windows/Fonts/msyh.ttc',
+        'C:/Windows/Fonts/simsun.ttc',
+        '/System/Library/Fonts/PingFang.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+    ]
     for font_path in font_paths:
         try:
             return ImageFont.truetype(font_path, font_size)
         except IOError:
             continue
+    
     print("警告: 未找到中文字体, 标注可能无法正确显示中文。")
     try:
         return ImageFont.load_default()
     except Exception:
         return None
+
 ANNOTATION_FONT = _get_font(font_size=36)
+
 
 # ====================================================================================
 # --- 几何学与分析辅助函数 ---
 # ====================================================================================
 
-# --- NEW: Helper functions for Quadrant-based analysis ---
-def get_line_quadrant(line, center_xy):
-    """Determines the quadrant of a line's midpoint. 1, 2, 3, 4 for NE, NW, SW, SE."""
-    cx, cy = center_xy
-    mid_x = (line[0] + line[2]) / 2.0
-    mid_y = (line[1] + line[3]) / 2.0
-    if mid_x >= cx and mid_y < cy: return 1 # NE
-    if mid_x < cx and mid_y < cy: return 2 # NW
-    if mid_x < cx and mid_y >= cy: return 3 # SW
-    if mid_x >= cx and mid_y >= cy: return 4 # SE
-    return 0 # Should not happen
-
-def are_quadrants_compatible(q1, q2):
-    """Checks if two quadrants are the same or adjacent."""
-    if q1 == q2: return True
-    diff = abs(q1 - q2)
-    return diff == 1 or diff == 3 # Adjacent quadrants (1-2, 2-3, 3-4, 4-1)
-
 def draw_dashed_line(img, pt1, pt2, color, thickness=1, dash_length=10):
     dist = np.linalg.norm(np.array(pt1) - np.array(pt2))
     if dist == 0: return
+    
     delta = (np.array(pt2) - np.array(pt1)) / dist
+    
     current_pos = np.array(pt1)
     segment_length = 0
     while segment_length < dist:
         start_point = current_pos
         end_point = current_pos + delta * dash_length
-        if segment_length + dash_length > dist: end_point = pt2
+        if segment_length + dash_length > dist:
+            end_point = pt2
+        
         cv2.line(img, tuple(map(int, start_point)), tuple(map(int, end_point)), color, thickness)
+        
         current_pos = current_pos + delta * (2 * dash_length)
         segment_length += 2 * dash_length
 
@@ -85,7 +81,8 @@ def calculate_vertex_angle(p_prev, p_curr, p_next):
     return np.degrees(angle)
 
 def calculate_angle_between_lines(line1, line2):
-    v1 = np.array(line1[2:]) - np.array(line1[:2]); v2 = np.array(line2[2:]) - np.array(line2[:2])
+    v1 = np.array(line1[2:]) - np.array(line1[:2])
+    v2 = np.array(line2[2:]) - np.array(line2[:2])
     v1_mag = np.linalg.norm(v1); v2_mag = np.linalg.norm(v2)
     if v1_mag < 1e-9 or v2_mag < 1e-9: return 0.0
     cosine_angle = np.dot(v1, v2) / (v1_mag * v2_mag)
@@ -104,105 +101,99 @@ def get_point_line_segment_projection(point, line_segment):
     proj_point = p1 + t * line_vec
     return proj_point, np.linalg.norm(p - proj_point)
 
+def get_line_quadrant(line, center_x, center_y):
+    mid_x = (line[0] + line[2]) / 2.0
+    mid_y = (line[1] + line[3]) / 2.0
+    if mid_x > center_x and mid_y <= center_y: return 0 # Top-Right
+    if mid_x <= center_x and mid_y <= center_y: return 1 # Top-Left
+    if mid_x <= center_x and mid_y > center_y: return 2 # Bottom-Left
+    return 3 # Bottom-Right
+
+def are_quadrants_compatible(q1, q2):
+    if q1 == q2: return True
+    if abs(q1 - q2) == 1: return True
+    if abs(q1 - q2) == 3: return True
+    return False
+
+def refine_q_defect_endpoint(start_point, direction_vec, binary_edges, search_width=3, max_search_dist=50):
+    h, w = binary_edges.shape
+    norm = np.linalg.norm(direction_vec)
+    if norm < 1e-6: return start_point
+    
+    unit_vec = direction_vec / norm
+    normal_vec = np.array([-unit_vec[1], unit_vec[0]])
+    
+    last_valid_point = np.copy(start_point)
+    
+    for step in range(1, max_search_dist):
+        current_base = start_point + unit_vec * step
+        found_pixel_in_profile = False
+        
+        for offset in range(-search_width // 2, search_width // 2 + 1):
+            check_point = current_base + normal_vec * offset
+            px, py = int(round(check_point[0])), int(round(check_point[1]))
+            
+            if 0 <= py < h and 0 <= px < w and binary_edges[py, px] > 0:
+                found_pixel_in_profile = True
+                break
+        
+        if found_pixel_in_profile:
+            last_valid_point = current_base
+        else:
+            break
+            
+    return last_valid_point
+
 def scan_edge_for_luminosity_defects(roi_gray, edge, params):
     p = params["DEFECT_DETECTION"]
+    
     p1 = np.array(edge[:2]); p2 = np.array(edge[2:])
     scan_width = p["LUMINOSITY_SCAN_WIDTH"]
     line_vec = p2 - p1; line_length = np.linalg.norm(line_vec)
     if line_length < 1e-6: return []
+
     unit_vec = line_vec / line_length; normal_vec = np.array([-unit_vec[1], unit_vec[0]])
     half_width_vec = (scan_width / 2.0) * normal_vec
     c1 = p1 + half_width_vec; c2 = p2 + half_width_vec
     c3 = p2 - half_width_vec; c4 = p1 - half_width_vec
     rect_points = np.array([c1, c2, c3, c4], dtype=np.int32).reshape((-1, 1, 2))
+    
     scan_mask = np.zeros_like(roi_gray)
     cv2.fillPoly(scan_mask, [rect_points], 255)
+    
     mean, std_dev = cv2.meanStdDev(roi_gray, mask=scan_mask)
+    
     initial_contours = []
     if std_dev[0][0] > 3:
-        # --- MODIFIED: Use a more lenient multiplier for initial detection ---
-        multiplier = p.get("LUMINOSITY_DETECTION_STD_DEV_MULTIPLIER", p["LUMINOSITY_STD_DEV_MULTIPLIER"])
-        threshold_low = mean[0][0] - multiplier * std_dev[0][0]
-        potential_defects = (roi_gray < threshold_low).astype(np.uint8) * 255
+        # --- MODIFIED: Added gradient check for more robust defect detection ---
+        grad_x = cv2.Sobel(roi_gray, cv2.CV_16S, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(roi_gray, cv2.CV_16S, 0, 1, ksize=3)
+        abs_grad_x = cv2.convertScaleAbs(grad_x)
+        abs_grad_y = cv2.convertScaleAbs(grad_y)
+        grad_img = cv2.addWeighted(abs_grad_x, 0.5, abs_grad_y, 0.5, 0)
+
+        brightness_threshold = mean[0][0] - p["LUMINOSITY_STD_DEV_MULTIPLIER"] * std_dev[0][0]
+        # NOTE: Add "LUMINOSITY_MIN_GRADIENT" to your config.json's DEFECT_DETECTION section
+        gradient_threshold = p.get("LUMINOSITY_MIN_GRADIENT", 30)
+
+        is_dark_enough = (roi_gray < brightness_threshold)
+        has_high_gradient = (grad_img > gradient_threshold)
+        
+        potential_defects = (is_dark_enough & has_high_gradient).astype(np.uint8) * 255
         defect_mask = cv2.bitwise_and(potential_defects, scan_mask)
+        # --- End of modification ---
+
         if p.get("LUMINOSITY_EDGE_IGNORE_WIDTH", 0) > 0:
             ignore_mask = np.zeros_like(roi_gray)
             cv2.line(ignore_mask, tuple(map(int, p1)), tuple(map(int, p2)), 255, thickness=p["LUMINOSITY_EDGE_IGNORE_WIDTH"])
             defect_mask = cv2.subtract(defect_mask, ignore_mask)
+
         contours, _ = cv2.findContours(defect_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
         for cnt in contours:
             if cv2.contourArea(cnt) > p["LUMINOSITY_MIN_AREA"]:
                 initial_contours.append(cnt)
     return initial_contours
-
-# --- MODIFIED: Upgraded function to search a 3px wide path for the boundary ---
-def find_brightness_boundary_point(grad_mag, p_intersection, p_original_far, max_search_dist=150, num_samples=100):
-    direction_vec = p_original_far - p_intersection
-    dist = np.linalg.norm(direction_vec)
-    if dist < 1e-6: return p_intersection
-    unit_vec = direction_vec / dist
-    normal_vec = np.array([-unit_vec[1], unit_vec[0]]) # Perpendicular vector
-    search_dist = min(dist, max_search_dist)
-    max_grad = -1
-    boundary_point = p_intersection
-    h, w = grad_mag.shape
-
-    def safe_get_grad(p):
-        x, y = int(p[0]), int(p[1])
-        if 0 <= y < h and 0 <= x < w: return grad_mag[y, x]
-        return 0
-
-    for i in range(1, num_samples + 1):
-        d = (i / num_samples) * search_dist
-        p_center = p_intersection + unit_vec * d
-        # Sample center and two adjacent pixels (3px wide path)
-        grad_center = safe_get_grad(p_center)
-        grad_side1 = safe_get_grad(p_center - normal_vec)
-        grad_side2 = safe_get_grad(p_center + normal_vec)
-        grad_val = max(grad_center, grad_side1, grad_side2) # Take the max response
-        if grad_val > max_grad:
-            max_grad = grad_val
-            boundary_point = p_center
-    return boundary_point
-
-def find_brightness_cracks(roi_gray, main_edges, params):
-    p_crack = params.get("CRACK_CLASSIFICATION", {})
-    # --- MODIFIED: Use a more lenient multiplier for initial detection ---
-    brightness_thresh_multiplier = p_crack.get("BRIGHTNESS_CRACK_DETECTION_THRESH_MULTIPLIER", 
-                                             p_crack.get("BRIGHTNESS_CRACK_THRESH_MULTIPLIER", 1.8))
-    min_area = p_crack.get("BRIGHTNESS_CRACK_MIN_AREA", 20)
-    min_aspect_ratio = p_crack.get("BRIGHTNESS_CRACK_MIN_ASPECT_RATIO", 4.0)
-    max_dist_to_edge = p_crack.get("BRIGHTNESS_CRACK_MAX_DIST", 15)
-    angle_tolerance = p_crack.get("BRIGHTNESS_CRACK_ANGLE_TOLERANCE", 30)
-    new_crack_defects = []
-    if not main_edges: return new_crack_defects
-    mean, std_dev = cv2.meanStdDev(roi_gray)
-    dark_threshold = mean[0][0] - brightness_thresh_multiplier * std_dev[0][0]
-    _, dark_mask = cv2.threshold(roi_gray, dark_threshold, 255, cv2.THRESH_BINARY_INV)
-    contours, _ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in contours:
-        if cv2.contourArea(cnt) < min_area: continue
-        min_area_rect = cv2.minAreaRect(cnt)
-        (w_rect, h_rect) = min_area_rect[1]
-        if w_rect < 1e-6 or h_rect < 1e-6: continue
-        aspect_ratio = max(w_rect, h_rect) / min(w_rect, h_rect)
-        if aspect_ratio > min_aspect_ratio:
-            cnt_center = np.array(min_area_rect[0])
-            closest_edge, min_dist = None, float('inf')
-            for edge in main_edges:
-                _, dist = get_point_line_segment_projection(cnt_center, edge)
-                if dist < min_dist: min_dist, closest_edge = dist, edge
-            if closest_edge is not None and min_dist < max_dist_to_edge:
-                crack_angle = min_area_rect[2]
-                if w_rect < h_rect: crack_angle += 90
-                edge_vec = np.array(closest_edge[2:]) - np.array(closest_edge[:2])
-                edge_angle = np.degrees(np.arctan2(edge_vec[1], edge_vec[0]))
-                angle_diff = abs(edge_angle - crack_angle)
-                angle_diff = min(angle_diff, 180 - angle_diff)
-                if abs(angle_diff - 90) < angle_tolerance:
-                    x, y, w, h = cv2.boundingRect(cnt)
-                    new_crack_defects.append({"type": "L", "rect": (x, y, w, h)})
-    return new_crack_defects
 
 # ====================================================================================
 # --- 核心处理流程 ---
@@ -216,7 +207,6 @@ def preprocess_for_hough_enhanced(roi_gray, params):
     return cv2.Canny(enhanced_contrast, p["CANNY_THRESHOLD_LOW"], p["CANNY_THRESHOLD_HIGH"])
 
 def merge_lines_and_get_main_edges(lines, params):
-    # This function remains unchanged
     if lines is None or len(lines) < 1: return []
     p = params["LINE_MERGING"]
     lines_np = np.array(lines).reshape(-int(len(lines)), 4)
@@ -252,7 +242,6 @@ def merge_lines_and_get_main_edges(lines, params):
         points = np.array([pt for line in group for pt in (line[0:2], line[2:4])], dtype=np.float32)
         if len(points) < 2: continue
         line_params = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
-        if line_params is None or len(line_params) < 4: continue
         vx, vy, x0, y0 = line_params.flatten()
         projected = (points[:, 0] - x0) * vx + (points[:, 1] - y0) * vy
         pt1, pt2 = points[np.argmin(projected)], points[np.argmax(projected)]
@@ -262,15 +251,12 @@ def merge_lines_and_get_main_edges(lines, params):
     merged_lines_with_scores.sort(key=lambda item: item['score'], reverse=True)
     return [item['line'] for item in merged_lines_with_scores[:p["TOP_N_EDGES"]]]
 
-def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
+def find_and_analyze_defects(edges, roi_gray, roi_dims, binary_edges, params):
     p_defect = params["DEFECT_DETECTION"]; p_crack = params["CRACK_CLASSIFICATION"]
-    num_edges = len(edges); roi_h, roi_w = roi_dims
-    roi_center = (roi_w / 2.0, roi_h / 2.0) # --- NEW: ROI center for quadrant analysis
+    num_edges = len(edges)
+    roi_h, roi_w = roi_dims
+    center_x, center_y = roi_w / 2.0, roi_h / 2.0
     
-    grad_x = cv2.Sobel(roi_gray, cv2.CV_64F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(roi_gray, cv2.CV_64F, 0, 1, ksize=3)
-    grad_mag = np.sqrt(grad_x**2 + grad_y**2)
-
     crack_defects = []; crack_indices = set(); endpoint_proximity_threshold = 15.0 
     if num_edges >= 2:
         for i, j in combinations(range(num_edges), 2):
@@ -297,33 +283,47 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
                             crack_defects.append({"type": "L", "rect": (x,y,w,h)}); crack_indices.add(j); break
 
     true_edges = [edge for i, edge in enumerate(edges) if i not in crack_indices]
-    brightness_based_cracks = find_brightness_cracks(roi_gray, true_edges, params)
-    crack_defects.extend(brightness_based_cracks)
     
     corner_defects = []; num_true_edges = len(true_edges)
     edges_for_drawing = [edge.copy() for edge in true_edges]
     endpoint_paired_status = {i: [False, False] for i in range(num_true_edges)}
-    potential_pairs = sorted([(i, j) for i, j in combinations(range(num_true_edges), 2)], key=lambda p: min(np.linalg.norm(true_edges[p[0]][:2] - true_edges[p[1]][:2]), np.linalg.norm(true_edges[p[0]][:2] - true_edges[p[1]][2:]), np.linalg.norm(true_edges[p[0]][2:] - true_edges[p[1]][:2]), np.linalg.norm(true_edges[p[0]][2:] - true_edges[p[1]][2:])))
+    
+    if num_true_edges > 1:
+        line_quadrants = [get_line_quadrant(edge, center_x, center_y) for edge in true_edges]
+        all_pairs = list(combinations(range(num_true_edges), 2))
+
+        def sort_key_for_pairs(p):
+            i, j = p
+            q1, q2 = line_quadrants[i], line_quadrants[j]
+            quadrant_priority = 0 if are_quadrants_compatible(q1, q2) else 1
+            line1, line2 = true_edges[i], true_edges[j]
+            dist = min(np.linalg.norm(line1[:2] - line2[:2]), np.linalg.norm(line1[:2] - line2[2:]),
+                       np.linalg.norm(line1[2:] - line2[:2]), np.linalg.norm(line1[2:] - line2[2:]))
+            return (quadrant_priority, dist)
+        
+        potential_pairs = sorted(all_pairs, key=sort_key_for_pairs)
+    else:
+        potential_pairs = []
 
     for i, j in potential_pairs:
         if all(endpoint_paired_status.get(i, [True,True])) or all(endpoint_paired_status.get(j, [True,True])): continue
         line1, line2 = true_edges[i], true_edges[j]
         
-        # --- MODIFIED: Quadrant-based prioritization ---
-        q1 = get_line_quadrant(line1, roi_center)
-        q2 = get_line_quadrant(line2, roi_center)
-        quadrant_penalty_factor = 1.0 if are_quadrants_compatible(q1, q2) else 0.1 # Heavily penalize incompatible quadrants
-        
         angle_between = calculate_angle_between_lines(line1, line2)
-        base_max_dist_normal = p_defect["CORNER_MAX_EXTENSION_DIST_NORMAL"]
-        base_max_dist_perp = p_defect["CORNER_MAX_EXTENSION_DIST_PERPENDICULAR"]
-        max_extension_dist = (base_max_dist_perp if abs(angle_between - 90.0) < p_defect["PERPENDICULAR_ANGLE_TOLERANCE"] else base_max_dist_normal) * quadrant_penalty_factor
-
+        max_extension_dist = p_defect["CORNER_MAX_EXTENSION_DIST_PERPENDICULAR"] if abs(angle_between - 90.0) < p_defect["PERPENDICULAR_ANGLE_TOLERANCE"] else p_defect["CORNER_MAX_EXTENSION_DIST_NORMAL"]
+        
         intersection = find_line_intersection(line1, line2)
         if intersection is None: continue
         
         dists_i = [np.linalg.norm(intersection - line1[:2]), np.linalg.norm(intersection - line1[2:])]; endpoint_idx_i = np.argmin(dists_i)
         dists_j = [np.linalg.norm(intersection - line2[:2]), np.linalg.norm(intersection - line2[2:])]; endpoint_idx_j = np.argmin(dists_j)
+
+        # NOTE: Add "CORNER_MIN_VALID_LENGTH_FROM_INTERSECTION" to config.json
+        min_len_param = p_defect.get("CORNER_MIN_VALID_LENGTH_FROM_INTERSECTION", 5.0)
+        far_dist_i = dists_i[1 - endpoint_idx_i]
+        far_dist_j = dists_j[1 - endpoint_idx_j]
+        if far_dist_i < min_len_param or far_dist_j < min_len_param:
+            continue
 
         if endpoint_paired_status[i][endpoint_idx_i] or endpoint_paired_status[j][endpoint_idx_j]: continue
         
@@ -335,25 +335,44 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
             edges_for_drawing[i][endpoint_idx_i*2:(endpoint_idx_i*2)+2] = intersection
             edges_for_drawing[j][endpoint_idx_j*2:(endpoint_idx_j*2)+2] = intersection
             
-            p1_near_orig = line1[:2] if endpoint_idx_i == 0 else line1[2:]
-            p2_near_orig = line2[:2] if endpoint_idx_j == 0 else line2[2:]
+            if is_valid_virtual and not is_physical:
+                p1_near = line1[:2] if endpoint_idx_i == 0 else line1[2:]
+                p2_near = line2[:2] if endpoint_idx_j == 0 else line2[2:]
+                
+                # NOTE: Add a "CORNER_ENDPOINT_REFINEMENT" section to config.json
+                search_params = p_defect.get("CORNER_ENDPOINT_REFINEMENT", {})
+                if search_params.get("ENABLE", True):
+                    vec1 = intersection - p1_near; vec2 = intersection - p2_near
+                    
+                    p1_refined = refine_q_defect_endpoint(
+                        p1_near, vec1, binary_edges, 
+                        search_width=search_params.get("SEARCH_WIDTH_PX", 3),
+                        max_search_dist=search_params.get("MAX_SEARCH_DIST_PX", 50)
+                    )
+                    p2_refined = refine_q_defect_endpoint(
+                        p2_near, vec2, binary_edges,
+                        search_width=search_params.get("SEARCH_WIDTH_PX", 3),
+                        max_search_dist=search_params.get("MAX_SEARCH_DIST_PX", 50)
+                    )
+                    
+                    refined_dist_i = np.linalg.norm(intersection - p1_refined)
+                    refined_dist_j = np.linalg.norm(intersection - p2_refined)
 
-            # --- MODIFIED: New rule to suppress Q-defects at near-physical corners ---
-            min_endpoint_dist = p_defect.get("CORNER_VIRTUAL_ENDPOINT_MIN_DIST", 5)
-            is_actually_physical = dists_i[endpoint_idx_i] < min_endpoint_dist or dists_j[endpoint_idx_j] < min_endpoint_dist
-
-            if is_valid_virtual and not is_physical and not is_actually_physical:
-                p1_far_orig = line1[2:] if endpoint_idx_i == 0 else line1[:2]
-                p2_far_orig = line2[2:] if endpoint_idx_j == 0 else line2[:2]
-                new_endpoint1 = find_brightness_boundary_point(grad_mag, intersection, p1_far_orig)
-                new_endpoint2 = find_brightness_boundary_point(grad_mag, intersection, p2_far_orig)
-                corner_defects.append({"type": "Q", "center": tuple(map(int, intersection)), "endpoints": (new_endpoint1, new_endpoint2), "orig_endpoints": (p1_near_orig, p2_near_orig), "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])})
-            elif (is_physical or is_actually_physical): # A physical or near-physical corner
+                    corner_defects.append({"type": "Q", "center": tuple(map(int, intersection)), 
+                                           "endpoints": (p1_refined, p2_refined), 
+                                           "distances": (refined_dist_i, refined_dist_j)})
+                else:
+                    corner_defects.append({"type": "Q", "center": tuple(map(int, intersection)), 
+                                           "endpoints": (p1_near, p2_near), 
+                                           "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])})
+            else:
                 p1_far = line1[2:] if endpoint_idx_i == 0 else line1[:2]
                 p2_far = line2[2:] if endpoint_idx_j == 0 else line2[:2]
                 angle = calculate_vertex_angle(p1_far, intersection, p2_far)
                 deviation = abs(angle - 90.0)
-                if deviation > p_defect.get("ANGLE_DEVIATION_TOLERANCE", 2.0):
+                
+                angle_tolerance = p_defect.get("ANGLE_DEVIATION_TOLERANCE", 2.0)
+                if deviation > angle_tolerance:
                     corner_defects.append({"type": "X", "center": tuple(map(int, intersection)), "angle": angle})
 
     all_chipping_contours = []; chipping_defects = []
@@ -365,21 +384,35 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
         kernel = np.ones(tuple(p_defect.get("MERGE_DEFECTS_KERNEL_SIZE", [5, 5])), np.uint8)
         merged_mask = cv2.morphologyEx(defect_canvas, cv2.MORPH_CLOSE, kernel, iterations=2)
         final_contours, _ = cv2.findContours(merged_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
         max_width = p_defect.get("FALSE_DEFECT_MAX_WIDTH", 8.0)
         min_aspect_ratio = p_defect.get("FALSE_DEFECT_MIN_ASPECT_RATIO", 5.0)
+
         for cnt in final_contours:
-            if cv2.contourArea(cnt) < p_defect["LUMINOSITY_MIN_AREA"]: continue
+            if cv2.contourArea(cnt) < p_defect["LUMINOSITY_MIN_AREA"]:
+                continue
+
             min_area_rect = cv2.minAreaRect(cnt)
-            (w_rect, h_rect) = min_area_rect[1]
-            width, length = min(w_rect, h_rect), max(w_rect, h_rect)
+            (w, h) = min_area_rect[1]
+            width = min(w, h)
+            length = max(w, h)
+            
             if width < 1e-6: continue
+            
             aspect_ratio = length / width
-            if width < max_width and aspect_ratio > min_aspect_ratio: continue
+            
+            if width < max_width and aspect_ratio > min_aspect_ratio:
+                continue
+            
             box_points = cv2.boxPoints(min_area_rect)
+            box_points = np.intp(box_points)
+            
             chipping_defects.append({"type": "B", "box_points": box_points})
+    
     final_chipping_defects = []
     shield_radius = p_defect.get("CHIPPING_ENDPOINT_SHIELD_RADIUS", 30)
     all_endpoints = [np.array(edge[:2]) for edge in true_edges] + [np.array(edge[2:]) for edge in true_edges]
+
     if not all_endpoints:
         final_chipping_defects = chipping_defects
     else:
@@ -388,141 +421,228 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
             min_dist_to_endpoint = min(np.linalg.norm(center - ep) for ep in all_endpoints)
             if min_dist_to_endpoint > shield_radius:
                 final_chipping_defects.append(defect)
+            
     return edges_for_drawing, corner_defects + final_chipping_defects + crack_defects
 
 def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm):
-    # This function's logic remains the same as the last refactored version
-    # The new rules are applied in find_and_analyze_defects, so this function
-    # will correctly process the refined defect list.
     x, y, w, h = int(roi_template['x']), int(roi_template['y']), int(roi_template['width']), int(roi_template['height'])
     roi_gray = image_gray[y:y+h, x:x+w]
+    
     p_hough = params["HOUGH_TRANSFORM"]
     binary_edges = preprocess_for_hough_enhanced(roi_gray, params)
     min_len_pixels = roi_gray.shape[1] * p_hough.get("MIN_LINE_LENGTH_RATIO", 0.05)
     raw_lines = cv2.HoughLinesP(binary_edges, 1, np.pi / 180, p_hough["THRESHOLD"], minLineLength=min_len_pixels, maxLineGap=p_hough["MAX_LINE_GAP"])
+    
     main_edges = merge_lines_and_get_main_edges(raw_lines, params)
-    edges_for_drawing, all_defects = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, params)
+    edges_for_drawing, all_defects = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, binary_edges, params)
+    
     final_defects_for_report = []
-    min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
     for defect in all_defects:
-        defect_type = defect.get('type')
+        new_defect = {'type': defect['type']}
         location = {}
-        if defect_type == 'L':
+
+        if defect['type'] == 'L':
             x_r, y_r, w_r, h_r = defect.get('rect', (0,0,0,0))
-            if not (w_r > 0 and h_r > 0): continue
-            mean_brightness = cv2.mean(roi_gray[y_r:y_r+h_r, x_r:x_r+w_r])[0]
-            if mean_brightness > 100: continue
-            location['x'] = int(x_r + w_r//2 + x)
-            location['y'] = int(y_r + h_r//2 + y)
-            length_px, width_px = max(w_r, h_r), min(w_r, h_r)
-            location['length_mm'] = float(round(length_px / pixels_per_mm, 2))
-            location['width_mm'] = float(round(width_px / pixels_per_mm, 2))
-            if location['length_mm'] < min_size_mm: continue
-            if location['length_mm'] * location['width_mm'] > 1000: continue
-        elif defect_type == 'B':
-            box_points = defect.get('box_points')
-            if box_points is None or len(box_points) < 4: continue
-            mask = np.zeros_like(roi_gray, dtype=np.uint8)
-            cv2.fillPoly(mask, [np.intp(box_points)], 255)
-            mean_brightness = cv2.mean(roi_gray, mask=mask)[0]
-            if mean_brightness > 100: continue
-            center = np.mean(box_points, axis=0)
-            location['x'] = int(center[0]) + x
-            location['y'] = int(center[1]) + y
-            d1 = np.linalg.norm(np.array(box_points[0]) - np.array(box_points[1]))
-            d2 = np.linalg.norm(np.array(box_points[1]) - np.array(box_points[2]))
-            length_px, width_px = max(d1, d2), min(d1, d2)
-            location['length_mm'] = float(round(length_px / pixels_per_mm, 2))
-            location['width_mm'] = float(round(width_px / pixels_per_mm, 2))
-            if location['length_mm'] < min_size_mm: continue
-            area_mm2 = location['length_mm'] * location['width_mm']
-            aspect_ratio = location['length_mm'] / location['width_mm'] if location['width_mm'] > 1e-6 else float('inf')
-            if (area_mm2 > 80 and aspect_ratio > 3.2) or (aspect_ratio > 6.0): continue
-        elif defect_type == 'Q':
-            if 'endpoints' not in defect: continue
-            center_np = np.array(defect.get('center', (0,0)))
-            v1_final, v2_final = np.array(defect["endpoints"][0]), np.array(defect["endpoints"][1])
-            pixel_area = 0.5 * abs(center_np[0]*(v1_final[1]-v2_final[1]) + v1_final[0]*(v2_final[1]-center_np[1]) + v2_final[0]*(center_np[1]-v1_final[1]))
-            if pixel_area < 15: continue
-            location['pixel_area'] = round(pixel_area, 2)
-            location['x'] = int(center_np[0] + x)
-            location['y'] = int(center_np[1] + y)
-            dist_leg1_px = np.linalg.norm(center_np - v1_final)
-            dist_leg2_px = np.linalg.norm(center_np - v2_final)
-            location['length_mm'] = float(round(max(dist_leg1_px, dist_leg2_px) / pixels_per_mm, 2))
-            location['width_mm'] = float(round(min(dist_leg1_px, dist_leg2_px) / pixels_per_mm, 2))
-            if location['length_mm'] * location['width_mm'] < 2.25: continue
-            if location['width_mm'] == 0 or location['length_mm'] / location['width_mm'] > 3.0: continue
-        elif defect_type == 'X':
-            center = defect.get('center', (0,0))
+            if w_r > 0 and h_r > 0:
+                defect_sub_roi = roi_gray[y_r:y_r+h_r, x_r:x_r+w_r]
+                mean_brightness = cv2.mean(defect_sub_roi)[0]
+                if mean_brightness > 50:
+                    continue
+            else:
+                continue
+
+        if defect['type'] == 'X':
+            center = defect.get('center', (0, 0))
             location['x'] = int(center[0] + x)
-            location['y'] = int(center[1]) + y
+            location['y'] = int(center[1] + y)
             location['angle'] = float(round(defect.get('angle', 0.0), 2))
         else:
-            continue
-        new_defect = {'type': defect_type, 'location': location, 'raw_defect': defect}
+            length_px, width_px = 0.0, 0.0
+            if defect['type'] == 'Q':
+                center = defect.get('center', (0, 0))
+                location['x'] = int(center[0] + x)
+                location['y'] = int(center[1] + y)
+
+                if 'endpoints' in defect and 'distances' in defect:
+                    center_np = np.array(center)
+                    v1_final, v2_final = np.array(defect["endpoints"][0]), np.array(defect["endpoints"][1])
+                    
+                    pixel_area = 0.5 * abs(center_np[0]*(v1_final[1]-v2_final[1]) + v1_final[0]*(v2_final[1]-center_np[1]) + v2_final[0]*(center_np[1]-v1_final[1]))
+                    location['pixel_area'] = round(pixel_area, 2)
+
+                    #if pixel_area < 15:
+                    #    continue
+                    #
+                    dist_leg1_px = np.linalg.norm(center_np - v1_final)
+                    dist_leg2_px = np.linalg.norm(center_np - v2_final)
+                    length_px = max(dist_leg1_px, dist_leg2_px)
+                    width_px  = min(dist_leg1_px, dist_leg2_px)
+                else:
+                    length_px, width_px = 0.0, 0.0
+            
+            elif defect['type'] == 'L':
+                lx, ly, lw, lh = defect.get('rect', (0,0,0,0))
+                location['x'] = int(lx + lw//2 + x)
+                location['y'] = int(ly + lh//2 + y)
+                length_px, width_px = max(lw, lh), min(lw, lh)
+
+            elif defect['type'] == 'B':
+                box = defect.get('box_points', [])
+                if len(box) >= 4:
+                    center = np.mean(box, axis=0)
+                    location['x'] = int(center[0]) + x
+                    location['y'] = int(center[1]) + y
+                    d1 = np.linalg.norm(np.array(box[0]) - np.array(box[1]))
+                    d2 = np.linalg.norm(np.array(box[1]) - np.array(box[2]))
+                    length_px, width_px = max(d1, d2), min(d1, d2)
+
+            location['length_mm'] = float(round(length_px / pixels_per_mm, 2))
+            location['width_mm'] = float(round(width_px / pixels_per_mm, 2))
+
+        new_defect['location'] = location
+        
+        min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
+        if new_defect['type'] == 'Q':
+            if location.get('length_mm', 0) * location.get('width_mm', 0) < 1 or (width_px > 1e-6 and location.get('length_mm', 0) / location.get('width_mm', 0) > 3.0):
+                continue
+        elif new_defect['type'] in ['L', 'B']:
+            if location.get('length_mm', 0) < min_size_mm:
+                continue
+
+        if new_defect['type'] == 'L':
+            if location.get('length_mm', 0) * location.get('width_mm', 0) > 1000:
+                continue
+        
+        if new_defect['type'] == 'B':
+            length_mm = location.get('length_mm', 0)
+            width_mm = location.get('width_mm', 0)
+            area_mm2 = length_mm * width_mm
+            aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
+            
+            if area_mm2 > 80 and aspect_ratio > 3.2:
+                continue
+            if aspect_ratio > 6.0:
+                continue
+
+        new_defect['raw_defect'] = defect 
         final_defects_for_report.append(new_defect)
-    roi_report = {"roi_idx": roi_idx, "x": x, "y": y, "w": w, "h": h, "defects": [d.copy() for d in final_defects_for_report], "edges_found": len(main_edges)}
-    for d in roi_report['defects']: d.pop('raw_defect', None)
+        
+    roi_report = {
+        "roi_idx": roi_idx, "x": x, "y": y, "w": w, "h": h,
+        "defects": [d.copy() for d in final_defects_for_report],
+        "edges_found": len(main_edges)
+    }
+    for d in roi_report['defects']:
+        d.pop('raw_defect', None)
+
     roi_color = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
     DEFECT_COLORS_BGR = {'Q': (0, 0, 255), 'X': (0, 255, 255), 'L': (255, 0, 255), 'B': (0, 165, 255)}
     p_vis = params["VISUALIZATION"]
     THICKNESS = 3
+    
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
+    
     for edge in edges_for_drawing:
-        pt1 = tuple(map(int, edge[:2])); pt2 = tuple(map(int, edge[2:]))
+        pt1 = tuple(map(int, edge[:2]))
+        pt2 = tuple(map(int, edge[2:]))
         cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
+
     annotations_to_draw = []
+    
     for defect_report in final_defects_for_report:
-        defect = defect_report['raw_defect']; color_bgr = DEFECT_COLORS_BGR.get(defect["type"], (255, 255, 255)); loc = defect_report['location']
-        defect_type_map = {'Q': '缺角', 'B': '崩边', 'X': '斜边', 'L': '裂纹'}; type_str = defect_type_map.get(defect_report['type'], '未知')
-        if defect_report['type'] == 'X': text = f"{type_str}: ({loc['x']}, {loc['y']}), 角度: {loc['angle']:.1f}°"
-        elif defect_report['type'] == 'Q' and 'pixel_area' in loc: text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm, 面积: {loc['pixel_area']:.0f}px"
-        else: text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm"
+        defect = defect_report['raw_defect']
+        color_bgr = DEFECT_COLORS_BGR.get(defect["type"], (255, 255, 255))
+        
+        loc = defect_report['location']
+        defect_type_map = {'Q': '缺角', 'B': '崩边', 'X': '斜边', 'L': '裂纹'}
+        type_str = defect_type_map.get(defect_report['type'], '未知')
+        
+        if defect_report['type'] == 'X':
+            text = f"{type_str}: ({loc['x']}, {loc['y']}), 角度: {loc['angle']:.1f}°"
+        elif defect_report['type'] == 'Q' and 'pixel_area' in loc:
+            text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm, 面积: {loc['pixel_area']:.0f}px"
+        else:
+            text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm"
+        
         annotations_to_draw.append({'text': text, 'color': color_bgr})
+
         if defect["type"] == "Q" and "endpoints" in defect:
-            center = np.array(defect["center"]); v1_final, v2_final = np.array(defect["endpoints"][0]), np.array(defect["endpoints"][1]); p1_orig, p2_orig = np.array(defect["orig_endpoints"][0]), np.array(defect["orig_endpoints"][1]); v1_dashed, v2_dashed = v1_final, v2_final
-            if "distances" in defect:
-                retreat_threshold = p_vis.get("RETREAT_DISTANCE_THRESHOLD", 100.0); retreat_len = p_vis.get("EDGE_ENDPOINT_FIXED_LENGTH", 20); dist1, dist2 = defect["distances"]
-                if dist1 > retreat_threshold: v1_dashed = center + ((p1_orig - center) / dist1) * retreat_len
-                if dist2 > retreat_threshold: v2_dashed = center + ((p2_orig - center) / dist2) * retreat_len
-            triangle_vertices = np.array([tuple(map(int, center)), tuple(map(int, v1_final)), tuple(map(int, v2_final))], dtype=np.int32)
-            overlay = roi_color.copy(); cv2.fillPoly(overlay, [triangle_vertices], color_bgr); cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
+            center = tuple(map(int, defect["center"]))
+            v1_final = tuple(map(int, defect["endpoints"][0]))
+            v2_final = tuple(map(int, defect["endpoints"][1]))
+
+            triangle_vertices = np.array([center, v1_final, v2_final], dtype=np.int32)
+            overlay = roi_color.copy()
+            cv2.fillPoly(overlay, [triangle_vertices], color_bgr)
+            cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
             blue_color = (255, 0, 0)
-            draw_dashed_line(roi_color, tuple(map(int, center)), tuple(map(int, v1_dashed)), blue_color, thickness=2, dash_length=8)
-            draw_dashed_line(roi_color, tuple(map(int, center)), tuple(map(int, v2_dashed)), blue_color, thickness=2, dash_length=8)
-        elif defect["type"] == "X" and "center" in defect: cv2.circle(roi_color, defect["center"], 15, color_bgr, THICKNESS)
+            draw_dashed_line(roi_color, center, v1_final, blue_color, thickness=2, dash_length=8)
+            draw_dashed_line(roi_color, center, v2_final, blue_color, thickness=2, dash_length=8)
+
+        elif defect["type"] == "X" and "center" in defect:
+            cv2.circle(roi_color, defect["center"], 15, color_bgr, THICKNESS)
+            
         elif defect["type"] == "L" and "rect" in defect:
-            x_r, y_r, w_r, h_r = defect["rect"]; overlay = roi_color.copy(); cv2.rectangle(overlay, (x_r, y_r), (x_r + w_r, y_r + h_r), color_bgr, -1); cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color); cv2.rectangle(roi_color, (x_r, y_r), (x_r + w_r, y_r + h_r), color_bgr, THICKNESS)
+            x_r, y_r, w_r, h_r = defect["rect"]
+            overlay = roi_color.copy()
+            cv2.rectangle(overlay, (x_r, y_r), (x_r + w_r, y_r + h_r), color_bgr, -1)
+            cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
+            cv2.rectangle(roi_color, (x_r, y_r), (x_r + w_r, y_r + h_r), color_bgr, THICKNESS)
+            
         elif defect["type"] == "B" and "box_points" in defect:
-            box_points = np.intp(defect["box_points"]); overlay = roi_color.copy(); cv2.fillPoly(overlay, [box_points], color_bgr); cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color); cv2.drawContours(roi_color, [box_points], 0, color_bgr, THICKNESS)
+            box_points = defect["box_points"]
+            overlay = roi_color.copy()
+            cv2.fillPoly(overlay, [box_points], color_bgr)
+            cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
+            cv2.drawContours(roi_color, [box_points], 0, color_bgr, THICKNESS)
+
     if annotations_to_draw and PIL_AVAILABLE and ANNOTATION_FONT:
-        pil_img = Image.fromarray(cv2.cvtColor(roi_color, cv2.COLOR_BGR2RGB)); draw = ImageDraw.Draw(pil_img)
-        y_text = 10; padding = 10
+        pil_img = Image.fromarray(cv2.cvtColor(roi_color, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_img)
+        
+        y_text = 10
+        padding = 10
         for ann in annotations_to_draw:
-            text = ann['text']; color_rgb = tuple(reversed(ann['color']))
+            text = ann['text']
+            color_rgb = tuple(reversed(ann['color']))
+            
             if hasattr(draw, 'textbbox'):
-                bbox = draw.textbbox((0,0), text, font=ANNOTATION_FONT); text_width, text_height = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            else: text_width, text_height = draw.textsize(text, font=ANNOTATION_FONT)
+                bbox = draw.textbbox((0,0), text, font=ANNOTATION_FONT)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+            else:
+                 text_width, text_height = draw.textsize(text, font=ANNOTATION_FONT)
+
             x_text = w - text_width - 10
+            
             draw.text((x_text, y_text), text, font=ANNOTATION_FONT, fill=color_rgb)
+            
             y_text += text_height + padding
+            
         roi_color = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
     return roi_report, roi_color
 
 def process_image_from_memory_parallel(image_gray, template_rois, config):
-    # This function remains unchanged
     final_image = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
     report = {"image_status": "OK", "defects": [] , "state_code": 0, "rois": []}
+
     hough_params = config.get('hough_inspector_params')
-    if not hough_params: raise ValueError("Configuration error: 'hough_inspector_params' section not found in the config file.")
+    if not hough_params:
+        raise ValueError("Configuration error: 'hough_inspector_params' section not found in the config file.")
+
     sys_params = config.get('system_params', {})
     pixels_per_mm = float(sys_params.get('pixels_per_mm', 1.0))
-    try: roi_threads_cfg = int(sys_params.get('roi_threads', 0) or 0)
-    except Exception: roi_threads_cfg = 0
+
+    try:
+        roi_threads_cfg = int(sys_params.get('roi_threads', 0) or 0)
+    except Exception:
+        roi_threads_cfg = 0
+    
     cpu_workers = multiprocessing.cpu_count()
     auto_workers = min(cpu_workers, len(template_rois))
     num_workers = auto_workers if roi_threads_cfg <= 0 else max(1, min(roi_threads_cfg, len(template_rois)))
+
     def _safe_roi_hough(i, r):
         try:
             return process_roi_hough_based(i, r, image_gray, hough_params, pixels_per_mm)
@@ -530,23 +650,33 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
             print(f"Error processing ROI {i}: {e}")
             x, y, w, h = int(r.get('x',0)), int(r.get('y',0)), int(r.get('width',0)), int(r.get('height',0))
             roi_bgr = np.zeros((h, w, 3), dtype=np.uint8)
-            try: roi_bgr = cv2.cvtColor(image_gray[y:y+h, x:x+w], cv2.COLOR_GRAY2BGR)
-            except Exception: pass
+            try:
+                roi_gray_crop = image_gray[y:y+h, x:x+w]
+                roi_bgr = cv2.cvtColor(roi_gray_crop, cv2.COLOR_GRAY2BGR)
+            except Exception:
+                 pass
             return ({"roi_idx": i, "x": x, "y": y, "w": w, "h": h, "defects": [], "edges_found": 0}, roi_bgr)
+
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(_safe_roi_hough, i, r) for i, r in enumerate(template_rois)]
         results = [future.result() for future in futures]
+
     max_edges_found = 0
     for roi_report, roi_color in results:
         if "x" not in roi_report: continue
         x, y, w, h = roi_report["x"], roi_report["y"], roi_report["w"], roi_report["h"]
         if w > 0 and h > 0: final_image[y:y+h, x:x+w] = roi_color
+        
         max_edges_found = max(max_edges_found, roi_report.get("edges_found", 0))
+        
         if roi_report.get("defects"):
             report["image_status"] = "NG"
             report["defects"].extend(roi_report["defects"])
+            
         slim_report = {k: roi_report.get(k) for k in ("roi_idx","x","y","w","h","edges_found")}
         report['rois'].append(slim_report)
+
     report["state_code"] = 1 if max_edges_found > 0 else 0
+    
     return report, final_image
-# --- END OF FILE image_processor_hough.py (Amended with quadrant logic and refined rules) ---
+# --- END OF FILE image_processor_hough.py (Corrected for New Filtering Rules) ---
