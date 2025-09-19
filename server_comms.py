@@ -1,8 +1,10 @@
 # --- START OF FILE server_comms.py (修改后) ---
 import requests
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit
+import time
+import threading
 
 
 def _mask_port(url: str) -> str:
@@ -97,35 +99,45 @@ def fetch_collection_id_from_server(settings, collection_id_var):
 # --- 以下函数被修改为非阻塞 ---
 # =================================================================
 
-def periodic_stats_pusher(stop_event, counters, settings, metadata_vars, http_client):
-    """(修改) 后台线程，周期性地将产量推送到服务器。"""
-    (yield_counter, rejection_counter) = counters
-    collection_id_var = metadata_vars
-    push_interval = int(getattr(settings, 'stats_push_interval_s', 601) or 601)
-    print(f"[统计推送线程]: 已启动，推送周期: {push_interval}秒。")
-
+## 删除 periodic_stats_pusher：仅保留事件触发剔废广播。
+def periodic_stats_pusher(settings, collection_id_var, yield_counter, rejection_counter, http_client, stop_event, interval_s: float = 30.0):
+    """(改造) 每日 00:00:05 执行一次：
+    1. 重新获取 collection_id
+    2. 推送一次当前产量/剔废统计
+    兼容旧 interval_s 参数但不再按固定秒循环推送，只做日界刷新。"""
+    print("[统计推送线程]: 已启动 (模式=每日定时 00:00:05)")
+    last_run_date = None
     while not stop_event.is_set():
-        if stop_event.wait(timeout=push_interval):
+        now = datetime.now()
+        current_date = now.date()
+        # 计算今日触发时间点
+        trigger_time = now.replace(hour=0, minute=0, second=5, microsecond=0)
+        # 若当前时间已过触发点且今天还没执行
+        if now >= trigger_time and current_date != last_run_date:
+            try:
+                print("[统计推送线程]: 日切换执行 -> 刷新 collection_id 并推送统计")
+                fetch_collection_id_from_server(settings, collection_id_var)
+            except Exception as e:
+                print(f"[统计推送线程]: 刷新 collection_id 失败: {e}")
+            try:
+                broadcast_yield_and_rejections(settings, collection_id_var, yield_counter, rejection_counter, http_client)
+            except Exception as e:
+                print(f"[统计推送线程]: 推送统计失败: {e}")
+            last_run_date = current_date
+        # 休眠：若未到触发点，按较长间隔睡眠；接近触发点时缩短
+        if stop_event.is_set():
             break
-
-        # 获取ID仍然是同步的，因为我们需要它来构建payload
-        fetch_collection_id_from_server(settings, collection_id_var)
-        if int(collection_id_var.value) < 0:
-            print("    [统计推送]: 获取 collection_id 失败，跳过本次推送。")
-            continue
-
-        payload = {
-            "collectionId": int(collection_id_var.value),
-            "lineName": settings.lineName,
-            "yield": int(yield_counter.value),
-            "rejection": int(rejection_counter.value)
-        }
-
-        # 使用非阻塞客户端发送请求
-        print(f"    [统计推送]: 准备推送数据")
-        http_client.post(settings.stats_push_url, json=payload, timeout=getattr(settings, 'http_post_timeout_s', 10))
-
-    print("[统计推送线程]: 已停止。")
+        # 距离下一次 00:00:05 的秒数
+        if now < trigger_time:
+            secs = (trigger_time - now).total_seconds()
+            sleep_s =  min(60.0, max(1.0, secs/10))
+        else:
+            # 已执行，睡到明天 00:00:05 附近
+            tomorrow_trigger = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+            secs = (tomorrow_trigger - now).total_seconds()
+            sleep_s = min(300.0, max(5.0, secs/20))
+        time.sleep(sleep_s)
+    print("[统计推送线程]: 已停止")
 
 
 def send_report_to_server(json_report, image_buffer, server_url, http_client, upload_timeout_s: float | None = None):
@@ -142,7 +154,11 @@ def send_report_to_server(json_report, image_buffer, server_url, http_client, up
     except ValueError:
         time_str = "000000"
     cam_index = json_report.get("camera_index", "X")
-    image_filename = f"{time_str}_{collection_id}_Cam{cam_index}.jpg"
+    try:
+        cam_display = int(cam_index) + 1
+    except Exception:
+        cam_display = cam_index
+    image_filename = f"{time_str}_{collection_id}_Cam{cam_display}.jpg"
 
     # 文件内容和名称
     file_data = (image_filename, image_buffer, 'image/jpeg')
@@ -153,9 +169,42 @@ def send_report_to_server(json_report, image_buffer, server_url, http_client, up
     http_client.post_files(server_url, files=file_data, json_payload=json_report, timeout_s=upload_timeout_s)
 
 
-def broadcast_yield_and_rejection(settings, collection_id, yield_count, rejection_count, http_client):
-    """(修改) 使用非阻塞客户端广播最新的产量和剔废量。"""
-    # 兼容多种类型，解析为整数
+def send_reports_batch_to_server(json_reports, image_buffers, server_url, http_client, upload_timeout_s: float | None = None):
+    """批量上传：json_reports 与 image_buffers 对应；form-data 中：
+    - 多个 fileList 字段，每个一张图片 (filename, bytes, 'image/jpeg')
+    - 一个 payload 字段，内容为 JSON 数组字符串
+    不附加其他冗余字段。"""
+    files_list = []
+    sanitized_reports = []
+    for rpt, img_buf in zip(json_reports, image_buffers):
+        collection_id = rpt.get("collection_id", -1)
+        try:
+            collection_id = int(collection_id)
+        except Exception:
+            collection_id = -1
+        rejection_time_str = rpt.get("rejection_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        try:
+            rejection_dt = datetime.strptime(rejection_time_str, "%Y-%m-%d %H:%M:%S")
+            time_str = rejection_dt.strftime('%H%M%S')
+        except ValueError:
+            time_str = "000000"
+        cam_index = rpt.get("camera_index", "X")
+        try:
+            cam_display = int(cam_index) + 1
+        except Exception:
+            cam_display = cam_index
+        image_filename = f"{time_str}_{collection_id}_Cam{cam_display}.jpg"
+        if img_buf:
+            files_list.append((image_filename, img_buf, 'image/jpeg'))
+        sanitized_reports.append(rpt)
+    if not sanitized_reports:
+        return
+    print(f"    [上传模块]: 正在批量提交 {len(sanitized_reports)} 份报告 (fileList 模式)")
+    http_client.post_files_batch(server_url, files_list, sanitized_reports, timeout_s=upload_timeout_s)
+
+
+def broadcast_rejections(settings, collection_id, rejection_count, http_client):
+    """广播剔废数量（删除产量字段）。"""
     try:
         cid_raw = getattr(collection_id, 'value', collection_id)
         if isinstance(cid_raw, (bytes, bytearray)):
@@ -168,10 +217,26 @@ def broadcast_yield_and_rejection(settings, collection_id, yield_count, rejectio
 
     payload = {
         "collectionId": cid_int,
-        "yield": int(yield_count.value),
         "rejection": int(rejection_count.value)
     }
+    target_url = f"http://{settings.server}:8085/fastapi/glass/updateRejections"
+    http_client.post(target_url, json=payload, timeout=getattr(settings, 'http_post_timeout_s', 5))
+
+def broadcast_yield_and_rejections(settings, collection_id, yield_counter, rejection_counter, http_client):
+    """同时广播产量与剔废到 /updateYieldAndRejections 接口。"""
+    try:
+        cid_raw = getattr(collection_id, 'value', collection_id)
+        if isinstance(cid_raw, (bytes, bytearray)):
+            cid_str = cid_raw.decode('utf-8', errors='replace')
+        else:
+            cid_str = str(cid_raw)
+        cid_int = int(cid_str)
+    except Exception:
+        cid_int = -1
+    payload = {
+        'collectionId': cid_int,
+        'yield': int(yield_counter.value),
+        'rejection': int(rejection_counter.value)
+    }
     target_url = f"http://{settings.server}:8085/fastapi/glass/updateYieldAndRejections"
-    
-    # 提交非阻塞POST请求
     http_client.post(target_url, json=payload, timeout=getattr(settings, 'http_post_timeout_s', 5))

@@ -26,7 +26,7 @@ def create_app(num_cameras, shared_objects):
     stop_event_mp, run_event_mp = shared_objects['stop_event'], shared_objects['run_event']
     shared_camera_states = shared_objects['camera_states']
     shared_settings = shared_objects['settings']
-    counters = shared_objects['counters']
+    counters = shared_objects['counters']  # (rejection_counter, yield_counter)
     queues = shared_objects['queues']
     flags = shared_objects['flags']
     machine_state_shared = shared_objects['machine_state']
@@ -67,15 +67,47 @@ def create_app(num_cameras, shared_objects):
         ), daemon=True)
         app.state.state_machine_thread.start()
 
-        threading.Thread(target=periodic_stats_pusher, args=(
-            thread_stop_event, counters, shared_settings, metadata[0], http_client
-        ), daemon=True).start()
+        # 启动周期统计推送线程（可配置开关）
+        try:
+            sys_params = getattr(shared_settings, 'system_params', None) or {}
+        except Exception:
+            sys_params = {}
+        enable_stats = True
+        try:
+            enable_stats = bool(getattr(shared_settings, 'enable_periodic_stats'))
+        except Exception:
+            # fallback to config dict if stored
+            enable_stats = bool(sys_params.get('enable_periodic_stats', True)) if isinstance(sys_params, dict) else True
+        interval_s = 30.0
+        try:
+            interval_s = float(getattr(shared_settings, 'stats_push_interval_s'))
+        except Exception:
+            if isinstance(sys_params, dict):
+                try:
+                    interval_s = float(sys_params.get('stats_push_interval_s', 30) or 30)
+                except Exception:
+                    interval_s = 30.0
+        if enable_stats and interval_s > 0:
+            app.state.stats_thread_stop = threading.Event()
+            app.state.stats_thread = threading.Thread(
+                target=periodic_stats_pusher,
+                args=(shared_settings, metadata[0], counters[1], counters[0], http_client, app.state.stats_thread_stop, interval_s),
+                daemon=True
+            )
+            app.state.stats_thread.start()
+        else:
+            app.state.stats_thread = None
+            app.state.stats_thread_stop = None
         
         yield
         
         print("[主进程]: FastAPI 应用关闭...")
         thread_stop_event.set()
         app.state.state_machine_thread.join(timeout=2)
+        if getattr(app.state, 'stats_thread_stop', None):
+            app.state.stats_thread_stop.set()
+        if getattr(app.state, 'stats_thread', None):
+            app.state.stats_thread.join(timeout=2)
 
     app = FastAPI(title="Glass Detection System", lifespan=lifespan)
     try:
@@ -116,13 +148,9 @@ def create_app(num_cameras, shared_objects):
         app.state.run_event.clear()
         return {"code": 200, "message": "检测已暂停", "data": {"status": "stopped"}}
 
-    @app.get("/yield")
-    def get_yield(): 
-        return {"code": 200, "message": "获取产量成功", "data": {"yield": counters[0].value}}
-
     @app.get("/rejections")
     def get_rejections(): 
-        return {"code": 200, "message": "获取剔废数量成功", "data": {"rejections": counters[1].value}}
+        return {"code": 200, "message": "获取剔废数量成功", "data": {"rejections": counters[0].value, "yield": counters[1].value}}
             
     @app.websocket("/ws/stream/{cam_index}")
     async def websocket_endpoint(websocket: WebSocket, cam_index: int):
@@ -142,9 +170,9 @@ def create_app(num_cameras, shared_objects):
         return {"code": 200, "message": msg, "data": {"rejection_mode": rejectionMode}}
 
     @app.post("/control/thresholds")
-    async def set_rejection_thresholds(rejectionThreshold: str = Body(...)):
+    async def set_rejection_thresholds(rejectionThreshold: int = Body(...)):
         try:
-            new_threshold = int(rejectionThreshold.replace("mm", "").strip())
+            new_threshold = rejectionThreshold
             old_value = shared_settings.max_defect_size_mm
             shared_settings.max_defect_size_mm = new_threshold
             msg = f"剔废阈值已更新: {old_value} -> {new_threshold}"
@@ -210,5 +238,37 @@ def create_app(num_cameras, shared_objects):
             http_client.post(shared_settings.heartbeat_url, json=status_data, timeout=shared_settings.http_post_timeout_s)
         except Exception as e:
             print(f"[状态上报]: 提交任务时发生本地错误: {e}")
+
+    # ========== 算法模式切换 (1=浅色 2=深色) ==========
+    @app.get("/algorithmMode")
+    def get_algorithm_mode():
+        mode = int(getattr(shared_settings, 'algorithm_mode', 1))
+        return {"code": 200, "message": "获取成功", "data": {"mode": mode}}
+
+    class AlgoModeBody(BaseModel):
+        mode: int
+
+    @app.post("/control/algorithmMode")
+    async def set_algorithm_mode(algorithmMode: int = Body(...)):
+        new_mode = algorithmMode
+        if new_mode not in (1, 2):
+            return {"code": 400, "message": "mode 只能为 1(浅色) 或 2(深色)"}
+        old_mode = int(getattr(shared_settings, 'algorithm_mode', 1))
+        if new_mode == old_mode:
+            return {"code": 200, "message": "模式未变化", "data": {"mode": new_mode}}
+        setattr(shared_settings, 'algorithm_mode', new_mode)
+        print(f"[API]: 算法模式切换 {old_mode} -> {new_mode}")
+        # 通过所有 websocket 通道广播模式变化事件
+        try:
+            payload = {"event": "algorithmModeChanged", "mode": new_mode}
+            # broadcast to all camera groups
+            for cam_idx in range(num_cameras):
+                try:
+                    asyncio.create_task(connection_manager.broadcast_json(payload, cam_idx))
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[API]: 广播算法模式变更失败: {e}")
+        return {"code": 200, "message": "模式已更新", "data": {"old_mode": old_mode, "new_mode": new_mode}}
 
     return app

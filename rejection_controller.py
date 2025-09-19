@@ -40,7 +40,7 @@ class RejectionController:
         if cam_index == -1:
             print(f"🔥🔥🔥 [剔除控制器]: 正在发送剔除信号 (持续 {pulse_duration_ms}ms)...")
         else:
-            print(f"🔥🔥🔥 [剔除控制器]: 相机 {cam_index} 正在发送剔除信号 (持续 {pulse_duration_ms}ms)...")
+            print(f"🔥🔥🔥 [剔除控制器]: 相机 {cam_index+1} 正在发送剔除信号 (持续 {pulse_duration_ms}ms)...")
 
         # 示例（使用pyserial库）:
         # if self.ser:

@@ -217,11 +217,21 @@ def main():
     shared_settings.REJECTION_DELAY_S = rejection_params.get('REJECTION_DELAY_S', 1.5)
     shared_settings.storage_path = config.get('storage_path', 'inspection_results')
     shared_settings.pixels_per_mm = system_params.get('pixels_per_mm', 2.4)
+    # 新增: 算法模式 (1=浅色 2=深色) 默认1
+    shared_settings.algorithm_mode = 1
     shared_settings.lineName = config.get('lineName', 'UNKNOWN_LINE')
     shared_settings.server = server_config.get('server', '127.0.0.1')
     shared_settings.upload_url = server_config.get('upload_url', f'http://{shared_settings.server}:5000/upload')
-    shared_settings.stats_push_url = server_config.get('stats_push_url', f'http://{shared_settings.server}:8085/fastapi/glass/updateYieldAndRejections')
+    # 修改：仅剔废上报端点
+    shared_settings.stats_push_url = server_config.get('stats_push_url', f'http://{shared_settings.server}:8085/fastapi/glass/updateRejections')
     shared_settings.heartbeat_url = server_config.get('heartbeat_url', f'http://{shared_settings.server}:8085/fastapi/system/heartbeat')
+    # 周期推送控制参数
+    sys_params_root = config.get('system_params', {}) or {}
+    shared_settings.enable_periodic_stats = bool(sys_params_root.get('enable_periodic_stats', True))
+    try:
+        shared_settings.stats_push_interval_s = float(sys_params_root.get('stats_push_interval_s', 30) or 30)
+    except Exception:
+        shared_settings.stats_push_interval_s = 30.0
     
     # 读取报警器配置
     alarm_params = config.get('alarm_light_params', {})
@@ -238,6 +248,7 @@ def main():
     
     # Shared state
     shared_camera_states = manager.dict()
+    # 恢复产量 + 剔废统计
     shared_yield_counter = manager.Value('i', 0)
     shared_rejection_counter = manager.Value('i', 0)
     manual_reject_flag = manager.Value('b', False)
@@ -301,7 +312,7 @@ def main():
         'stop_event': stop_event, 'run_event': run_event,
         'camera_states': shared_camera_states,
         'settings': shared_settings,
-        'counters': (shared_yield_counter, shared_rejection_counter),
+        'counters': (shared_rejection_counter, shared_yield_counter),  # 顺序: 0=rejections 1=yield
         'queues': {'task': task_queue, 'results': results_queue, 'rejection': rejection_queue},
         'flags': (manual_reject_flag, shared_rejection_mode, can_late_reject),
         'machine_state': machine_state_shared,
@@ -309,7 +320,7 @@ def main():
         'metadata': (shared_collection_id, shared_user_id_auto, shared_user_id_manual),
         'rejection_controller': rejection_controller,
         'alarm_light_controller': alarm_light_controller, # <-- 传递安全的代理对象
-        'http_client': http_client
+    'http_client': http_client
     }
 
     app = create_app(num_cameras=NUM_CAMERAS, shared_objects=shared_objects)

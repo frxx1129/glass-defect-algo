@@ -51,8 +51,11 @@ inspection_results/
 *.bmp
 *.tiff
 *.svg
-*.ico
 *.mp4
 *.avi
 *.mkv
 *.mov
+
+*_results/
+*_output/
+*_reports/

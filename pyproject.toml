@@ -27,5 +27,8 @@ dependencies = [
 	"scikit-learn>=1.4.0",
 	"nuitka>=2.3",
 	"scipy>=1.12.0",  # 打包命令中引用 --include-package=scipy
-	"pyserial"
+	"pyserial",
+	"opencv-contrib-python",
+	"tqdm",
+	"Pillow"
 ]

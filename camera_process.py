@@ -316,100 +316,127 @@ def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, 
         num_cameras = num_devices  # 使用 MVEnumerateAllDevices 的结果继续
     
     if num_cameras == 0:
-        print("[相机池]: 未检测到物理相机，进入测试模式...")
+        # ---------------- 新的模拟模式实现 ----------------
+        # 要求：5路相机分别播放 4,5,4,5,4.avi；所有相机统一使用 cam5_roi_averaged_by_group.json 的 ROI 组
+        print("[相机池]: 未检测到物理相机，进入'视频回放+统一ROI'模拟模式...")
         setup_tool.cleanup()
-        from synthetic_test_scene import SyntheticGlassScene
+        import cv2, os
+
+        # 读取期望的模拟相机数量（默认 5 以满足需求；向下兼容用户配置）
         try:
-            test_cameras = int((config.get('camera_setup', {}) or {}).get('expected_cameras', 1) or 1)
+            test_cameras = int((config.get('camera_setup', {}) or {}).get('expected_cameras', 5) or 5)
         except Exception:
-            test_cameras = 1
+            test_cameras = 5
         if test_cameras <= 0:
-            test_cameras = 1
+            test_cameras = 5
+        test_cameras = min(test_cameras, 5)  # 映射只定义到 5 路
+
         acq = (config.get('camera_setup', {}) or {}).get('unified_params', {}).get('acquisition', {})
         cam_w = int(acq.get('width', 1280) or 1280)
         cam_h = int(acq.get('height', 960) or 960)
-        runtime = (config.get('camera_setup') or {}).get('runtime', {})
-        legacy_sys = (config.get('system_params') or {})
-        frame_rate = float(acq.get('frame_rate', runtime.get('frame_rate', legacy_sys.get('target_fps', 15))) or runtime.get('target_fps', legacy_sys.get('target_fps', 15)) or 15)
-        # 设定每"行"间隔 = 1/frame_rate 秒 -> 每个相机每秒也近似输出 frame_rate 帧
-        row_interval = 1.0 / max(1.0, frame_rate)
-        # 垂直步进像素：使得完整穿过高度大约需要 cam_h / step_px 行；设置为高度 / (frame_rate * 6) 约 6 秒穿过
-        step_px = max(1, int(cam_h / (frame_rate * 6)))
-        # 读取可选的玻璃宽度控制参数
-        pane_width_factor = float(runtime.get('test_scene_width_factor', legacy_sys.get('test_scene_width_factor', 0.95)) or 0.95)
-        pane_margin_px = runtime.get('test_scene_margin_px', legacy_sys.get('test_scene_margin_px'))
-        try:
-            pane_margin_px = int(pane_margin_px) if pane_margin_px is not None else None
-        except Exception:
-            pane_margin_px = None
-        # 加载各相机 ROI （复用与处理端类似逻辑）
-        def _load_rois(path: str):
-            rois = []
+
+        # 1) 载入统一 ROI 文件
+        roi_override_file = 'cam5_roi_averaged_by_group.json'
+        def _load_averaged_rois(path: str):
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 if isinstance(data, dict):
-                    # averaged_rois 结构
+                    # 选 source_image_count 最大的 averaged_rois
                     best_key = None; best_cnt = -1
-                    for k,v in data.items():
+                    for k, v in data.items():
                         if isinstance(v, dict) and 'averaged_rois' in v:
                             cnt = v.get('source_image_count', len(v['averaged_rois']))
                             if cnt > best_cnt:
                                 best_cnt = cnt; best_key = k
                     if best_key is not None:
-                        rois = data[best_key]['averaged_rois']
-                    elif 'rois' in data and isinstance(data['rois'], list):
-                        rois = data['rois']
+                        return data[best_key]['averaged_rois']
+                    # 兼容直接 rois 列表
+                    if 'rois' in data and isinstance(data['rois'], list):
+                        return data['rois']
                 elif isinstance(data, list):
-                    rois = data
-            except Exception:
-                rois = []
-            return rois
-        cam_rois_cfg = config.get('camera_rois', {})
-        rois_per_cam = []
-        for ci in range(test_cameras):
-            roi_path = None
-            if isinstance(cam_rois_cfg, dict):
-                roi_path = cam_rois_cfg.get(str(ci)) or cam_rois_cfg.get(ci)
-            elif isinstance(cam_rois_cfg, list) and ci < len(cam_rois_cfg):
-                roi_path = cam_rois_cfg[ci]
-            if not roi_path:
-                roi_path = config.get('roi_template_file', 'roi_averaged_by_group_CORRECTED.json')
-            rois_per_cam.append(_load_rois(roi_path))
+                    return data
+            except Exception as e:
+                print(f"[相机池][测试模式]: 载入统一ROI失败: {e}")
+            return []
+        unified_rois = _load_averaged_rois(roi_override_file)
+        print(f"[相机池][测试模式]: 统一ROI载入完成, 数量={len(unified_rois)} 来自 {roi_override_file}")
 
-        scene = SyntheticGlassScene(test_cameras, cam_w, cam_h, step_px=step_px,
-                                    pane_width_factor=pane_width_factor, pane_margin_px=pane_margin_px,
-                                    rois_per_cam=rois_per_cam, roi_only=False)
-        print(f"[相机池][测试模式]: 玻璃+ROI 模式 | cameras={test_cameras}, size={cam_w}x{cam_h}, roi_loaded={[len(r) for r in rois_per_cam]}")
-        
-        # 初始化所有模拟相机的状态
+        # 2) 建立视频映射
+        video_map = ['4.avi', '5.avi', '4.avi', '5.avi', '4.avi']
+        caps = []              # 每路 VideoCapture
+        frame_intervals = []    # 每路帧间隔 (秒)
+        next_times = []         # 下一帧时间戳
+        for idx in range(test_cameras):
+            vf = video_map[idx] if idx < len(video_map) else video_map[-1]
+            cap = cv2.VideoCapture(vf)
+            if not cap.isOpened():
+                print(f"[相机池][测试模式]: ⚠️ 相机{idx} 无法打开视频 {vf}，使用黑帧占位。")
+                cap = None
+                interval = 0.1
+            else:
+                fps_v = cap.get(cv2.CAP_PROP_FPS) or 10.0
+                if fps_v <= 0: fps_v = 10.0
+                interval = 1.0 / fps_v
+                print(f"[相机池][测试模式]: 相机{idx} 使用 {vf} (fps={fps_v:.2f})")
+            caps.append(cap)
+            frame_intervals.append(interval)
+            next_times.append(time.perf_counter())
+
+        # 3) 初始化共享状态
         for idx in range(test_cameras):
             shared_states[idx] = {
                 "status": "Connected (Test Mode)",
-                "type": "Synthetic",
+                "type": "VideoSim",
                 "camera_index": idx,
                 "frame_size": f"{cam_w}x{cam_h}",
-                "rois_count": len(rois_per_cam[idx]) if idx < len(rois_per_cam) else 0
+                "rois_count": len(unified_rois),
+                "video_file": video_map[idx] if idx < len(video_map) else video_map[-1]
             }
-        
-        # 通知主进程相机已准备就绪
-        print(f"[相机池]: 所有{test_cameras}台模拟相机已就绪，发送就绪事件...")
+
+        print(f"[相机池][测试模式]: 视频相机={test_cameras} 路, 分辨率={cam_w}x{cam_h}")
+        print("[相机池][测试模式]: 所有模拟相机就绪，发送就绪事件...")
         cameras_ready_event.set()
-        
-        next_row_t = time.perf_counter()
+
+        # 4) 主循环：定时为每路相机取帧
         while not stop_event.is_set():
             now = time.perf_counter()
-            if now < next_row_t:
-                time.sleep(min(next_row_t - now, 0.002))
-                continue
-            frames = scene.next_row_frames()
-            for idx, frame in enumerate(frames):
-                shared_states[idx] = {"status": "Connected (Test Mode)"}
+            for idx in range(test_cameras):
+                if now < next_times[idx]:
+                    continue
+                cap = caps[idx]
+                frame_gray = None
+                if cap is not None:
+                    ret, frame_bgr = cap.read()
+                    if not ret or frame_bgr is None:
+                        # 循环回放
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame_bgr = cap.read()
+                    if ret and frame_bgr is not None:
+                        try:
+                            frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                        except Exception:
+                            frame_gray = None
+                if frame_gray is None:
+                    frame_gray = np.zeros((cam_h, cam_w), dtype=np.uint8)
+                else:
+                    h_in, w_in = frame_gray.shape
+                    if h_in != cam_h or w_in != cam_w:
+                        frame_gray = cv2.resize(frame_gray, (cam_w, cam_h), interpolation=cv2.INTER_AREA)
                 try:
-                    task_queue.put_nowait({"data": frame, "cam_index": idx})
+                    # 将统一 ROI 一并投递，供处理进程首次载入时直接使用
+                    task_queue.put_nowait({"data": frame_gray, "cam_index": idx, "rois": unified_rois})
                 except queue.Full:
                     pass
-            next_row_t += row_interval
+                next_times[idx] += frame_intervals[idx]
+            time.sleep(0.001)
+        # 退出清理
+        for cap in caps:
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
         return
 
     # ---------------------------- 实机模式 ----------------------------
