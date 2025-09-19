@@ -332,6 +332,20 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         new_defect = {'type': defect['type']}
         location = {}
 
+        # --- UPDATED: 针对L型缺陷增加前置过滤 ---
+        if defect['type'] == 'L':
+            x_r, y_r, w_r, h_r = defect.get('rect', (0,0,0,0))
+            # 保证矩形框有效
+            if w_r > 0 and h_r > 0:
+                defect_sub_roi = roi_gray[y_r:y_r+h_r, x_r:x_r+w_r]
+                mean_brightness = cv2.mean(defect_sub_roi)[0]
+                # --- NEW: L型缺陷亮度过滤 ---
+                # 如果矩形框内平均亮度 > 50，则不是缺陷
+                if mean_brightness > 50:
+                    continue
+            else: # 无效矩形则跳过
+                continue
+
         if defect['type'] == 'X':
             center = defect.get('center', (0, 0))
             location['x'] = int(center[0] + x)
@@ -343,28 +357,49 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 center = defect.get('center', (0, 0))
                 location['x'] = int(center[0] + x)
                 location['y'] = int(center[1] + y)
-                if 'endpoints' in defect:
-                    p1, p2 = defect['endpoints']
-                    dist_leg1_px = np.linalg.norm(np.array(center) - np.array(p1))
-                    dist_leg2_px = np.linalg.norm(np.array(center) - np.array(p2))
 
-                    # --- FIX: Report size consistent with retreated visualization ---
+                # --- UPDATED: Q型缺陷像素面积计算与过滤 ---
+                # 提前计算可视化顶点，用于面积过滤
+                if 'endpoints' in defect:
+                    center_np = np.array(center)
+                    p1_orig, p2_orig = np.array(defect["endpoints"][0]), np.array(defect["endpoints"][1])
+                    v1_final, v2_final = p1_orig, p2_orig # 默认等于原始端点
+
                     p_vis_local = params.get("VISUALIZATION", {})
                     retreat_threshold = p_vis_local.get("RETREAT_DISTANCE_THRESHOLD", 100.0)
                     retreat_len_px = p_vis_local.get("EDGE_ENDPOINT_FIXED_LENGTH", 20)
-                    
-                    adj_leg1 = retreat_len_px if "distances" in defect and defect["distances"][0] > retreat_threshold else dist_leg1_px
-                    adj_leg2 = retreat_len_px if "distances" in defect and defect["distances"][1] > retreat_threshold else dist_leg2_px
 
-                    length_px = max(adj_leg1, adj_leg2)
-                    width_px  = min(adj_leg1, adj_leg2)
+                    if "distances" in defect:
+                        dist1, dist2 = defect["distances"]
+                        if dist1 > retreat_threshold:
+                            vec1 = (p1_orig - center_np) / dist1
+                            v1_final = center_np + vec1 * retreat_len_px
+                        if dist2 > retreat_threshold:
+                            vec2 = (p2_orig - center_np) / dist2
+                            v2_final = center_np + vec2 * retreat_len_px
+                    
+                    # 计算由交点和两个（可能回退的）端点构成的三角形面积
+                    pixel_area = 0.5 * abs(center_np[0]*(v1_final[1]-v2_final[1]) + v1_final[0]*(v2_final[1]-center_np[1]) + v2_final[0]*(center_np[1]-v1_final[1]))
+                    location['pixel_area'] = round(pixel_area, 2)
+
+                    # --- NEW: Q型缺陷像素面积过滤 ---
+                    if pixel_area < 15:
+                        continue
+                    
+                    # 使用更新后的顶点计算上报尺寸
+                    dist_leg1_px = np.linalg.norm(center_np - v1_final)
+                    dist_leg2_px = np.linalg.norm(center_np - v2_final)
+                    length_px = max(dist_leg1_px, dist_leg2_px)
+                    width_px  = min(dist_leg1_px, dist_leg2_px)
                 else:
                     length_px, width_px = 0.0, 0.0
+            
             elif defect['type'] == 'L':
                 lx, ly, lw, lh = defect.get('rect', (0,0,0,0))
                 location['x'] = int(lx + lw//2 + x)
                 location['y'] = int(ly + lh//2 + y)
                 length_px, width_px = max(lw, lh), min(lw, lh)
+
             elif defect['type'] == 'B':
                 box = defect.get('box_points', [])
                 if len(box) >= 4:
@@ -380,7 +415,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
         new_defect['location'] = location
         
-        # --- FIX: Stricter MIN_DEFECT_SIZE_MM filter for Q-type defects ---
+        # 原有过滤规则
         min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
         if new_defect['type'] == 'Q':
             if location.get('length_mm', 0) * location.get('width_mm', 0) < 2.25 or location.get('length_mm', 0) / location.get('width_mm', 1) > 3.0:
@@ -388,8 +423,12 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         elif new_defect['type'] in ['L', 'B']:
             if location.get('length_mm', 0) < min_size_mm:
                 continue
+
+        # --- NEW: L型缺陷面积过滤 (mm^2) ---
+        if new_defect['type'] == 'L':
+            if location.get('length_mm', 0) * location.get('width_mm', 0) > 1000:
+                continue
         
-        # --- FIX: New B-type area calculation and filter ---
         if new_defect['type'] == 'B':
             length_mm = location.get('length_mm', 0)
             width_mm = location.get('width_mm', 0)
@@ -419,6 +458,13 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
     
+    # --- NEW: 绘制检测到的有效直线 ---
+    # 在绘制缺陷之前，先将所有识别出的有效边缘用绿色画出
+    for edge in edges_for_drawing:
+        pt1 = tuple(map(int, edge[:2]))
+        pt2 = tuple(map(int, edge[2:]))
+        cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2) # (B, G, R) -> 绿色
+
     annotations_to_draw = []
     
     for defect_report in final_defects_for_report:
@@ -431,6 +477,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         
         if defect_report['type'] == 'X':
             text = f"{type_str}: ({loc['x']}, {loc['y']}), 角度: {loc['angle']:.1f}°"
+        # 更新Q型缺陷的标注，可以额外显示像素面积
+        elif defect_report['type'] == 'Q' and 'pixel_area' in loc:
+            text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm, 面积: {loc['pixel_area']:.0f}px"
         else:
             text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm"
         
