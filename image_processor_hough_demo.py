@@ -1,4 +1,4 @@
-# --- START OF FILE image_processor_hough.py (Corrected for Q-Defect Reporting and Filtering) ---
+# --- START OF FILE image_processor_hough.py (Updated with Global Annotation) ---
 import cv2
 import numpy as np
 import json
@@ -6,6 +6,7 @@ import os
 from itertools import combinations
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -40,7 +41,7 @@ def _get_font(font_size=36):
         return None
 
 ANNOTATION_FONT = _get_font(font_size=36)
-
+PERSISTENT_ANNOTATIONS = []
 
 # ====================================================================================
 # --- 几何学与分析辅助函数 ---
@@ -101,7 +102,6 @@ def get_point_line_segment_projection(point, line_segment):
     proj_point = p1 + t * line_vec
     return proj_point, np.linalg.norm(p - proj_point)
 
-# --- MODIFIED: Added gradient check to this function ---
 def scan_edge_for_luminosity_defects(roi_gray, edge, params):
     p = params["DEFECT_DETECTION"]
     
@@ -134,7 +134,6 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
 
         contours, _ = cv2.findContours(defect_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # --- NEW: Gradient check for stability ---
         if contours:
             min_gradient_threshold = p.get("LUMINOSITY_MIN_GRADIENT", 15.0)
 
@@ -157,25 +156,12 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
 
 
 def find_gradient_endpoint(start_point, line_vec_normalized, roi_gray_blurred, max_search_dist, search_width=7, gradient_stop_threshold=20.0):
-    """
-    Scans from a starting point along a line vector to find the *first point* where the gradient
-    exceeds a specified threshold.
-
-    :param start_point: np.array, The starting point for the scan (usually the intersection).
-    :param line_vec_normalized: np.array, The unit vector for the direction of the scan.
-    :param roi_gray_blurred: np.array, The blurred grayscale image for stable gradient calculation.
-    :param max_search_dist: int, The maximum distance to scan.
-    :param search_width: int, The width of the scan line in pixels.
-    :param gradient_stop_threshold: float, The minimum gradient value to trigger an early stop.
-    :return: np.array or None, The coordinates of the new endpoint, or None if not found.
-    """
     h, w = roi_gray_blurred.shape
     perp_vec = np.array([-line_vec_normalized[1], line_vec_normalized[0]])
     half_width = (search_width - 1) // 2
 
     last_avg_intensity = -1.0
 
-    # Start search a few pixels away to avoid instabilities at the virtual intersection
     for i in range(3, int(max_search_dist)):
         current_center = start_point + i * line_vec_normalized
         
@@ -200,14 +186,11 @@ def find_gradient_endpoint(start_point, line_vec_normalized, roi_gray_blurred, m
         if last_avg_intensity >= 0:
             grad = abs(current_avg_intensity - last_avg_intensity)
             
-            # --- NEW LOGIC: Stop at the first gradient spike above the threshold ---
             if grad > gradient_stop_threshold:
-                # Return the average coordinate of the current sample points
                 return np.mean(valid_coords, axis=0)
         
         last_avg_intensity = current_avg_intensity
 
-    # If the loop finishes without finding a point that meets the threshold, return None
     return None
 
 # ====================================================================================
@@ -266,7 +249,6 @@ def merge_lines_and_get_main_edges(lines, params):
     merged_lines_with_scores.sort(key=lambda item: item['score'], reverse=True)
     return [item['line'] for item in merged_lines_with_scores[:p["TOP_N_EDGES"]]]
 
-# --- MODIFIED: Updated intersection pair sorting logic ---
 def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
     p_defect = params["DEFECT_DETECTION"]; p_crack = params["CRACK_CLASSIFICATION"]
     num_edges = len(edges); roi_h, roi_w = roi_dims
@@ -440,41 +422,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
             min_dist_to_endpoint = min(np.linalg.norm(center - ep) for ep in all_endpoints)
             if min_dist_to_endpoint > shield_radius:
                 final_chipping_defects.append(defect)
-
-    # --- NEW: Filter B-type defects that overlap with the area of Q-type defects ---
-    surviving_chipping_defects = []
-    if corner_defects and final_chipping_defects:
-        # 1. Create a combined mask of all Q-defect areas
-        q_mask = np.zeros(roi_dims, dtype=np.uint8)
-        for q_defect in corner_defects:
-            q_contour = np.array([
-                q_defect['center'], 
-                q_defect['endpoints'][0], 
-                q_defect['endpoints'][1]
-            ], dtype=np.int32)
-            cv2.fillPoly(q_mask, [q_contour], 255)
-
-        # 2. Check each B-defect for overlap with the combined Q-mask
-        for b_defect in final_chipping_defects:
-            b_mask = np.zeros(roi_dims, dtype=np.uint8)
-            b_contour = b_defect.get('box_points')
-            if b_contour is None:
-                surviving_chipping_defects.append(b_defect)
-                continue
             
-            cv2.fillPoly(b_mask, [np.array(b_contour)], 255)
-            
-            # 3. Use bitwise_and to find intersection
-            intersection = cv2.bitwise_and(q_mask, b_mask)
-            
-            # 4. If there's no intersection, the B-defect survives
-            if cv2.countNonZero(intersection) == 0:
-                surviving_chipping_defects.append(b_defect)
-    else:
-        # If there are no Q-defects or no B-defects, keep all B-defects
-        surviving_chipping_defects = final_chipping_defects
-            
-    return edges_for_drawing, corner_defects + surviving_chipping_defects + crack_defects
+    return edges_for_drawing, corner_defects + final_chipping_defects + crack_defects
 
 def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm):
     x, y, w, h = int(roi_template['x']), int(roi_template['y']), int(roi_template['width']), int(roi_template['height'])
@@ -575,8 +524,6 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         if new_defect['type'] == 'L':
             if location.get('length_mm', 0) * location.get('width_mm', 0) > 1000:
                 continue
-            if location.get('width_mm', 0) < 0.1:
-                continue
         
         if new_defect['type'] == 'B':
             length_mm = location.get('length_mm', 0)
@@ -584,9 +531,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             area_mm2 = length_mm * width_mm
             aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
             
-            if area_mm2 > 80 and aspect_ratio > 3.0:
+            if area_mm2 > 80 and aspect_ratio > 3.2:
                 continue
-            if location.get('length_mm', 0) <0.5 or location.get('width_mm', 0) < 0.5:
+            if aspect_ratio > 6.0:
                 continue
 
             p_reclass = params["DEFECT_DETECTION"].get("RECLASSIFY_B_AS_L_PARAMS", {})
@@ -623,40 +570,32 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             target_edge = edge
                             break
                 
-                # --- NEW: Logic to extend the reclassified L-type defect ---
                 if new_defect['type'] == "L" and target_edge is not None:
-                    # 1. Get original defect properties
                     center = np.array(min_area_rect[0])
                     defect_length = max(w_rect, h_rect)
                     defect_width = min(w_rect, h_rect)
                     
-                    # 2. Calculate long axis vector and endpoints
                     angle_rad = np.deg2rad(defect_angle)
                     vec = np.array([np.cos(angle_rad), np.sin(angle_rad)])
                     ep1 = center + vec * defect_length / 2
                     ep2 = center - vec * defect_length / 2
                     
-                    # 3. Find the endpoint farther from the target edge
                     _, dist1 = get_point_line_segment_projection(ep1, target_edge)
                     _, dist2 = get_point_line_segment_projection(ep2, target_edge)
                     far_endpoint = ep1 if dist1 > dist2 else ep2
 
-                    # 4. Define the defect's axis as a line for intersection
-                    axis_line = np.hstack([ep1, ep2]) # Format: (x1, y1, x2, y2)
+                    axis_line = np.hstack([ep1, ep2])
                     intersection_point = find_line_intersection(axis_line, target_edge)
 
                     if intersection_point is not None:
-                        # 5. Build the new, extended rectangle
                         new_length = np.linalg.norm(far_endpoint - intersection_point)
                         new_center = (far_endpoint + intersection_point) / 2
                         
-                        # Use original w/h to decide the new size tuple's order
                         new_size = (new_length, defect_width) if w_rect > h_rect else (defect_width, new_length)
                         
                         new_min_area_rect = (tuple(new_center), new_size, angle_raw)
                         new_box_points = np.intp(cv2.boxPoints(new_min_area_rect))
                         
-                        # 6. Update defect info with the new extended geometry
                         defect['box_points'] = new_box_points
                         length_px, width_px = new_length, defect_width
                         new_defect['location']['length_mm'] = float(round(length_px / pixels_per_mm, 2))
@@ -686,26 +625,14 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         pt2 = tuple(map(int, edge[2:]))
         #绘制直线
         #cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
-
-    annotations_to_draw = []
+    
+    # --- MODIFICATION: Text generation and drawing is REMOVED from here ---
     
     for defect_report in final_defects_for_report:
         defect = defect_report['raw_defect']
         color_bgr = DEFECT_COLORS_BGR.get(defect_report["type"], (255, 255, 255))
         
-        loc = defect_report['location']
-        defect_type_map = {'Q': '缺角', 'B': '崩边', 'X': '斜边', 'L': '裂纹'}
-        type_str = defect_type_map.get(defect_report['type'], '未知')
-        
-        if defect_report['type'] == 'X':
-            text = f"{type_str}: ({loc['x']}, {loc['y']}), 角度: {loc['angle']:.1f}°"
-        elif defect_report['type'] == 'Q' and 'pixel_area' in loc:
-            text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm"
-        else:
-            text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm"
-        
-        annotations_to_draw.append({'text': text, 'color': color_bgr})
-
+        # --- SHAPE DRAWING LOGIC (UNCHANGED) ---
         if defect["type"] == "Q" and "endpoints" in defect:
             center = np.array(defect["center"])
             p1_orig, p2_orig = np.array(defect["endpoints"][0]), np.array(defect["endpoints"][1])
@@ -743,30 +670,12 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
             cv2.drawContours(roi_color, [box_points], 0, color_bgr, THICKNESS)
 
-    if annotations_to_draw and PIL_AVAILABLE and ANNOTATION_FONT:
-        pil_img = Image.fromarray(cv2.cvtColor(roi_color, cv2.COLOR_BGR2RGB))
-        draw = ImageDraw.Draw(pil_img)
-        
-        y_text = 10; padding = 10
-        for ann in annotations_to_draw:
-            text = ann['text']
-            color_rgb = tuple(reversed(ann['color']))
-            
-            if hasattr(draw, 'textbbox'):
-                bbox = draw.textbbox((0,0), text, font=ANNOTATION_FONT)
-                text_width = bbox[2] - bbox[0]; text_height = bbox[3] - bbox[1]
-            else:
-                 text_width, text_height = draw.textsize(text, font=ANNOTATION_FONT)
-
-            x_text = w - text_width - 10
-            draw.text((x_text, y_text), text, font=ANNOTATION_FONT, fill=color_rgb)
-            y_text += text_height + padding
-            
-        roi_color = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-
     return roi_report, roi_color
 
 def process_image_from_memory_parallel(image_gray, template_rois, config):
+    # 声明我们将要修改全局列表
+    global PERSISTENT_ANNOTATIONS
+
     final_image = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
     report = {"image_status": "OK", "defects": [] , "state_code": 0, "rois": []}
 
@@ -821,5 +730,61 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
 
     report["state_code"] = 1 if max_edges_found > 0 else 0
     
+    # --- MODIFIED: 全局标注逻辑修改为使用并更新持久化列表 ---
+    
+    # 定义常量
+    DEFECT_COLORS_BGR = {'Q': (0, 0, 255), 'X': (255, 0, 0), 'L': (255, 0, 255), 'B': (0, 165, 255)}
+    MAX_ANNOTATIONS = 10  # 屏幕上最多保留的标注行数
+
+    # 1. 将当前帧检测到的新缺陷添加到持久化列表中
+    if report["defects"]:
+        current_time = datetime.now().strftime("%H:%M:%S")
+        for defect_report in report["defects"]:
+            loc = defect_report['location']
+            defect_type_map = {'Q': '缺角', 'B': '崩边', 'X': '斜边', 'L': '裂纹'}
+            type_str = defect_type_map.get(defect_report['type'], '未知')
+            
+            size_str = ""
+            if defect_report['type'] in ['Q', 'L', 'B']:
+                size_str = f"尺寸:{loc.get('length_mm', 0):.1f}x{loc.get('width_mm', 0):.1f}mm"
+            elif defect_report['type'] == 'X':
+                size_str = f"角度:{loc.get('angle', 0):.1f}°"
+            
+            text = f"{current_time} {type_str} {size_str}"
+            color_bgr = DEFECT_COLORS_BGR.get(defect_report["type"], (255, 255, 255))
+            
+            PERSISTENT_ANNOTATIONS.append({
+                'text': text,
+                'color': tuple(reversed(color_bgr))  # Store as RGB for PIL
+            })
+
+    # 2. 限制列表长度，只保留最新的N条记录
+    PERSISTENT_ANNOTATIONS = PERSISTENT_ANNOTATIONS[-MAX_ANNOTATIONS:]
+
+    # 3. 绘制持久化列表中的所有信息
+    if PERSISTENT_ANNOTATIONS and PIL_AVAILABLE and ANNOTATION_FONT:
+        pil_img = Image.fromarray(cv2.cvtColor(final_image, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_img)
+        
+        y_text = 10
+        padding = 10
+        img_h, img_w, _ = final_image.shape
+
+        for ann in PERSISTENT_ANNOTATIONS:
+            text = ann['text']
+            color_rgb = ann['color']
+
+            if hasattr(draw, 'textbbox'):
+                bbox = draw.textbbox((0,0), text, font=ANNOTATION_FONT)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+            else:
+                 text_width, text_height = draw.textsize(text, font=ANNOTATION_FONT)
+
+            x_text = img_w - text_width - 10 
+            draw.text((x_text, y_text), text, font=ANNOTATION_FONT, fill=color_rgb)
+            y_text += text_height + padding
+
+        final_image = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
     return report, final_image
-# --- END OF FILE image_processor_hough.py (Corrected for New Filtering Rules) ---
