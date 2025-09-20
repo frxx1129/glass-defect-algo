@@ -1,4 +1,4 @@
-# --- START OF FILE image_processor_hough.py (Corrected for Q-Defect Reporting and Filtering) ---
+# --- START OF FILE image_processor_hough.py (Corrected for KeyError: 'endpoints') ---
 import cv2
 import numpy as np
 import json
@@ -101,7 +101,6 @@ def get_point_line_segment_projection(point, line_segment):
     proj_point = p1 + t * line_vec
     return proj_point, np.linalg.norm(p - proj_point)
 
-# --- MODIFIED: Added gradient check to this function ---
 def scan_edge_for_luminosity_defects(roi_gray, edge, params):
     p = params["DEFECT_DETECTION"]
     
@@ -134,7 +133,6 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
 
         contours, _ = cv2.findContours(defect_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # --- NEW: Gradient check for stability ---
         if contours:
             min_gradient_threshold = p.get("LUMINOSITY_MIN_GRADIENT", 15.0)
 
@@ -157,25 +155,12 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
 
 
 def find_gradient_endpoint(start_point, line_vec_normalized, roi_gray_blurred, max_search_dist, search_width=7, gradient_stop_threshold=20.0):
-    """
-    Scans from a starting point along a line vector to find the *first point* where the gradient
-    exceeds a specified threshold.
-
-    :param start_point: np.array, The starting point for the scan (usually the intersection).
-    :param line_vec_normalized: np.array, The unit vector for the direction of the scan.
-    :param roi_gray_blurred: np.array, The blurred grayscale image for stable gradient calculation.
-    :param max_search_dist: int, The maximum distance to scan.
-    :param search_width: int, The width of the scan line in pixels.
-    :param gradient_stop_threshold: float, The minimum gradient value to trigger an early stop.
-    :return: np.array or None, The coordinates of the new endpoint, or None if not found.
-    """
     h, w = roi_gray_blurred.shape
     perp_vec = np.array([-line_vec_normalized[1], line_vec_normalized[0]])
     half_width = (search_width - 1) // 2
 
     last_avg_intensity = -1.0
 
-    # Start search a few pixels away to avoid instabilities at the virtual intersection
     for i in range(3, int(max_search_dist)):
         current_center = start_point + i * line_vec_normalized
         
@@ -200,14 +185,11 @@ def find_gradient_endpoint(start_point, line_vec_normalized, roi_gray_blurred, m
         if last_avg_intensity >= 0:
             grad = abs(current_avg_intensity - last_avg_intensity)
             
-            # --- NEW LOGIC: Stop at the first gradient spike above the threshold ---
             if grad > gradient_stop_threshold:
-                # Return the average coordinate of the current sample points
                 return np.mean(valid_coords, axis=0)
         
         last_avg_intensity = current_avg_intensity
 
-    # If the loop finishes without finding a point that meets the threshold, return None
     return None
 
 # ====================================================================================
@@ -266,7 +248,6 @@ def merge_lines_and_get_main_edges(lines, params):
     merged_lines_with_scores.sort(key=lambda item: item['score'], reverse=True)
     return [item['line'] for item in merged_lines_with_scores[:p["TOP_N_EDGES"]]]
 
-# --- MODIFIED: Updated intersection pair sorting logic ---
 def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
     p_defect = params["DEFECT_DETECTION"]; p_crack = params["CRACK_CLASSIFICATION"]
     num_edges = len(edges); roi_h, roi_w = roi_dims
@@ -441,20 +422,21 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
             if min_dist_to_endpoint > shield_radius:
                 final_chipping_defects.append(defect)
 
-    # --- NEW: Filter B-type defects that overlap with the area of Q-type defects ---
     surviving_chipping_defects = []
     if corner_defects and final_chipping_defects:
-        # 1. Create a combined mask of all Q-defect areas
         q_mask = np.zeros(roi_dims, dtype=np.uint8)
         for q_defect in corner_defects:
-            q_contour = np.array([
-                q_defect['center'], 
-                q_defect['endpoints'][0], 
-                q_defect['endpoints'][1]
-            ], dtype=np.int32)
-            cv2.fillPoly(q_mask, [q_contour], 255)
+            # --- FIX STARTS HERE ---
+            # Check if the defect is a Q-type before accessing 'endpoints'
+            if q_defect.get('type') == 'Q' and 'endpoints' in q_defect:
+                q_contour = np.array([
+                    q_defect['center'], 
+                    q_defect['endpoints'][0], 
+                    q_defect['endpoints'][1]
+                ], dtype=np.int32)
+                cv2.fillPoly(q_mask, [q_contour], 255)
+            # --- FIX ENDS HERE ---
 
-        # 2. Check each B-defect for overlap with the combined Q-mask
         for b_defect in final_chipping_defects:
             b_mask = np.zeros(roi_dims, dtype=np.uint8)
             b_contour = b_defect.get('box_points')
@@ -464,14 +446,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
             
             cv2.fillPoly(b_mask, [np.array(b_contour)], 255)
             
-            # 3. Use bitwise_and to find intersection
             intersection = cv2.bitwise_and(q_mask, b_mask)
             
-            # 4. If there's no intersection, the B-defect survives
             if cv2.countNonZero(intersection) == 0:
                 surviving_chipping_defects.append(b_defect)
     else:
-        # If there are no Q-defects or no B-defects, keep all B-defects
         surviving_chipping_defects = final_chipping_defects
             
     return edges_for_drawing, corner_defects + surviving_chipping_defects + crack_defects
@@ -523,19 +502,6 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     center_np = np.array(center)
                     p1_orig, p2_orig = np.array(defect["endpoints"][0]), np.array(defect["endpoints"][1])
                     v1_final, v2_final = p1_orig, p2_orig
-                    
-                    p_vis_local = params.get("VISUALIZATION", {})
-                    retreat_threshold = p_vis_local.get("RETREAT_DISTANCE_THRESHOLD", 100.0)
-                    retreat_len_px = p_vis_local.get("EDGE_ENDPOINT_FIXED_LENGTH", 20)
-
-                    if "distances" in defect:
-                        dist1, dist2 = defect["distances"]
-                        if dist1 > retreat_threshold:
-                            vec1 = (p1_orig - center_np); norm_vec1 = np.linalg.norm(vec1)
-                            if norm_vec1 > 1e-6: v1_final = center_np + (vec1 / norm_vec1) * retreat_len_px
-                        if dist2 > retreat_threshold:
-                            vec2 = (p2_orig - center_np); norm_vec2 = np.linalg.norm(vec2)
-                            if norm_vec2 > 1e-6: v2_final = center_np + (vec2 / norm_vec2) * retreat_len_px
                     
                     pixel_area = 0.5 * abs(center_np[0]*(v1_final[1]-v2_final[1]) + v1_final[0]*(v2_final[1]-center_np[1]) + v2_final[0]*(center_np[1]-v1_final[1]))
                     location['pixel_area'] = round(pixel_area, 2)
@@ -628,41 +594,33 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             new_defect['type'] = "L"
                             target_edge = edge
                             break
-                
-                # --- NEW: Logic to extend the reclassified L-type defect ---
+                        
                 if new_defect['type'] == "L" and target_edge is not None:
-                    # 1. Get original defect properties
                     center = np.array(min_area_rect[0])
                     defect_length = max(w_rect, h_rect)
                     defect_width = min(w_rect, h_rect)
                     
-                    # 2. Calculate long axis vector and endpoints
                     angle_rad = np.deg2rad(defect_angle)
                     vec = np.array([np.cos(angle_rad), np.sin(angle_rad)])
                     ep1 = center + vec * defect_length / 2
                     ep2 = center - vec * defect_length / 2
                     
-                    # 3. Find the endpoint farther from the target edge
                     _, dist1 = get_point_line_segment_projection(ep1, target_edge)
                     _, dist2 = get_point_line_segment_projection(ep2, target_edge)
                     far_endpoint = ep1 if dist1 > dist2 else ep2
 
-                    # 4. Define the defect's axis as a line for intersection
-                    axis_line = np.hstack([ep1, ep2]) # Format: (x1, y1, x2, y2)
+                    axis_line = np.hstack([ep1, ep2])
                     intersection_point = find_line_intersection(axis_line, target_edge)
 
                     if intersection_point is not None:
-                        # 5. Build the new, extended rectangle
                         new_length = np.linalg.norm(far_endpoint - intersection_point)
                         new_center = (far_endpoint + intersection_point) / 2
                         
-                        # Use original w/h to decide the new size tuple's order
                         new_size = (new_length, defect_width) if w_rect > h_rect else (defect_width, new_length)
                         
                         new_min_area_rect = (tuple(new_center), new_size, angle_raw)
                         new_box_points = np.intp(cv2.boxPoints(new_min_area_rect))
                         
-                        # 6. Update defect info with the new extended geometry
                         defect['box_points'] = new_box_points
                         length_px, width_px = new_length, defect_width
                         new_defect['location']['length_mm'] = float(round(length_px / pixels_per_mm, 2))
@@ -828,4 +786,3 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
     report["state_code"] = 1 if max_edges_found > 0 else 0
     
     return report, final_image
-# --- END OF FILE image_processor_hough.py (Corrected for New Filtering Rules) ---
