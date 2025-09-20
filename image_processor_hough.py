@@ -101,49 +101,7 @@ def get_point_line_segment_projection(point, line_segment):
     proj_point = p1 + t * line_vec
     return proj_point, np.linalg.norm(p - proj_point)
 
-def get_line_quadrant(line, center_x, center_y):
-    mid_x = (line[0] + line[2]) / 2.0
-    mid_y = (line[1] + line[3]) / 2.0
-    if mid_x > center_x and mid_y <= center_y: return 0 # Top-Right
-    if mid_x <= center_x and mid_y <= center_y: return 1 # Top-Left
-    if mid_x <= center_x and mid_y > center_y: return 2 # Bottom-Left
-    return 3 # Bottom-Right
-
-def are_quadrants_compatible(q1, q2):
-    if q1 == q2: return True
-    if abs(q1 - q2) == 1: return True
-    if abs(q1 - q2) == 3: return True
-    return False
-
-def refine_q_defect_endpoint(start_point, direction_vec, binary_edges, search_width=3, max_search_dist=50):
-    h, w = binary_edges.shape
-    norm = np.linalg.norm(direction_vec)
-    if norm < 1e-6: return start_point
-    
-    unit_vec = direction_vec / norm
-    normal_vec = np.array([-unit_vec[1], unit_vec[0]])
-    
-    last_valid_point = np.copy(start_point)
-    
-    for step in range(1, max_search_dist):
-        current_base = start_point + unit_vec * step
-        found_pixel_in_profile = False
-        
-        for offset in range(-search_width // 2, search_width // 2 + 1):
-            check_point = current_base + normal_vec * offset
-            px, py = int(round(check_point[0])), int(round(check_point[1]))
-            
-            if 0 <= py < h and 0 <= px < w and binary_edges[py, px] > 0:
-                found_pixel_in_profile = True
-                break
-        
-        if found_pixel_in_profile:
-            last_valid_point = current_base
-        else:
-            break
-            
-    return last_valid_point
-
+# --- MODIFIED: Added gradient check to this function ---
 def scan_edge_for_luminosity_defects(roi_gray, edge, params):
     p = params["DEFECT_DETECTION"]
     
@@ -165,23 +123,9 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
     
     initial_contours = []
     if std_dev[0][0] > 3:
-        # --- MODIFIED: Added gradient check for more robust defect detection ---
-        grad_x = cv2.Sobel(roi_gray, cv2.CV_16S, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(roi_gray, cv2.CV_16S, 0, 1, ksize=3)
-        abs_grad_x = cv2.convertScaleAbs(grad_x)
-        abs_grad_y = cv2.convertScaleAbs(grad_y)
-        grad_img = cv2.addWeighted(abs_grad_x, 0.5, abs_grad_y, 0.5, 0)
-
-        brightness_threshold = mean[0][0] - p["LUMINOSITY_STD_DEV_MULTIPLIER"] * std_dev[0][0]
-        # NOTE: Add "LUMINOSITY_MIN_GRADIENT" to your config.json's DEFECT_DETECTION section
-        gradient_threshold = p.get("LUMINOSITY_MIN_GRADIENT", 30)
-
-        is_dark_enough = (roi_gray < brightness_threshold)
-        has_high_gradient = (grad_img > gradient_threshold)
-        
-        potential_defects = (is_dark_enough & has_high_gradient).astype(np.uint8) * 255
+        threshold_low = mean[0][0] - p["LUMINOSITY_STD_DEV_MULTIPLIER"] * std_dev[0][0]
+        potential_defects = (roi_gray < threshold_low).astype(np.uint8) * 255
         defect_mask = cv2.bitwise_and(potential_defects, scan_mask)
-        # --- End of modification ---
 
         if p.get("LUMINOSITY_EDGE_IGNORE_WIDTH", 0) > 0:
             ignore_mask = np.zeros_like(roi_gray)
@@ -190,10 +134,81 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
 
         contours, _ = cv2.findContours(defect_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        for cnt in contours:
-            if cv2.contourArea(cnt) > p["LUMINOSITY_MIN_AREA"]:
-                initial_contours.append(cnt)
+        # --- NEW: Gradient check for stability ---
+        if contours:
+            min_gradient_threshold = p.get("LUMINOSITY_MIN_GRADIENT", 15.0)
+
+            blurred = cv2.medianBlur(roi_gray, 3)
+            grad_x = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
+            grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+
+            for cnt in contours:
+                if cv2.contourArea(cnt) > p["LUMINOSITY_MIN_AREA"]:
+                    contour_mask = np.zeros_like(roi_gray)
+                    cv2.drawContours(contour_mask, [cnt], -1, 255, -1)
+                    
+                    mean_grad_val = cv2.mean(grad_mag, mask=contour_mask)[0]
+
+                    if mean_grad_val > min_gradient_threshold:
+                        initial_contours.append(cnt)
+    
     return initial_contours
+
+
+def find_gradient_endpoint(start_point, line_vec_normalized, roi_gray_blurred, max_search_dist, search_width=3, gradient_stop_threshold=20.0):
+    """
+    Scans from a starting point along a line vector to find the *first point* where the gradient
+    exceeds a specified threshold.
+
+    :param start_point: np.array, The starting point for the scan (usually the intersection).
+    :param line_vec_normalized: np.array, The unit vector for the direction of the scan.
+    :param roi_gray_blurred: np.array, The blurred grayscale image for stable gradient calculation.
+    :param max_search_dist: int, The maximum distance to scan.
+    :param search_width: int, The width of the scan line in pixels.
+    :param gradient_stop_threshold: float, The minimum gradient value to trigger an early stop.
+    :return: np.array or None, The coordinates of the new endpoint, or None if not found.
+    """
+    h, w = roi_gray_blurred.shape
+    perp_vec = np.array([-line_vec_normalized[1], line_vec_normalized[0]])
+    half_width = (search_width - 1) // 2
+
+    last_avg_intensity = -1.0
+
+    # Start search a few pixels away to avoid instabilities at the virtual intersection
+    for i in range(3, int(max_search_dist)):
+        current_center = start_point + i * line_vec_normalized
+        
+        if not (0 <= current_center[0] < w and 0 <= current_center[1] < h):
+            break
+
+        sample_points_coords = [current_center + j * perp_vec for j in range(-half_width, half_width + 1)]
+        
+        intensities = []
+        valid_coords = []
+        for p in sample_points_coords:
+            px, py = int(p[0]), int(p[1])
+            if 0 <= px < w and 0 <= py < h:
+                intensities.append(roi_gray_blurred[py, px])
+                valid_coords.append(p)
+
+        if not intensities:
+            continue
+
+        current_avg_intensity = np.mean(intensities)
+
+        if last_avg_intensity >= 0:
+            grad = abs(current_avg_intensity - last_avg_intensity)
+            
+            # --- NEW LOGIC: Stop at the first gradient spike above the threshold ---
+            if grad > gradient_stop_threshold:
+                # Return the average coordinate of the current sample points
+                return np.mean(valid_coords, axis=0)
+        
+        last_avg_intensity = current_avg_intensity
+
+    # If the loop finishes without finding a point that meets the threshold, return None
+    return None
 
 # ====================================================================================
 # --- 核心处理流程 ---
@@ -251,11 +266,10 @@ def merge_lines_and_get_main_edges(lines, params):
     merged_lines_with_scores.sort(key=lambda item: item['score'], reverse=True)
     return [item['line'] for item in merged_lines_with_scores[:p["TOP_N_EDGES"]]]
 
-def find_and_analyze_defects(edges, roi_gray, roi_dims, binary_edges, params):
+# --- MODIFIED: Updated intersection pair sorting logic ---
+def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
     p_defect = params["DEFECT_DETECTION"]; p_crack = params["CRACK_CLASSIFICATION"]
-    num_edges = len(edges)
-    roi_h, roi_w = roi_dims
-    center_x, center_y = roi_w / 2.0, roi_h / 2.0
+    num_edges = len(edges); roi_h, roi_w = roi_dims
     
     crack_defects = []; crack_indices = set(); endpoint_proximity_threshold = 15.0 
     if num_edges >= 2:
@@ -288,20 +302,34 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, binary_edges, params):
     edges_for_drawing = [edge.copy() for edge in true_edges]
     endpoint_paired_status = {i: [False, False] for i in range(num_true_edges)}
     
-    if num_true_edges > 1:
-        line_quadrants = [get_line_quadrant(edge, center_x, center_y) for edge in true_edges]
-        all_pairs = list(combinations(range(num_true_edges), 2))
+    def get_line_quadrant(line, w, h):
+        center_x, center_y = w / 2, h / 2
+        mid_x, mid_y = (line[0] + line[2]) / 2, (line[1] + line[3]) / 2
+        if mid_y < center_y:
+            return 'TL' if mid_x < center_x else 'TR'
+        else:
+            return 'BL' if mid_x < center_x else 'BR'
 
-        def sort_key_for_pairs(p):
-            i, j = p
-            q1, q2 = line_quadrants[i], line_quadrants[j]
-            quadrant_priority = 0 if are_quadrants_compatible(q1, q2) else 1
-            line1, line2 = true_edges[i], true_edges[j]
-            dist = min(np.linalg.norm(line1[:2] - line2[:2]), np.linalg.norm(line1[:2] - line2[2:]),
+    def get_quadrant_compatibility(q1, q2):
+        if q1 == q2: return 0
+        pair = frozenset([q1, q2])
+        if pair in [frozenset(['TL', 'TR']), frozenset(['BL', 'BR']), 
+                    frozenset(['TL', 'BL']), frozenset(['TR', 'BR'])]:
+            return 1
+        return 2
+
+    edge_quadrants = [get_line_quadrant(edge, roi_w, roi_h) for edge in true_edges]
+
+    def sort_key_func(pair_indices):
+        i, j = pair_indices
+        line1, line2 = true_edges[i], true_edges[j]
+        compatibility = get_quadrant_compatibility(edge_quadrants[i], edge_quadrants[j])
+        min_dist = min(np.linalg.norm(line1[:2] - line2[:2]), np.linalg.norm(line1[:2] - line2[2:]),
                        np.linalg.norm(line1[2:] - line2[:2]), np.linalg.norm(line1[2:] - line2[2:]))
-            return (quadrant_priority, dist)
-        
-        potential_pairs = sorted(all_pairs, key=sort_key_for_pairs)
+        return (compatibility, min_dist)
+    
+    if num_true_edges >= 2:
+        potential_pairs = sorted([(i, j) for i, j in combinations(range(num_true_edges), 2)], key=sort_key_func)
     else:
         potential_pairs = []
 
@@ -318,13 +346,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, binary_edges, params):
         dists_i = [np.linalg.norm(intersection - line1[:2]), np.linalg.norm(intersection - line1[2:])]; endpoint_idx_i = np.argmin(dists_i)
         dists_j = [np.linalg.norm(intersection - line2[:2]), np.linalg.norm(intersection - line2[2:])]; endpoint_idx_j = np.argmin(dists_j)
 
-        # NOTE: Add "CORNER_MIN_VALID_LENGTH_FROM_INTERSECTION" to config.json
-        min_len_param = p_defect.get("CORNER_MIN_VALID_LENGTH_FROM_INTERSECTION", 5.0)
-        far_dist_i = dists_i[1 - endpoint_idx_i]
-        far_dist_j = dists_j[1 - endpoint_idx_j]
-        if far_dist_i < min_len_param or far_dist_j < min_len_param:
-            continue
-
         if endpoint_paired_status[i][endpoint_idx_i] or endpoint_paired_status[j][endpoint_idx_j]: continue
         
         is_physical = dists_i[endpoint_idx_i] < p_defect["CORNER_MAX_PHYSICAL_GAP"] and dists_j[endpoint_idx_j] < p_defect["CORNER_MAX_PHYSICAL_GAP"]
@@ -334,40 +355,33 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, binary_edges, params):
             endpoint_paired_status[i][endpoint_idx_i] = True; endpoint_paired_status[j][endpoint_idx_j] = True
             edges_for_drawing[i][endpoint_idx_i*2:(endpoint_idx_i*2)+2] = intersection
             edges_for_drawing[j][endpoint_idx_j*2:(endpoint_idx_j*2)+2] = intersection
-            
-            if is_valid_virtual and not is_physical:
-                p1_near = line1[:2] if endpoint_idx_i == 0 else line1[2:]
-                p2_near = line2[:2] if endpoint_idx_j == 0 else line2[2:]
-                
-                # NOTE: Add a "CORNER_ENDPOINT_REFINEMENT" section to config.json
-                search_params = p_defect.get("CORNER_ENDPOINT_REFINEMENT", {})
-                if search_params.get("ENABLE", True):
-                    vec1 = intersection - p1_near; vec2 = intersection - p2_near
-                    
-                    p1_refined = refine_q_defect_endpoint(
-                        p1_near, vec1, binary_edges, 
-                        search_width=search_params.get("SEARCH_WIDTH_PX", 3),
-                        max_search_dist=search_params.get("MAX_SEARCH_DIST_PX", 50)
-                    )
-                    p2_refined = refine_q_defect_endpoint(
-                        p2_near, vec2, binary_edges,
-                        search_width=search_params.get("SEARCH_WIDTH_PX", 3),
-                        max_search_dist=search_params.get("MAX_SEARCH_DIST_PX", 50)
-                    )
-                    
-                    refined_dist_i = np.linalg.norm(intersection - p1_refined)
-                    refined_dist_j = np.linalg.norm(intersection - p2_refined)
+            p1_near = line1[:2] if endpoint_idx_i == 0 else line1[2:]; p2_near = line2[:2] if endpoint_idx_j == 0 else line2[2:]
 
-                    corner_defects.append({"type": "Q", "center": tuple(map(int, intersection)), 
-                                           "endpoints": (p1_refined, p2_refined), 
-                                           "distances": (refined_dist_i, refined_dist_j)})
-                else:
-                    corner_defects.append({"type": "Q", "center": tuple(map(int, intersection)), 
-                                           "endpoints": (p1_near, p2_near), 
-                                           "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])})
-            else:
+            if is_valid_virtual and not is_physical:
                 p1_far = line1[2:] if endpoint_idx_i == 0 else line1[:2]
                 p2_far = line2[2:] if endpoint_idx_j == 0 else line2[:2]
+                
+                p_preproc = params["PREPROCESSING"]
+                roi_gray_blurred = cv2.medianBlur(roi_gray, p_preproc["MEDIAN_BLUR_KSIZE"])
+                
+                vec1 = p1_far - intersection; norm1 = np.linalg.norm(vec1)
+                if norm1 > 1e-6: vec1 /= norm1
+                
+                vec2 = p2_far - intersection; norm2 = np.linalg.norm(vec2)
+                if norm2 > 1e-6: vec2 /= norm2
+
+                # --- MODIFICATION: Read new threshold from params ---
+                grad_thresh = p_defect.get("Q_DEFECT_GRADIENT_THRESHOLD", 20.0)
+
+                new_p1 = find_gradient_endpoint(intersection, vec1, roi_gray_blurred, max_extension_dist, gradient_stop_threshold=grad_thresh)
+                new_p2 = find_gradient_endpoint(intersection, vec2, roi_gray_blurred, max_extension_dist, gradient_stop_threshold=grad_thresh)
+                
+                final_p1 = new_p1 if new_p1 is not None else p1_near
+                final_p2 = new_p2 if new_p2 is not None else p2_near
+
+                corner_defects.append({"type": "Q", "center": tuple(map(int, intersection)), "endpoints": (final_p1, final_p2), "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])})
+            else:
+                p1_far = line1[2:] if endpoint_idx_i == 0 else line1[:2]; p2_far = line2[2:] if endpoint_idx_j == 0 else line2[:2]
                 angle = calculate_vertex_angle(p1_far, intersection, p2_far)
                 deviation = abs(angle - 90.0)
                 
@@ -434,7 +448,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     raw_lines = cv2.HoughLinesP(binary_edges, 1, np.pi / 180, p_hough["THRESHOLD"], minLineLength=min_len_pixels, maxLineGap=p_hough["MAX_LINE_GAP"])
     
     main_edges = merge_lines_and_get_main_edges(raw_lines, params)
-    edges_for_drawing, all_defects = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, binary_edges, params)
+    edges_for_drawing, all_defects = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, params)
     
     final_defects_for_report = []
     for defect in all_defects:
@@ -463,16 +477,34 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 location['x'] = int(center[0] + x)
                 location['y'] = int(center[1] + y)
 
-                if 'endpoints' in defect and 'distances' in defect:
+                if 'endpoints' in defect:
                     center_np = np.array(center)
-                    v1_final, v2_final = np.array(defect["endpoints"][0]), np.array(defect["endpoints"][1])
+                    p1_orig, p2_orig = np.array(defect["endpoints"][0]), np.array(defect["endpoints"][1])
+                    v1_final, v2_final = p1_orig, p2_orig
+                    
+                    p_vis_local = params.get("VISUALIZATION", {})
+                    retreat_threshold = p_vis_local.get("RETREAT_DISTANCE_THRESHOLD", 100.0)
+                    retreat_len_px = p_vis_local.get("EDGE_ENDPOINT_FIXED_LENGTH", 20)
+
+                    if "distances" in defect:
+                        dist1, dist2 = defect["distances"]
+                        if dist1 > retreat_threshold:
+                            vec1 = (p1_orig - center_np)
+                            norm_vec1 = np.linalg.norm(vec1)
+                            if norm_vec1 > 1e-6:
+                                v1_final = center_np + (vec1 / norm_vec1) * retreat_len_px
+                        if dist2 > retreat_threshold:
+                            vec2 = (p2_orig - center_np)
+                            norm_vec2 = np.linalg.norm(vec2)
+                            if norm_vec2 > 1e-6:
+                                v2_final = center_np + (vec2 / norm_vec2) * retreat_len_px
                     
                     pixel_area = 0.5 * abs(center_np[0]*(v1_final[1]-v2_final[1]) + v1_final[0]*(v2_final[1]-center_np[1]) + v2_final[0]*(center_np[1]-v1_final[1]))
                     location['pixel_area'] = round(pixel_area, 2)
 
-                    #if pixel_area < 15:
-                    #    continue
-                    #
+                    if pixel_area < 15:
+                        continue
+                    
                     dist_leg1_px = np.linalg.norm(center_np - v1_final)
                     dist_leg2_px = np.linalg.norm(center_np - v2_final)
                     length_px = max(dist_leg1_px, dist_leg2_px)
@@ -503,7 +535,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         
         min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
         if new_defect['type'] == 'Q':
-            if location.get('length_mm', 0) * location.get('width_mm', 0) < 1 or (width_px > 1e-6 and location.get('length_mm', 0) / location.get('width_mm', 0) > 3.0):
+            if location.get('length_mm', 0) * location.get('width_mm', 0) < 2.25 or location.get('length_mm', 0) / location.get('width_mm', 1) > 3.0:
                 continue
         elif new_defect['type'] in ['L', 'B']:
             if location.get('length_mm', 0) < min_size_mm:
@@ -567,17 +599,39 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         annotations_to_draw.append({'text': text, 'color': color_bgr})
 
         if defect["type"] == "Q" and "endpoints" in defect:
-            center = tuple(map(int, defect["center"]))
-            v1_final = tuple(map(int, defect["endpoints"][0]))
-            v2_final = tuple(map(int, defect["endpoints"][1]))
+            center = np.array(defect["center"])
+            p1_orig, p2_orig = np.array(defect["endpoints"][0]), np.array(defect["endpoints"][1])
+            v1_final, v2_final = p1_orig, p2_orig 
 
-            triangle_vertices = np.array([center, v1_final, v2_final], dtype=np.int32)
+            if "distances" in defect:
+                retreat_threshold = p_vis.get("RETREAT_DISTANCE_THRESHOLD", 100.0)
+                retreat_len = p_vis.get("EDGE_ENDPOINT_FIXED_LENGTH", 20)
+                dist1, dist2 = defect["distances"]
+                if dist1 > retreat_threshold:
+                    vec1 = (p1_orig - center)
+                    norm_vec1 = np.linalg.norm(vec1)
+                    if norm_vec1 > 1e-6:
+                        v1_final = center + (vec1 / norm_vec1) * retreat_len
+                if dist2 > retreat_threshold:
+                    vec2 = (p2_orig - center)
+                    norm_vec2 = np.linalg.norm(vec2)
+                    if norm_vec2 > 1e-6:
+                        v2_final = center + (vec2 / norm_vec2) * retreat_len
+                try:
+                    defect_report.setdefault('_adjusted_q_lengths_px', [
+                        float(np.linalg.norm(v1_final - center)),
+                        float(np.linalg.norm(v2_final - center))
+                    ])
+                except Exception:
+                    pass
+
+            triangle_vertices = np.array([tuple(map(int, center)), tuple(map(int, v1_final)), tuple(map(int, v2_final))], dtype=np.int32)
             overlay = roi_color.copy()
             cv2.fillPoly(overlay, [triangle_vertices], color_bgr)
             cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
             blue_color = (255, 0, 0)
-            draw_dashed_line(roi_color, center, v1_final, blue_color, thickness=2, dash_length=8)
-            draw_dashed_line(roi_color, center, v2_final, blue_color, thickness=2, dash_length=8)
+            draw_dashed_line(roi_color, tuple(map(int, center)), tuple(map(int, v1_final)), blue_color, thickness=2, dash_length=8)
+            draw_dashed_line(roi_color, tuple(map(int, center)), tuple(map(int, v2_final)), blue_color, thickness=2, dash_length=8)
 
         elif defect["type"] == "X" and "center" in defect:
             cv2.circle(roi_color, defect["center"], 15, color_bgr, THICKNESS)
