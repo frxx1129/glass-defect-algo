@@ -283,8 +283,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
                     if len_line2 > 1e-6:
                         shield2 = len_line2 * p_crack["ENDPOINT_SHIELD_RATIO"]
                         if np.linalg.norm(proj_point - line2[:2]) > shield2 and np.linalg.norm(proj_point - line2[2:]) > shield2:
-                            x, y, w, h = cv2.boundingRect(line1.reshape(-1, 2).astype(np.int32));
-                            crack_defects.append({"type": "L", "rect": (x,y,w,h)}); crack_indices.add(i); break
+                            contour = line1.reshape(-1, 2).astype(np.int32)
+                            min_area_rect = cv2.minAreaRect(contour)
+                            box_points = np.intp(cv2.boxPoints(min_area_rect))
+                            crack_defects.append({"type": "L", "box_points": box_points}); crack_indices.add(i); break
+
             if i in crack_indices: continue
             for point2 in [line2[:2], line2[2:]]:
                 proj_point, dist = get_point_line_segment_projection(point2, line1)
@@ -293,8 +296,10 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
                     if len_line1 > 1e-6:
                         shield1 = len_line1 * p_crack["ENDPOINT_SHIELD_RATIO"]
                         if np.linalg.norm(proj_point - line1[:2]) > shield1 and np.linalg.norm(proj_point - line1[2:]) > shield1:
-                            x, y, w, h = cv2.boundingRect(line2.reshape(-1, 2).astype(np.int32))
-                            crack_defects.append({"type": "L", "rect": (x,y,w,h)}); crack_indices.add(j); break
+                            contour = line2.reshape(-1, 2).astype(np.int32)
+                            min_area_rect = cv2.minAreaRect(contour)
+                            box_points = np.intp(cv2.boxPoints(min_area_rect))
+                            crack_defects.append({"type": "L", "box_points": box_points}); crack_indices.add(j); break
 
     true_edges = [edge for i, edge in enumerate(edges) if i not in crack_indices]
     
@@ -410,18 +415,72 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
             (w, h) = min_area_rect[1]
             width = min(w, h)
             length = max(w, h)
-            
-            if width < 1e-6: continue
-            
-            aspect_ratio = length / width
-            
+            aspect_ratio = length / width if width > 1e-6 else 0.0
+            # --- 新的、包含重新分类逻辑的代码块 ---
             if width < max_width and aspect_ratio > min_aspect_ratio:
                 continue
+
+            # 默认缺陷类型为崩边 'B'
+            defect_type = "B"
             
+            # 从配置中读取重新分类的参数
+            p_reclass = p_defect.get("RECLASSIFY_B_AS_L_PARAMS", {})
+            
+            # 只有在启用时才执行重新分类逻辑
+            if p_reclass.get("ENABLE", False):
+                # 条件1: 缺陷必须具有足够高的长宽比，才像裂纹
+                if aspect_ratio > p_reclass.get("MIN_ASPECT_RATIO", 4.0):
+                    
+                    # 获取缺陷的尺寸和原始角度
+                    (w, h) = min_area_rect[1]
+                    angle_raw = min_area_rect[2]
+
+                    # 1. 统一缺陷角度到 [0, 180) 范围，并确保它代表长轴方向
+                    #    cv2中，角度是与width边关联的。如果height才是长边，则真实角度需要+90度。
+                    defect_angle = angle_raw
+                    if w < h:
+                        defect_angle += 90
+
+                    #    进行归一化，使其落入 [0, 180) 区间
+                    while defect_angle < 0:
+                        defect_angle += 180
+                    defect_angle = defect_angle % 180
+
+                    # 遍历所有主边缘，检查垂直关系
+                    for edge in true_edges:
+                        # 条件2: 缺陷中心必须离主边缘足够近 (这部分逻辑不变)
+                        defect_center = np.array(min_area_rect[0])
+                        _, dist = get_point_line_segment_projection(defect_center, edge)
+                        if dist < p_reclass.get("MAX_DISTANCE_PX", 40):
+                            
+                            # 2. 统一主边缘的角度到 [0, 180) 范围
+                            edge_vec = np.array(edge[2:]) - np.array(edge[:2])
+                            edge_angle = np.degrees(np.arctan2(edge_vec[1], edge_vec[0]))
+                            
+                            #   进行归一化
+                            while edge_angle < 0:
+                                edge_angle += 180
+                            edge_angle = edge_angle % 180
+                            
+                            # 3. 在 [0, 180) 的标准下进行垂直判断
+                            #    计算两个角度的最小夹角
+                            angle_diff = abs(defect_angle - edge_angle)
+                            angle_diff = min(angle_diff, 180 - angle_diff) # 处理环绕问题(例如 170° 和 10° 其实只差 20°)
+                            # print(f"Defect angle: {defect_angle:.2f}, Edge angle: {edge_angle:.2f}, Angle diff: {angle_diff:.2f}")
+                            #    检查夹角是否接近90度
+                            if abs(angle_diff - 90.0) < p_reclass.get("ANGLE_TOLERANCE", 15.0):
+                                defect_type = "L"
+                                print(f"Reclassified defect at {defect_center} as 'L' type.")
+                                break
+                    
+                    if defect_type == "L":
+                        pass # 如果已经改为L型，外层循环也不用继续了(虽然此处只有一个外层循环)
+
             box_points = cv2.boxPoints(min_area_rect)
             box_points = np.intp(box_points)
             
-            chipping_defects.append({"type": "B", "box_points": box_points})
+            # 使用最终确定的 defect_type 添加缺陷
+            chipping_defects.append({"type": defect_type, "box_points": box_points})
     
     final_chipping_defects = []
     shield_radius = p_defect.get("CHIPPING_ENDPOINT_SHIELD_RADIUS", 30)
@@ -437,6 +496,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
                 final_chipping_defects.append(defect)
             
     return edges_for_drawing, corner_defects + final_chipping_defects + crack_defects
+
 
 def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm):
     x, y, w, h = int(roi_template['x']), int(roi_template['y']), int(roi_template['width']), int(roi_template['height'])
