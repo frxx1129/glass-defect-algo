@@ -568,6 +568,11 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         if new_defect['type'] == 'Q':
             if location.get('length_mm', 0) * location.get('width_mm', 0) < 2.25 or location.get('length_mm', 0) / location.get('width_mm', 1) > 3.0:
                 continue
+            if min(location.get('length_mm', 0), location.get('width_mm', 0)) < 2.0:
+                continue
+            if location.get('length_mm', 0)< min_size_mm:
+                continue
+            
         elif new_defect['type'] in ['L', 'B']:
             if location.get('length_mm', 0) < min_size_mm:
                 continue
@@ -584,11 +589,12 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             area_mm2 = length_mm * width_mm
             aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
             
-            if area_mm2 > 80 and aspect_ratio > 3.0:
+            if aspect_ratio > 10.0:
                 continue
-            if location.get('length_mm', 0) <0.5 or location.get('width_mm', 0) < 0.5:
+            
+            if area_mm2 < 25 and width_mm < min_size_mm:
                 continue
-
+            
             p_reclass = params["DEFECT_DETECTION"].get("RECLASSIFY_B_AS_L_PARAMS", {})
             min_area_rect = defect.get("min_area_rect")
 

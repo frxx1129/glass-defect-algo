@@ -570,6 +570,8 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 continue
             if min(location.get('length_mm', 0), location.get('width_mm', 0)) < 2.0:
                 continue
+            if location.get('length_mm', 0)< min_size_mm:
+                continue
             
         elif new_defect['type'] in ['L', 'B']:
             if location.get('length_mm', 0) < min_size_mm:
@@ -588,6 +590,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
             
             if aspect_ratio > 10.0:
+                continue
+            
+            if area_mm2 < 25 and width_mm < min_size_mm:
                 continue
             
            #if area_mm2 > 80 and aspect_ratio > 3.0:
@@ -691,7 +696,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         pt1 = tuple(map(int, edge[:2]))
         pt2 = tuple(map(int, edge[2:]))
         #绘制直线
-        cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
+        #cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
 
     annotations_to_draw = []
     
