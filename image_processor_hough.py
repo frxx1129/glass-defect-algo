@@ -568,7 +568,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         d.pop('raw_defect', None)
 
     roi_color = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
-    DEFECT_COLORS_BGR = {'Q': (0, 0, 255), 'X': (0, 255, 255), 'L': (255, 0, 255), 'B': (0, 165, 255)}
+    DEFECT_COLORS_BGR = {'Q': (0, 0, 255), 'X': (255, 0, 0), 'L': (255, 0, 255), 'B': (0, 165, 255)}
     p_vis = params["VISUALIZATION"]
     THICKNESS = 3
     
