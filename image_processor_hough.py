@@ -607,7 +607,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             if location.get('length_mm', 0) * location.get('width_mm', 0) > 1000: continue
             if location.get('width_mm', 0) < 1: continue
             if location.get('width_mm', 0) > 7.0: continue
-            if location.get('length_mm', 0) / max(location.get('width_mm', 1e-6), 1e-6) > 20.0: continue
+            if location.get('length_mm', 0) / max(location.get('width_mm', 1e-6), 1e-6) > 8.0: continue
         
         if new_defect['type'] == 'B':
             length_mm = location.get('length_mm', 0); width_mm = location.get('width_mm', 0)
