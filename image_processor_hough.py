@@ -538,6 +538,8 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         
         min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
         if new_defect['type'] == 'Q':
+            length_mm = location.get('length_mm', 0)
+            width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm
             aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
             if area_mm2 < 10.0:
