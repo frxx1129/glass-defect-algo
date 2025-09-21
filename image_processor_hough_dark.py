@@ -567,7 +567,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
             if aspect_ratio > 10.0:
                 continue
-            if area_mm2 < 25.0:
+            if area_mm2 < 16.0:
                 continue
             if width_mm > 4.0 and aspect_ratio > 6.0:
                 continue
