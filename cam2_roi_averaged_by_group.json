@@ -3,16 +3,16 @@
         "source_image_count": 1,
         "averaged_rois": [
             {
-                "x": 195,
-                "y": 239,
-                "width": 2015,
-                "height": 227
+                "x": 24,
+                "y": 281,
+                "width": 2394,
+                "height": 233
             },
             {
-                "x": 70,
-                "y": 1049,
-                "width": 2272,
-                "height": 233
+                "x": 34,
+                "y": 1095,
+                "width": 2384,
+                "height": 237
             }
         ]
     }

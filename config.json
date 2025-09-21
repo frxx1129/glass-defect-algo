@@ -26,7 +26,7 @@
   "alarm_light_params": {
     "port": "COM3",
     "ng_buzz_duration_s": 0.1,
-    "rejection_buzz_duration_s": 0.2
+    "rejection_buzz_duration_s": 0.3
   },
   "camera_setup": {
     "expected_cameras": 5,
@@ -68,30 +68,30 @@
     "camera_bindings": [
       {
         "index": 0,
+        "physical_index": 3,
+        "mac": "94:AA:B8:04:6B:18",
+        "ip": "192.168.7.124",
+        "model": "MV-HP500GM"
+      },
+      {
+        "index": 1,
         "physical_index": 0,
         "mac": "94:AA:B8:03:DD:F7",
         "ip": "192.168.3.147",
         "model": "MV-HP500GM"
       },
       {
-        "index": 1,
+        "index": 2,
         "physical_index": 1,
         "mac": "94:AA:B8:07:9E:73",
         "ip": "192.168.5.115",
         "model": "MV-HP500GM"
       },
       {
-        "index": 2,
+        "index": 3,
         "physical_index": 2,
         "mac": "94:AA:B8:04:11:95",
         "ip": "192.168.6.149",
-        "model": "MV-HP500GM"
-      },
-      {
-        "index": 3,
-        "physical_index": 3,
-        "mac": "94:AA:B8:04:6B:18",
-        "ip": "192.168.7.124",
         "model": "MV-HP500GM"
       },
       {
@@ -109,7 +109,7 @@
         "frame_rate": 18
       },
       "exposure": {
-        "value_us": 211
+        "value_us": 320
       },
       "gain": {
         "value_db": 1.2
@@ -124,10 +124,10 @@
     }
   },
   "camera_rois": {
-    "0": "cam2_roi_averaged_by_group.json",
-    "1": "cam3_roi_averaged_by_group.json",
-    "2": "cam4_roi_averaged_by_group.json",
-    "3": "cam1_roi_averaged_by_group.json",
+    "0": "cam5_roi_averaged_by_group.json",
+    "1": "cam2_roi_averaged_by_group.json",
+    "2": "cam3_roi_averaged_by_group.json",
+    "3": "cam4_roi_averaged_by_group.json",
     "4": "cam5_roi_averaged_by_group.json"
   },
   "server_config": {
@@ -154,16 +154,16 @@
         8,
         8
       ],
-      "CANNY_THRESHOLD_LOW": 40,
-      "CANNY_THRESHOLD_HIGH": 105
+      "CANNY_THRESHOLD_LOW": 30,
+      "CANNY_THRESHOLD_HIGH": 90
     },
     "HOUGH_TRANSFORM": {
-      "THRESHOLD": 40,
-      "MIN_LINE_LENGTH_RATIO": 0.075,
+      "THRESHOLD": 30,
+      "MIN_LINE_LENGTH_RATIO": 0.05,
       "MAX_LINE_GAP": 20
     },
     "LINE_MERGING": {
-      "ANGLE_TOLERANCE": 2,
+      "ANGLE_TOLERANCE": 1.5,
       "MAX_LATERAL_DISTANCE": 30,
       "TOP_N_EDGES": 6
     },
@@ -179,23 +179,24 @@
       "FALSE_DEFECT_MAX_WIDTH": 8.0,
       "FALSE_DEFECT_MIN_ASPECT_RATIO": 5.0,
       "ANGLE_DEVIATION_TOLERANCE": 2.0,
-      "Q_DEFECT_GRADIENT_THRESHOLD": 3.0,
-      "CORNER_MAX_PHYSICAL_GAP": 3,
-      "CORNER_MIN_VIRTUAL_GAP": 5.0,
-      "CORNER_MAX_EXTENSION_DIST_NORMAL": 100,
+      "Q_DEFECT_GRADIENT_THRESHOLD": 2.5,
+      "SHADOW_FILTER_MIN_EXTENT_RATIO": 0.25,
+      "CORNER_MAX_PHYSICAL_GAP": 7,
+      "CORNER_MIN_VIRTUAL_GAP": 7.0,
+      "CORNER_MAX_EXTENSION_DIST_NORMAL": 0,
       "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR": 200,
       "PERPENDICULAR_ANGLE_TOLERANCE": 10,
       "LUMINOSITY_SCAN_WIDTH": 200,
       "LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD": 75,
       "LUMINOSITY_STD_DEV_MULTIPLIER": 3.0,
       "LUMINOSITY_MIN_AREA": 30,
-      "LUMINOSITY_EDGE_IGNORE_WIDTH": 5,
+      "LUMINOSITY_EDGE_IGNORE_WIDTH": 3,
       "LUMINOSITY_MIN_GRADIENT": 30,
       "CHIPPING_ENDPOINT_SHIELD_RADIUS": 15,
       "RECLASSIFY_B_AS_L_PARAMS": {
         "ENABLE": true,
         "MIN_ASPECT_RATIO": 3.2,
-        "MAX_DISTANCE_PX": 250,
+        "MAX_DISTANCE_PX": 200,
         "ANGLE_TOLERANCE": 15.0
       }
     },
@@ -224,10 +225,13 @@
     "LINE_MERGING": {
       "ANGLE_TOLERANCE": 0.8,
       "MAX_LATERAL_DISTANCE": 12,
-      "TOP_N_EDGES": 6
+      "TOP_N_EDGES": 8
     },
     "CRACK_CLASSIFICATION": {
-      "ENDPOINT_SHIELD_RATIO": 0.1
+      "ENDPOINT_SHIELD_RATIO": 0.1,
+      "PARALLEL_CRACK_FILTER_ENABLE": true,
+      "PARALLEL_CRACK_FILTER_ANGLE_TOLERANCE": 5.0,
+      "PARALLEL_CRACK_FILTER_MAX_DISTANCE_PX": 10.0
     },
     "DEFECT_DETECTION": {
       "MIN_DEFECT_SIZE_MM": 3.0,
@@ -237,25 +241,26 @@
       ],
       "FALSE_DEFECT_MAX_WIDTH": 8.0,
       "FALSE_DEFECT_MIN_ASPECT_RATIO": 5.0,
-      "ANGLE_DEVIATION_TOLERANCE": 1.0,
+      "ANGLE_DEVIATION_TOLERANCE": 2.0,
       "Q_DEFECT_GRADIENT_THRESHOLD": 4.0,
-      "CORNER_MAX_PHYSICAL_GAP": 5,
-      "CORNER_MIN_VIRTUAL_GAP": 5.0,
-      "CORNER_MAX_EXTENSION_DIST_NORMAL": 75,
+      "SHADOW_FILTER_MIN_EXTENT_RATIO": 0.25,
+      "CORNER_MAX_PHYSICAL_GAP": 7,
+      "CORNER_MIN_VIRTUAL_GAP": 7.0,
+      "CORNER_MAX_EXTENSION_DIST_NORMAL": 0,
       "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR": 125,
       "PERPENDICULAR_ANGLE_TOLERANCE": 10,
-      "LUMINOSITY_SCAN_WIDTH": 150,
-      "LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD": 75,
+      "LUMINOSITY_SCAN_WIDTH": 200,
+      "LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD": 50,
       "LUMINOSITY_STD_DEV_MULTIPLIER": 1.5,
       "LUMINOSITY_MIN_AREA": 50,
       "LUMINOSITY_EDGE_IGNORE_WIDTH": 2,
-      "LUMINOSITY_MIN_GRADIENT": 25,
+      "LUMINOSITY_MIN_GRADIENT": 10,
       "CHIPPING_ENDPOINT_SHIELD_RADIUS": 0,
       "RECLASSIFY_B_AS_L_PARAMS": {
         "ENABLE": true,
         "MIN_ASPECT_RATIO": 4.0,
-        "MAX_DISTANCE_PX": 250,
-        "ANGLE_TOLERANCE": 25.0
+        "MAX_DISTANCE_PX": 200,
+        "ANGLE_TOLERANCE": 15.0
       }
     },
     "VISUALIZATION": {
