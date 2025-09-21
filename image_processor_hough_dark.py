@@ -121,11 +121,10 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
     mean, std_dev = cv2.meanStdDev(roi_gray, mask=scan_mask)
     
     initial_contours = []
-    # 仅在图像区域存在一定标准差时才进行检测，避免在纯色区域误检
     if std_dev[0][0] > 3:
-        # 使用严格的亮度阈值进行缺陷检测
-        strict_threshold = p.get("LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD", 75)
-        potential_defects = (roi_gray < strict_threshold).astype(np.uint8) * 255
+        # 步骤1: 使用基于均值和标准差的动态阈值进行初步筛选
+        threshold_low = mean[0][0] - p["LUMINOSITY_STD_DEV_MULTIPLIER"] * std_dev[0][0]
+        potential_defects = (roi_gray < threshold_low).astype(np.uint8) * 255
         defect_mask = cv2.bitwise_and(potential_defects, scan_mask)
 
         if p.get("LUMINOSITY_EDGE_IGNORE_WIDTH", 0) > 0:
@@ -137,6 +136,8 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
         
         if contours:
             min_gradient_threshold = p.get("LUMINOSITY_MIN_GRADIENT", 15.0)
+            # 从配置中获取严格的亮度阈值
+            strict_brightness_threshold = p.get("LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD", 75)
 
             blurred = cv2.medianBlur(roi_gray, 3)
             grad_x = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
@@ -148,10 +149,13 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
                     contour_mask = np.zeros_like(roi_gray)
                     cv2.drawContours(contour_mask, [cnt], -1, 255, -1)
                     
-                    mean_grad_val = cv2.mean(grad_mag, mask=contour_mask)[0]
-
-                    if mean_grad_val > min_gradient_threshold:
-                        initial_contours.append(cnt)
+                    # 步骤2: 对初步筛选出的缺陷，进行严格的亮度阈值二次筛选
+                    mean_brightness_val = cv2.mean(roi_gray, mask=contour_mask)[0]
+                    if mean_brightness_val < strict_brightness_threshold:
+                        # 步骤3: 通过亮度筛选后，再进行梯度检查
+                        mean_grad_val = cv2.mean(grad_mag, mask=contour_mask)[0]
+                        if mean_grad_val > min_gradient_threshold:
+                            initial_contours.append(cnt)
     
     return initial_contours
 
