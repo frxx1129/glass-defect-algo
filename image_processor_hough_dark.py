@@ -487,6 +487,10 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     for defect in all_defects:
         new_defect = {'type': defect['type']}
         location = {}
+        
+        # --- MODIFICATION START: Introduce a flag to mark defects for filtering ---
+        should_be_filtered = False
+        # --- MODIFICATION END ---
 
         if defect['type'] == 'L':
             box_pts = defect.get('box_points')
@@ -545,11 +549,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             location['width_mm'] = float(round(width_px / pixels_per_mm, 2))
 
         new_defect['location'] = location
-        new_defect['raw_defect'] = defect # Keep raw defect for filtering
-
+        
         min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
-
-        # Apply B to L reclassification first
+        
         if new_defect['type'] == 'B':
             p_reclass = params["DEFECT_DETECTION"].get("RECLASSIFY_B_AS_L_PARAMS", {})
             min_area_rect = defect.get("min_area_rect")
@@ -559,7 +561,8 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
 
             if p_reclass.get("ENABLE", False) and min_area_rect and aspect_ratio > p_reclass.get("MIN_ASPECT_RATIO", 4.0):
-                is_reclassified = False
+                target_edge = None
+                
                 (w_rect, h_rect) = min_area_rect[1]; angle_raw = min_area_rect[2]
                 defect_angle = angle_raw + 90 if w_rect < h_rect else angle_raw
                 defect_angle = (defect_angle % 180 + 180) % 180
@@ -572,54 +575,105 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                         edge_angle = (np.degrees(np.arctan2(edge_vec[1], edge_vec[0])) % 180 + 180) % 180
                         angle_diff = min(abs(defect_angle - edge_angle), 180 - abs(defect_angle - edge_angle))
                         if abs(angle_diff - 90.0) < p_reclass.get("ANGLE_TOLERANCE", 15.0):
-                            new_defect['type'] = "L"; is_reclassified = True; break
+                            new_defect['type'] = "L"
+                            target_edge = edge
+                            break
                 
-        if new_defect['type'] in ['B', 'L']:
-            raw_defect = new_defect['raw_defect']
-            if raw_defect.get('type') == 'B': 
-                min_extent_ratio = params["DEFECT_DETECTION"].get("SHADOW_FILTER_MIN_EXTENT_RATIO", 0.25)
-                
-                contour = raw_defect.get('contour')
-                min_area_rect = raw_defect.get('min_area_rect')
+                # --- MODIFICATION START: Extension and Endpoint Shield Logic ---
+                if new_defect['type'] == "L" and target_edge is not None:
+                    center = np.array(min_area_rect[0])
+                    defect_length = max(w_rect, h_rect)
+                    defect_width = min(w_rect, h_rect)
+                    
+                    angle_rad = np.deg2rad(defect_angle)
+                    vec = np.array([np.cos(angle_rad), np.sin(angle_rad)])
+                    ep1 = center + vec * defect_length / 2
+                    ep2 = center - vec * defect_length / 2
+                    
+                    _, dist1 = get_point_line_segment_projection(ep1, target_edge)
+                    _, dist2 = get_point_line_segment_projection(ep2, target_edge)
+                    far_endpoint = ep1 if dist1 > dist2 else ep2
 
-                if contour is not None and min_area_rect is not None:
-                    contour_area = cv2.contourArea(contour)
-                    rect_w, rect_h = min_area_rect[1]
-                    rect_area = rect_w * rect_h
+                    axis_line = np.hstack([ep1, ep2])
+                    intersection_point = find_line_intersection(axis_line, target_edge)
 
-                    if rect_area > 1e-6:
-                        extent_ratio = contour_area / rect_area
-                        if extent_ratio < min_extent_ratio:
-                            continue
+                    if intersection_point is not None:
+                        # New shield logic to filter corner false positives
+                        is_valid_location = True
+                        shield_ratio = p_reclass.get("ENDPOINT_SHIELD_RATIO_FOR_EXTENDED", 0.1)
+                        if shield_ratio > 0:
+                            edge_p1 = np.array(target_edge[:2])
+                            edge_p2 = np.array(target_edge[2:])
+                            edge_length = np.linalg.norm(edge_p1 - edge_p2)
+                            
+                            if edge_length > 1e-6:
+                                shield_distance = edge_length * shield_ratio
+                                dist_from_p1 = np.linalg.norm(intersection_point - edge_p1)
+                                dist_from_p2 = np.linalg.norm(intersection_point - edge_p2)
+                                
+                                if dist_from_p1 < shield_distance or dist_from_p2 < shield_distance:
+                                    is_valid_location = False
+                        
+                        if is_valid_location:
+                            # If location is valid, proceed with extension
+                            new_length = np.linalg.norm(far_endpoint - intersection_point)
+                            new_center = (far_endpoint + intersection_point) / 2
+                            new_size = (new_length, defect_width) if w_rect > h_rect else (defect_width, new_length)
+                            new_min_area_rect = (tuple(new_center), new_size, angle_raw)
+                            new_box_points = np.intp(cv2.boxPoints(new_min_area_rect))
+                            
+                            defect['box_points'] = new_box_points
+                            location['length_mm'] = float(round(new_length / pixels_per_mm, 2))
+                            location['width_mm'] = float(round(defect_width / pixels_per_mm, 2))
+                            location['x'] = int(new_center[0] + x)
+                            location['y'] = int(new_center[1] + y)
+                        else:
+                            # If location is invalid, mark the defect for filtering
+                            should_be_filtered = True
+                # --- MODIFICATION END ---
         
-        # General size filtering
+        new_defect['raw_defect'] = defect 
+        
+        if new_defect.get('raw_defect', {}).get('type') == 'B':
+            min_extent_ratio = params["DEFECT_DETECTION"].get("SHADOW_FILTER_MIN_EXTENT_RATIO", 0.25)
+            contour = defect.get('contour')
+            min_area_rect_for_extent = defect.get('min_area_rect')
+            if contour is not None and min_area_rect_for_extent is not None:
+                contour_area = cv2.contourArea(contour)
+                rect_w, rect_h = min_area_rect_for_extent[1]
+                rect_area = rect_w * rect_h
+                if rect_area > 1e-6 and (contour_area / rect_area) < min_extent_ratio:
+                    continue
+
         if new_defect['type'] == 'Q':
             length_mm = location.get('length_mm', 0); width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm; aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
             if area_mm2 < 2.25 or aspect_ratio > 3.0: continue
             if min(length_mm, width_mm) < 2.0: continue
-            if width_mm < 0.1: continue
+            if length_mm < min_size_mm: continue
+            
         elif new_defect['type'] in ['L', 'B']:
             if location.get('length_mm', 0) < min_size_mm:
                 continue
 
         if new_defect['type'] == 'L':
             if location.get('length_mm', 0) * location.get('width_mm', 0) > 1000: continue
-            if location.get('width_mm', 0) < 1: continue
-            if location.get('width_mm', 0) > 7.0: continue
-            if location.get('length_mm', 0) / max(location.get('width_mm', 1e-6), 1e-6) > 8.0: continue
+            if location.get('width_mm', 0) < 0.1: continue
+            if location.get('width_mm', 0) > 10.0: continue
         
         if new_defect['type'] == 'B':
             length_mm = location.get('length_mm', 0); width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm; aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
+            
+            if aspect_ratio > 7.5: continue
             if area_mm2 < 25 and width_mm < min_size_mm: continue
-            if width_mm < 1.0: continue
+            if area_mm2 > 4000 and width_mm < 50: continue
             if area_mm2 > 1000 and aspect_ratio > 5.0: continue
-            if aspect_ratio > 10.0: continue
-            if width_mm > 4.0 and aspect_ratio > 6.0: continue
-
-
-        final_defects_for_report.append(new_defect)
+        
+        # --- MODIFICATION START: Final check of the filter flag ---
+        if not should_be_filtered:
+            final_defects_for_report.append(new_defect)
+        # --- MODIFICATION END ---
         
     roi_report = {
         "roi_idx": roi_idx, "x": x, "y": y, "w": w, "h": h,
@@ -632,18 +686,14 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     roi_color = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
     DEFECT_COLORS_BGR = {'Q': (0, 0, 255), 'X': (255, 0, 0), 'L': (255, 0, 255), 'B': (0, 165, 255)}
     p_vis = params["VISUALIZATION"]
-    THICKNESS = 1
+    THICKNESS = 3
     
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
     
-    # --- THIS IS THE CORRECTED CODE BLOCK ---
-    # This loop draws the final, processed lines onto the image
     for edge in edges_for_drawing:
         pt1 = tuple(map(int, edge[:2]))
         pt2 = tuple(map(int, edge[2:]))
-        # Draws a green line with a thickness of 2 pixels
         cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
-    # --- END OF CORRECTION ---
 
     annotations_to_draw = []
     
@@ -723,7 +773,6 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         roi_color = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
     return roi_report, roi_color
-
 
 def process_image_from_memory_parallel(image_gray, template_rois, config):
     final_image = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)

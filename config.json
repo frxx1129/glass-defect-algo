@@ -197,7 +197,8 @@
         "ENABLE": true,
         "MIN_ASPECT_RATIO": 3.2,
         "MAX_DISTANCE_PX": 200,
-        "ANGLE_TOLERANCE": 15.0
+        "ANGLE_TOLERANCE": 15.0,
+        "ENDPOINT_SHIELD_RATIO_FOR_EXTENDED": 0.1
       }
     },
     "VISUALIZATION": {
@@ -260,7 +261,8 @@
         "ENABLE": true,
         "MIN_ASPECT_RATIO": 4.0,
         "MAX_DISTANCE_PX": 200,
-        "ANGLE_TOLERANCE": 15.0
+        "ANGLE_TOLERANCE": 15.0,
+        "ENDPOINT_SHIELD_RATIO_FOR_EXTENDED": 0.1
       }
     },
     "VISUALIZATION": {
