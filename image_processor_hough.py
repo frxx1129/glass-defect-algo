@@ -122,7 +122,6 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
     
     initial_contours = []
     if std_dev[0][0] > 3:
-        # 步骤1: 使用基于均值和标准差的动态阈值进行初步筛选
         threshold_low = mean[0][0] - p["LUMINOSITY_STD_DEV_MULTIPLIER"] * std_dev[0][0]
         potential_defects = (roi_gray < threshold_low).astype(np.uint8) * 255
         defect_mask = cv2.bitwise_and(potential_defects, scan_mask)
@@ -136,8 +135,6 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
         
         if contours:
             min_gradient_threshold = p.get("LUMINOSITY_MIN_GRADIENT", 15.0)
-            # 从配置中获取严格的亮度阈值
-            strict_brightness_threshold = p.get("LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD", 75)
 
             blurred = cv2.medianBlur(roi_gray, 3)
             grad_x = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
@@ -149,13 +146,10 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
                     contour_mask = np.zeros_like(roi_gray)
                     cv2.drawContours(contour_mask, [cnt], -1, 255, -1)
                     
-                    # 步骤2: 对初步筛选出的缺陷，进行严格的亮度阈值二次筛选
-                    mean_brightness_val = cv2.mean(roi_gray, mask=contour_mask)[0]
-                    if mean_brightness_val < strict_brightness_threshold:
-                        # 步骤3: 通过亮度筛选后，再进行梯度检查
-                        mean_grad_val = cv2.mean(grad_mag, mask=contour_mask)[0]
-                        if mean_grad_val > min_gradient_threshold:
-                            initial_contours.append(cnt)
+                    mean_grad_val = cv2.mean(grad_mag, mask=contour_mask)[0]
+
+                    if mean_grad_val > min_gradient_threshold:
+                        initial_contours.append(cnt)
     
     return initial_contours
 
@@ -542,6 +536,16 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm
             aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
+            if location.get('length_mm', 0) * location.get('width_mm', 0) < 2.25 or location.get('length_mm', 0) / location.get('width_mm', 1) > 3.0:
+                continue
+            if min(location.get('length_mm', 0), location.get('width_mm', 0)) < 2.0:
+                continue
+            if location.get('length_mm', 0)< min_size_mm:
+                continue
+            if area_mm2 < 10.0:
+                continue
+            if location.get('length_mm', 0) < min_size_mm:
+                continue
             if area_mm2 < 10.0:
                 continue
             if location.get('length_mm', 0) < min_size_mm:
@@ -556,10 +560,11 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 continue
 
         if new_defect['type'] == 'L':
-
+            if location.get('length_mm', 0) * location.get('width_mm', 0) > 1000:
+                continue
             if location.get('width_mm', 0) < 0.1:
                 continue
-            if location.get('width_mm', 0) > 15.0:
+            if location.get('width_mm', 0) > 10.0:
                 continue
         
         if new_defect['type'] == 'B':
@@ -567,13 +572,21 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm
             aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
+            
+            if area_mm2 < 25 and width_mm < min_size_mm:
+                continue
+            if area_mm2 > 4000 and width_mm < 50:
+                continue
+            if area_mm2 > 1000 and aspect_ratio > 5.0:
+                continue
+            if area_mm2 > 1500 and area_mm2 <2000 and 2.0 < aspect_ratio < 3.0:
+                continue
             if aspect_ratio > 10.0:
                 continue
             if area_mm2 < 16.0:
                 continue
             if width_mm > 4.0 and aspect_ratio > 6.0:
                 continue
-            
             
             p_reclass = params["DEFECT_DETECTION"].get("RECLASSIFY_B_AS_L_PARAMS", {})
             min_area_rect = defect.get("min_area_rect")
@@ -655,7 +668,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     roi_color = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
     DEFECT_COLORS_BGR = {'Q': (0, 0, 255), 'X': (255, 0, 0), 'L': (255, 0, 255), 'B': (0, 165, 255)}
     p_vis = params["VISUALIZATION"]
-    THICKNESS = 1
+    THICKNESS = 3
     
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
     
@@ -663,7 +676,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         pt1 = tuple(map(int, edge[:2]))
         pt2 = tuple(map(int, edge[2:]))
         #绘制直线
-        cv2.line(roi_color, pt1, pt2, (0, 255, 0), 1)
+        cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
 
     annotations_to_draw = []
     
@@ -708,8 +721,8 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             cv2.fillPoly(overlay, [triangle_vertices], color_bgr)
             cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
             blue_color = (255, 0, 0)
-            draw_dashed_line(roi_color, tuple(map(int, center)), tuple(map(int, v1_final)), blue_color, thickness=1, dash_length=8)
-            draw_dashed_line(roi_color, tuple(map(int, center)), tuple(map(int, v2_final)), blue_color, thickness=1, dash_length=8)
+            draw_dashed_line(roi_color, tuple(map(int, center)), tuple(map(int, v1_final)), blue_color, thickness=2, dash_length=8)
+            draw_dashed_line(roi_color, tuple(map(int, center)), tuple(map(int, v2_final)), blue_color, thickness=2, dash_length=8)
 
         elif defect["type"] == "X" and "center" in defect:
             cv2.circle(roi_color, defect["center"], 15, color_bgr, THICKNESS)
