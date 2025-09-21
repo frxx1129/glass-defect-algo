@@ -28,6 +28,11 @@ dist/
 .eggs/
 *.egg-info/
 
+*.zip
+*.tar.gz
+*.tar.bz2
+*.whl
+
 # OS junk
 Thumbs.db
 .DS_Store
