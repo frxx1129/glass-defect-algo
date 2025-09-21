@@ -109,7 +109,7 @@
         "frame_rate": 18
       },
       "exposure": {
-        "value_us": 320
+        "value_us": 295
       },
       "gain": {
         "value_db": 1.2
@@ -192,7 +192,7 @@
       "LUMINOSITY_MIN_AREA": 30,
       "LUMINOSITY_EDGE_IGNORE_WIDTH": 3,
       "LUMINOSITY_MIN_GRADIENT": 30,
-      "CHIPPING_ENDPOINT_SHIELD_RADIUS": 15,
+      "CHIPPING_ENDPOINT_SHIELD_RADIUS": 0,
       "RECLASSIFY_B_AS_L_PARAMS": {
         "ENABLE": true,
         "MIN_ASPECT_RATIO": 3.2,
@@ -256,7 +256,7 @@
       "LUMINOSITY_MIN_AREA": 50,
       "LUMINOSITY_EDGE_IGNORE_WIDTH": 2,
       "LUMINOSITY_MIN_GRADIENT": 10,
-      "CHIPPING_ENDPOINT_SHIELD_RADIUS": 0,
+      "CHIPPING_ENDPOINT_SHIELD_RADIUS": 5,
       "RECLASSIFY_B_AS_L_PARAMS": {
         "ENABLE": true,
         "MIN_ASPECT_RATIO": 4.0,

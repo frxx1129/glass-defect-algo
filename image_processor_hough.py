@@ -39,7 +39,7 @@ def _get_font(font_size=36):
     except Exception:
         return None
 
-ANNOTATION_FONT = _get_font(font_size=36)
+ANNOTATION_FONT = _get_font(font_size=32)
 
 
 # ====================================================================================
@@ -470,6 +470,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
         surviving_chipping_defects = final_chipping_defects
             
     return edges_for_drawing, corner_defects + surviving_chipping_defects + crack_defects
+
 
 def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm):
     x, y, w, h = int(roi_template['x']), int(roi_template['y']), int(roi_template['width']), int(roi_template['height'])

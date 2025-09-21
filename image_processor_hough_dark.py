@@ -39,7 +39,7 @@ def _get_font(font_size=36):
     except Exception:
         return None
 
-ANNOTATION_FONT = _get_font(font_size=36)
+ANNOTATION_FONT = _get_font(font_size=32)
 
 
 # ====================================================================================
