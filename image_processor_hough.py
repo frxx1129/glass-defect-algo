@@ -370,7 +370,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
                 angle = calculate_vertex_angle(p1_far, intersection, p2_far)
                 
                 # --- BUG FIX START: Corrected X-Defect (斜边) Logic ---
-                if angle < 45.0:
+                if angle < 45. or angle > 135:
                     continue
                 
                 # 1. First, calculate the potential corrected angle from the original measurement
@@ -619,6 +619,12 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             # If location is valid, proceed with extension
                             new_length = np.linalg.norm(far_endpoint - intersection_point)
                             new_center = (far_endpoint + intersection_point) / 2
+                            #如果中心位置过于贴近任意一条主边缘，则不进行缺陷报告
+                            for edge in main_edges:
+                                dist_to_edge = get_point_line_segment_projection(new_center, edge)[1]
+                                if dist_to_edge < 10.0 :
+                                    is_valid_location = False
+                                    break
                             new_size = (new_length, defect_width) if w_rect > h_rect else (defect_width, new_length)
                             new_min_area_rect = (tuple(new_center), new_size, angle_raw)
                             new_box_points = np.intp(cv2.boxPoints(new_min_area_rect))
@@ -628,6 +634,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             location['width_mm'] = float(round(defect_width / pixels_per_mm, 2))
                             location['x'] = int(new_center[0] + x)
                             location['y'] = int(new_center[1] + y)
+                            
                         else:
                             # If location is invalid, mark the defect for filtering
                             should_be_filtered = True
@@ -691,10 +698,10 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
     
-    #for edge in edges_for_drawing:
-    #    pt1 = tuple(map(int, edge[:2]))
-    #    pt2 = tuple(map(int, edge[2:]))
-    #    cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
+    for edge in edges_for_drawing:
+        pt1 = tuple(map(int, edge[:2]))
+        pt2 = tuple(map(int, edge[2:]))
+        cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
 
     annotations_to_draw = []
     
