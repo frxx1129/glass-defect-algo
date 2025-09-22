@@ -583,6 +583,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 # --- MODIFICATION START: Extension and Endpoint Shield Logic ---
                 if new_defect['type'] == "L" and target_edge is not None:
                     center = np.array(min_area_rect[0])
+                    
                     defect_length = max(w_rect, h_rect)
                     defect_width = min(w_rect, h_rect)
                     
@@ -619,12 +620,6 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             # If location is valid, proceed with extension
                             new_length = np.linalg.norm(far_endpoint - intersection_point)
                             new_center = (far_endpoint + intersection_point) / 2
-                            #如果中心位置过于贴近任意一条主边缘，则不进行缺陷报告
-                            for edge in main_edges:
-                                dist_to_edge = get_point_line_segment_projection(new_center, edge)[1]
-                                if dist_to_edge < 10.0 :
-                                    is_valid_location = False
-                                    break
                             new_size = (new_length, defect_width) if w_rect > h_rect else (defect_width, new_length)
                             new_min_area_rect = (tuple(new_center), new_size, angle_raw)
                             new_box_points = np.intp(cv2.boxPoints(new_min_area_rect))
@@ -634,6 +629,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             location['width_mm'] = float(round(defect_width / pixels_per_mm, 2))
                             location['x'] = int(new_center[0] + x)
                             location['y'] = int(new_center[1] + y)
+                            aspect_ratio = new_length / defect_width if defect_width > 1e-6 else float('inf')
+                            if aspect_ratio > 50:
+                                should_be_filtered = True
                             
                         else:
                             # If location is invalid, mark the defect for filtering
@@ -656,7 +654,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         if new_defect['type'] == 'Q':
             length_mm = location.get('length_mm', 0); width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm; aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
-            if area_mm2 < 2.25 or aspect_ratio > 3.0: continue
+            if area_mm2 < 2.25 or aspect_ratio > 3.6: continue
             if min(length_mm, width_mm) < 2.0: continue
             if length_mm < min_size_mm: continue
             
@@ -666,9 +664,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
         if new_defect['type'] == 'L':
             if location.get('length_mm', 0) * location.get('width_mm', 0) > 1000: continue
-            if location.get('width_mm', 0) < 0.1: continue
+            if location.get('width_mm', 0) < 0.75: continue
             if location.get('width_mm', 0) > 10.0: continue
-        
+
         if new_defect['type'] == 'B':
             length_mm = location.get('length_mm', 0); width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm; aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
@@ -677,6 +675,45 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             if area_mm2 < 25 and width_mm < min_size_mm: continue
             if area_mm2 > 4000 and width_mm < 50: continue
             if area_mm2 > 1000 and aspect_ratio > 5.0: continue
+
+         #如果两个裂缝的位置有重叠则合并
+        if new_defect['type'] == 'L':
+            existing_L_defects = [d for d in final_defects_for_report if d['type'] == 'L']
+            new_box = defect.get('box_points')
+            if new_box is not None and len(new_box) == 4:
+                new_rect = cv2.minAreaRect(new_box)
+                new_box_pts = cv2.boxPoints(new_rect)
+                new_box_polygon = np.array(new_box_pts, dtype=np.int32)
+                
+                merged = False
+                for existing_defect in existing_L_defects:
+                    existing_box = existing_defect['raw_defect'].get('box_points')
+                    if existing_box is not None and len(existing_box) == 4:
+                        existing_rect = cv2.minAreaRect(existing_box)
+                        existing_box_pts = cv2.boxPoints(existing_rect)
+                        existing_box_polygon = np.array(existing_box_pts, dtype=np.int32)
+                        
+                        intersection_area = cv2.intersectConvexConvex(new_box_polygon, existing_box_polygon)[0]
+                        if intersection_area > 0:
+                            x_coords = np.concatenate((new_box_polygon[:, 0], existing_box_polygon[:, 0]))
+                            y_coords = np.concatenate((new_box_polygon[:, 1], existing_box_polygon[:, 1]))
+                            combined_points = np.column_stack((x_coords, y_coords))
+                            merged_rect = cv2.minAreaRect(combined_points)
+                            merged_box = np.intp(cv2.boxPoints(merged_rect))
+                            
+                            existing_defect['raw_defect']['box_points'] = merged_box
+                            length_mm = max(merged_rect[1])
+                            width_mm = min(merged_rect[1])
+                            existing_defect['location']['length_mm'] = float(round(length_mm / pixels_per_mm, 2))
+                            existing_defect['location']['width_mm'] = float(round(width_mm / pixels_per_mm, 2))
+                            existing_defect['location']['x'] = int(merged_rect[0][0] + x)
+                            existing_defect['location']['y'] = int(merged_rect[0][1] + y)
+                            
+                            merged = True
+                            break
+                if merged:
+                    continue
+                
         
         # --- MODIFICATION START: Final check of the filter flag ---
         if not should_be_filtered:

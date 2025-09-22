@@ -24,7 +24,7 @@
     "auto_start": false
   },
   "alarm_light_params": {
-    "port": "COM3",
+    "port": "COM4",
     "ng_buzz_duration_s": 0.1,
     "rejection_buzz_duration_s": 0.3
   },
@@ -37,7 +37,7 @@
     "heartbeat_timeout_ms": 30000,
     "runtime": {
       "use_software_trigger": true,
-      "frame_rate": 18,
+      "frame_rate": 19,
       "enforce_mono8": true
     },
     "network_interfaces": [
@@ -106,10 +106,10 @@
       "acquisition": {
         "width": 2448,
         "height": 2048,
-        "frame_rate": 18
+        "frame_rate": 19
       },
       "exposure": {
-        "value_us": 295
+        "value_us": 260
       },
       "gain": {
         "value_db": 1.2
@@ -124,7 +124,7 @@
     }
   },
   "camera_rois": {
-    "0": "cam1_roi_averaged_by_group.json",
+    "0": "cam5_roi_averaged_by_group.json",
     "1": "cam2_roi_averaged_by_group.json",
     "2": "cam3_roi_averaged_by_group.json",
     "3": "cam4_roi_averaged_by_group.json",
@@ -154,21 +154,21 @@
         8,
         8
       ],
-      "CANNY_THRESHOLD_LOW": 30,
-      "CANNY_THRESHOLD_HIGH": 90
+      "CANNY_THRESHOLD_LOW": 40,
+      "CANNY_THRESHOLD_HIGH": 105
     },
     "HOUGH_TRANSFORM": {
-      "THRESHOLD": 30,
+      "THRESHOLD": 25,
       "MIN_LINE_LENGTH_RATIO": 0.05,
-      "MAX_LINE_GAP": 20
+      "MAX_LINE_GAP": 30
     },
     "LINE_MERGING": {
-      "ANGLE_TOLERANCE": 1.5,
+      "ANGLE_TOLERANCE": 1.0,
       "MAX_LATERAL_DISTANCE": 30,
       "TOP_N_EDGES": 6
     },
     "CRACK_CLASSIFICATION": {
-      "ENDPOINT_SHIELD_RATIO": 0.1
+      "ENDPOINT_SHIELD_RATIO": 0.08
     },
     "DEFECT_DETECTION": {
       "MIN_DEFECT_SIZE_MM": 3.0,
@@ -179,7 +179,7 @@
       "FALSE_DEFECT_MAX_WIDTH": 8.0,
       "FALSE_DEFECT_MIN_ASPECT_RATIO": 5.0,
       "ANGLE_DEVIATION_TOLERANCE": 2.0,
-      "Q_DEFECT_GRADIENT_THRESHOLD": 2.5,
+      "Q_DEFECT_GRADIENT_THRESHOLD": 3.0,
       "SHADOW_FILTER_MIN_EXTENT_RATIO": 0.25,
       "CORNER_MAX_PHYSICAL_GAP": 7,
       "CORNER_MIN_VIRTUAL_GAP": 7.0,
@@ -188,11 +188,11 @@
       "PERPENDICULAR_ANGLE_TOLERANCE": 10,
       "LUMINOSITY_SCAN_WIDTH": 200,
       "LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD": 75,
-      "LUMINOSITY_STD_DEV_MULTIPLIER": 3.0,
+      "LUMINOSITY_STD_DEV_MULTIPLIER": 2.5,
       "LUMINOSITY_MIN_AREA": 30,
-      "LUMINOSITY_EDGE_IGNORE_WIDTH": 3,
-      "LUMINOSITY_MIN_GRADIENT": 30,
-      "CHIPPING_ENDPOINT_SHIELD_RADIUS": 0,
+      "LUMINOSITY_EDGE_IGNORE_WIDTH": 6,
+      "LUMINOSITY_MIN_GRADIENT": 20,
+      "CHIPPING_ENDPOINT_SHIELD_RADIUS": 10,
       "RECLASSIFY_B_AS_L_PARAMS": {
         "ENABLE": true,
         "MIN_ASPECT_RATIO": 3.2,
@@ -215,8 +215,8 @@
         8,
         8
       ],
-      "CANNY_THRESHOLD_LOW": 30,
-      "CANNY_THRESHOLD_HIGH": 90
+      "CANNY_THRESHOLD_LOW": 40,
+      "CANNY_THRESHOLD_HIGH": 105
     },
     "HOUGH_TRANSFORM": {
       "THRESHOLD": 25,
