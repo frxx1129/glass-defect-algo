@@ -336,10 +336,9 @@ class MultiCameraSetup:
     """工具类：管理相机发现、MAC绑定和IP分配。支持首次运行自动配置。"""
     DEFAULT_IP = "192.168.1.200"  # 默认的相机初始IP（相机板载程序设置）
     
-    def __init__(self, config, config_path='data_collector_config.json'):
+    def __init__(self, config):
         """初始化多相机设置工具"""
         self.config = config
-        self.config_path = config_path
         self.camera_setup = self.config.get('camera_setup', {})
         if not self.camera_setup:
             print("[SetupTool]: 警告 - 在 config.json 中未找到 'camera_setup' 部分。")
@@ -806,9 +805,9 @@ class MultiCameraSetup:
         
         # 保存配置
         try:
-            with open(self.config_path, 'w', encoding='utf-8') as f:
+            with open('config.json', 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
-            print(f"[SetupTool]: ✅ 已将 {len(new_bindings)} 台相机的映射信息保存到 {self.config_path}")
+            print(f"[SetupTool]: ✅ 已将 {len(new_bindings)} 台相机的映射信息保存到config.json")
             
             # 打印映射信息
             print("[SetupTool]: 相机映射信息:")

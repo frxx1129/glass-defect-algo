@@ -21,7 +21,7 @@
     "coalesce_max_drain": 500,
     "process_workers": 5,
     "roi_threads": 2,
-    "auto_start": false
+    "auto_start": true
   },
   "alarm_light_params": {
     "port": "COM4",
@@ -29,7 +29,7 @@
     "rejection_buzz_duration_s": 0.3
   },
   "camera_setup": {
-    "expected_cameras": 5,
+    "expected_cameras": 3,
     "bootstrap_default_ip": "192.168.1.200",
     "bootstrap_assign_ips": true,
     "open_retry_count": 3,
@@ -47,19 +47,11 @@
       },
       {
         "index": 1,
-        "ip": "192.168.5.100"
+        "ip": "192.168.4.100"
       },
       {
         "index": 2,
-        "ip": "192.168.6.100"
-      },
-      {
-        "index": 3,
-        "ip": "192.168.7.100"
-      },
-      {
-        "index": 4,
-        "ip": "192.168.8.100"
+        "ip": "192.168.5.100"
       }
     ],
     "camera_nic_bindings": {
@@ -68,54 +60,40 @@
     "camera_bindings": [
       {
         "index": 0,
-        "physical_index": 3,
-        "mac": "94:AA:B8:04:6B:18",
-        "ip": "192.168.7.124",
-        "model": "MV-HP500GM"
+        "physical_index": 0,
+        "mac": "94:AA:B8:01:3A:DF",
+        "ip": "192.168.3.123",
+        "model": "MV-HP120GM"
       },
       {
         "index": 1,
-        "physical_index": 0,
-        "mac": "94:AA:B8:03:DD:F7",
-        "ip": "192.168.3.147",
-        "model": "MV-HP500GM"
+        "physical_index": 1,
+        "mac": "94:AA:B8:01:FC:E6",
+        "ip": "192.168.4.130",
+        "model": "MV-HP120GM"
       },
       {
         "index": 2,
-        "physical_index": 1,
-        "mac": "94:AA:B8:07:9E:73",
-        "ip": "192.168.5.115",
-        "model": "MV-HP500GM"
-      },
-      {
-        "index": 3,
         "physical_index": 2,
-        "mac": "94:AA:B8:04:11:95",
-        "ip": "192.168.6.149",
-        "model": "MV-HP500GM"
-      },
-      {
-        "index": 4,
-        "physical_index": 4,
-        "mac": "94:AA:B8:04:87:AE",
-        "ip": "192.168.8.174",
-        "model": "MV-HP500GM"
+        "mac": "94:AA:B8:00:08:A2",
+        "ip": "192.168.5.162",
+        "model": "MV-HP120GM"
       }
     ],
     "unified_params": {
       "acquisition": {
-        "width": 2448,
-        "height": 2048,
+        "width": 1280,
+        "height": 960,
         "frame_rate": 19
       },
       "exposure": {
-        "value_us": 200
+        "value_us": 400
       },
       "gain": {
         "value_db": 1.2
       },
       "gamma": {
-        "value": 0.92
+        "value": 1
       },
       "network": {
         "packet_size_bytes": 8996,
@@ -124,11 +102,9 @@
     }
   },
   "camera_rois": {
-    "0": "cam1_roi_averaged_by_group.json",
-    "1": "cam2_roi_averaged_by_group.json",
-    "2": "cam3_roi_averaged_by_group.json",
-    "3": "cam4_roi_averaged_by_group.json",
-    "4": "cam5_roi_averaged_by_group.json"
+    "0": "test.json",
+    "1": "test.json",
+    "2": "test.json"
   },
   "server_config": {
     "server": "localhost",
@@ -270,5 +246,6 @@
       "RETREAT_DISTANCE_THRESHOLD": 100,
       "EDGE_ENDPOINT_FIXED_LENGTH": 20
     }
-  }
+  },
+  "data_collection_mode": true
 }

@@ -135,9 +135,56 @@ def main():
     except Exception as e:
         sys.exit(f"错误: 无法加载 config.json: {e}")
 
+    # ================= 运行模式选择 =================
+    # 模式1: 正常检测 (默认)
+    # 模式2: 采集模式 -> 读取 data_collector_config.json 的 camera_setup 参数用于相机采集，并保存ROI裁剪图片
+    data_collection_mode = False
+    try:
+        # 交互式选择；若在无控制台/打包环境失败则回退默认
+        selection = input("请选择运行模式 (1=正常检测 2=采集模式) [默认1]: ").strip()
+        if selection == '2':
+            try:
+                with open('data_collector_config.json', 'r', encoding='utf-8') as f:
+                    collector_cfg = json.load(f)
+                if isinstance(collector_cfg, dict):
+                    # 合并 camera_setup
+                    if 'camera_setup' in collector_cfg:
+                        config['camera_setup'] = collector_cfg['camera_setup']
+                    # 合并 camera_rois (关键: 让处理进程能够读取 test.json)
+                    if 'camera_rois' in collector_cfg:
+                        config['camera_rois'] = collector_cfg['camera_rois']
+                        print(f"[主进程]: 采集模式载入 camera_rois: {collector_cfg['camera_rois']}")
+                    # 若采集配置中指定 roi_template_file 也覆盖（用于启动前越界校验）
+                    if 'roi_template_file' in collector_cfg:
+                        config['roi_template_file'] = collector_cfg['roi_template_file']
+                    data_collection_mode = True
+                    print("[主进程]: 已切换到采集模式 (模式2)，采集配置合并完成")
+                else:
+                    print("[主进程]: data_collector_config.json 结构异常，继续使用原配置 (回退模式1)")
+            except Exception as e:
+                print(f"[主进程]: 读取 data_collector_config.json 失败: {e}，继续使用正常检测模式")
+        else:
+            print("[主进程]: 运行模式=正常检测 (模式1)")
+    except Exception:
+        print("[主进程]: 运行模式选择失败，默认使用正常检测模式 (模式1)")
+
+    # 在配置中标记（供后续模块参考）
+    config['data_collection_mode'] = data_collection_mode
+
     # --- 启动前校验：ROI 不得越界于相机分辨率 ---
     try:
-        roi_file = config.get('roi_template_file', 'roi_averaged_by_group_CORRECTED.json')
+        # 如果存在 camera_rois 优先使用其中第一个文件做越界校验
+        roi_file = None
+        cam_rois_cfg = config.get('camera_rois')
+        if isinstance(cam_rois_cfg, dict) and cam_rois_cfg:
+            # 取第一个 value
+            try:
+                roi_file = next(iter(cam_rois_cfg.values()))
+                print(f"[主进程]: 使用 camera_rois 中的 '{roi_file}' 进行ROI越界校验")
+            except Exception:
+                roi_file = None
+        if not roi_file:
+            roi_file = config.get('roi_template_file', 'roi_averaged_by_group_CORRECTED.json')
         with open(roi_file, 'r', encoding='utf-8') as f:
             averaged_data = json.load(f)
         if not averaged_data:
@@ -200,12 +247,15 @@ def main():
 
     # 确保存储目录存在
     storage_path = config.get('storage_path', 'inspection_results')
-    if not os.path.exists(storage_path):
-        try:
-            os.makedirs(storage_path)
-            print(f"[主进程]: 创建存储目录: {storage_path}")
-        except Exception as e:
-            print(f"[主进程]: 警告 - 无法创建存储目录 {storage_path}: {e}")
+    if not config.get('data_collection_mode', False):
+        if not os.path.exists(storage_path):
+            try:
+                os.makedirs(storage_path)
+                print(f"[主进程]: 创建存储目录: {storage_path}")
+            except Exception as e:
+                print(f"[主进程]: 警告 - 无法创建存储目录 {storage_path}: {e}")
+    else:
+        print("[主进程]: 采集模式启用 -> 禁用 inspection_results 持久化与上传。")
 
     # Shared settings object
     shared_settings = manager.Namespace()
@@ -215,10 +265,28 @@ def main():
     shared_settings.max_defect_size_mm = rejection_params.get('max_defect_size_mm', 20.0)
     shared_settings.REJECTION_PULSE_MS = rejection_params.get('REJECTION_PULSE_MS', 100)
     shared_settings.REJECTION_DELAY_S = rejection_params.get('REJECTION_DELAY_S', 1.5)
-    shared_settings.storage_path = config.get('storage_path', 'inspection_results')
+    # 采集模式下仍保留字段但不使用
+    shared_settings.storage_path = '' if config.get('data_collection_mode', False) else config.get('storage_path', 'inspection_results')
     shared_settings.pixels_per_mm = system_params.get('pixels_per_mm', 2.4)
     # 新增: 算法模式 (1=浅色 2=深色) 默认1
     shared_settings.algorithm_mode = 1
+    # 数据采集模式标记与输出根目录
+    try:
+        shared_settings.data_collection_mode = bool(config.get('data_collection_mode', False))
+    except Exception:
+        shared_settings.data_collection_mode = False
+    # 可通过 config.collection_output_root 自定义目录
+    shared_settings.collection_output_root = config.get('collection_output_root', 'collected_dataset')
+    if getattr(shared_settings, 'data_collection_mode', False):
+        try:
+            import time
+            day_dir = time.strftime('%Y%m%d')
+            base_dir = os.path.join(shared_settings.collection_output_root, day_dir)
+            for sub in ['original', 'ng']:
+                os.makedirs(os.path.join(base_dir, sub), exist_ok=True)
+            print(f"[主进程]: 采集模式启用，ROI裁剪保存目录: {base_dir}")
+        except Exception as e:
+            print(f"[主进程]: 创建采集输出目录失败: {e}")
     shared_settings.lineName = config.get('lineName', 'UNKNOWN_LINE')
     shared_settings.server = server_config.get('server', '127.0.0.1')
     shared_settings.upload_url = server_config.get('upload_url', f'http://{shared_settings.server}:5000/upload')
@@ -245,6 +313,8 @@ def main():
     results_queue = manager.Queue(maxsize=NUM_WORKERS * NUM_CAMERAS * queue_size_factor)
     rejection_queue = manager.Queue()
     alarm_command_queue = manager.Queue() # <-- 为报警器创建跨进程队列
+    # 采集模式下的玻璃会话状态（跨进程） cam_idx -> {active:bool, start_ts:int, folder:str}
+    data_sessions = manager.dict()
     
     # Shared state
     shared_camera_states = manager.dict()
@@ -299,7 +369,7 @@ def main():
     for i in range(NUM_WORKERS):
         worker_proc = multiprocessing.Process(
             target=calculation_worker, 
-            args=(i, task_queue, results_queue, stop_event, run_event, config, shared_settings),
+            args=(i, task_queue, results_queue, stop_event, run_event, config, shared_settings, data_sessions),
             daemon=True
         )
         processes.append(worker_proc)
@@ -320,7 +390,8 @@ def main():
         'metadata': (shared_collection_id, shared_user_id_auto, shared_user_id_manual),
         'rejection_controller': rejection_controller,
         'alarm_light_controller': alarm_light_controller, # <-- 传递安全的代理对象
-    'http_client': http_client
+    'http_client': http_client,
+        'data_sessions': data_sessions
     }
 
     app = create_app(num_cameras=NUM_CAMERAS, shared_objects=shared_objects)

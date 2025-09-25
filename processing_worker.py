@@ -6,6 +6,7 @@ import traceback
 from queue import Empty
 import time
 import fused_image_processor
+from fused_image_processor import save_roi_crops
 
 def should_reject_pane(pane_json, shared_settings, pixels_per_mm):
     """根据缺陷类型与尺寸判定是否剔废。
@@ -29,7 +30,7 @@ def should_reject_pane(pane_json, shared_settings, pixels_per_mm):
                 return True
     return False
 
-def calculation_worker(process_index, task_queue, results_queue, stop_event, run_event, config, shared_settings):
+def calculation_worker(process_index, task_queue, results_queue, stop_event, run_event, config, shared_settings, data_sessions=None):
     """A worker process that consumes raw images and produces analysis results."""
     print(f"[计算进程 {process_index}]: 已启动。")
     try:
@@ -115,6 +116,69 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                 pane_json, annotated_image = fused_image_processor.process_image(
                     frame_data, roi_cache[cam_idx], config, algo_mode)
 
+                # 会话逻辑：只有检测到玻璃(state_code>0)才开启文件夹；玻璃离开(state_code==0 且之前active)结束。
+                is_collection = bool(getattr(shared_settings, 'data_collection_mode', False))
+                session_info = None
+                if is_collection and data_sessions is not None:
+                    try:
+                        active = False
+                        if str(cam_idx) in data_sessions:
+                            session_info = data_sessions[str(cam_idx)]
+                            active = session_info.get('active', False)
+                        state_code = int(pane_json.get('state_code', 0) or 0)
+                        ts_now = int(time.time()*1000)
+                        if state_code > 0 and not active:
+                            # 开始新会话
+                            import os, time as _t
+                            root = getattr(shared_settings, 'collection_output_root', 'collected_dataset')
+                            day_dir = _t.strftime('%Y%m%d')
+                            pane_folder = f"pane_cam{cam_idx}_{ts_now}"
+                            base = os.path.join(root, day_dir, pane_folder)
+                            os.makedirs(base, exist_ok=True)
+                            session_info = {'active': True, 'start_ts': ts_now, 'folder': base}
+                            data_sessions[str(cam_idx)] = session_info
+                        elif state_code == 0 and active:
+                            # 结束会话
+                            session_info['active'] = False
+                            data_sessions[str(cam_idx)] = session_info
+                    except Exception:
+                        pass
+
+                # ================= ROI 裁剪保存 (采集模式) =================
+                try:
+                    if is_collection and session_info and session_info.get('active'):
+                        # 使用已建立的会话根目录，不再重复创建 pane_*；save_roi_crops 传 per_pane_folder=False 然后我们手动组织
+                        # 将会话下的 original/ng 结构与先前逻辑兼容：直接把会话 folder 当 output_root 且不再创建 date 层
+                        # 为复用函数，临时构造一个路径：在函数里 per_pane_folder=False 时会 base_dir=output_root/日期，需要改写: 这里复制函数逻辑较重，改简单包装
+                        from fused_image_processor import save_roi_crops as _s
+                        # 临时 monkey: 直接调用内部函数前改成一个假的 output_root = session_folder_parent 并 per_pane_folder=True => 会自动再创建嵌套 pane_，不符需求
+                        # 简化：复制一份核心循环保存（避免改原函数复杂度）
+                        import os
+                        rois = roi_cache[cam_idx]
+                        millis = int(time.time()*1000)
+                        orig_dir = os.path.join(session_info['folder'], 'original')
+                        ng_dir = os.path.join(session_info['folder'], 'ng')
+                        os.makedirs(orig_dir, exist_ok=True)
+                        if pane_json.get('image_status') == 'NG':
+                            os.makedirs(ng_dir, exist_ok=True)
+                        for roi_idx, roi in enumerate(rois):
+                            try:
+                                x=int(roi.get('x',0));y=int(roi.get('y',0));w=int(roi.get('width',0));h=int(roi.get('height',0))
+                                if w<=0 or h<=0: continue
+                                crop_gray = frame_data[y:y+h, x:x+w]
+                                if crop_gray is None or crop_gray.size==0: continue
+                                fn = f"cam{cam_idx}_ts{millis}_roi{roi_idx}.jpg"
+                                if pane_json.get('state_code',0)>0:
+                                    cv2.imwrite(os.path.join(orig_dir, fn), crop_gray)
+                                if pane_json.get('image_status')=='NG':
+                                    crop_anno = annotated_image[y:y+h, x:x+w]
+                                    if crop_anno is not None and crop_anno.size>0:
+                                        cv2.imwrite(os.path.join(ng_dir, fn), crop_anno)
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+
                 should_reject_overall = should_reject_pane(pane_json, shared_settings, PIXELS_PER_MM)
 
                 jpg_q_main = int(config.get('system_params', {}).get('jpeg_quality_main', 85) or 85)
@@ -141,6 +205,7 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                     "should_reject": should_reject_overall,
                     "annotated_image_buffer": original_buffer_encoded.tobytes(),
                 }
+                # 采集模式下不保存 inspection_results 目录（主逻辑已有 storage_path，但这里只控制结果入队即可）
                 results_queue.put(result)
         except Exception as e:
             print(f"[计算进程 {process_index}]: 处理错误: {e}")

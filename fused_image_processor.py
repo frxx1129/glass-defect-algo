@@ -59,3 +59,53 @@ def process_image(image_gray, rois, full_config: Dict[str, Any], mode: int):
         report = {"image_status": "OK", "defects": [], "state_code": 0, "rois": []}
         report["state_code"] = 0
         return report, empty
+
+# =============================================================
+# ROI 图像保存辅助
+# =============================================================
+def save_roi_crops(image_gray: np.ndarray, annotated_bgr: np.ndarray, report: Dict[str, Any], rois: list,
+                   output_root: str, cam_idx: int, frame_ts: float, save_original: bool, save_ng: bool,
+                   per_pane_folder: bool = False):
+    """保存 ROI 裁剪：
+    - 原始灰度 ROI (save_original=True 且 state_code>0 认为有玻璃) 目录: original/
+    - 标注 NG ROI (save_ng=True 且 image_status=NG) 目录: ng/
+    文件命名: cam{cam_idx}_ts{ms}_{roi_idx}.jpg
+    只在 rois 与 report['rois'] 对齐时使用。"""
+    try:
+        import os, cv2, time
+        if not rois or 'rois' not in report:
+            return
+        millis = int(frame_ts * 1000)
+        day_dir = time.strftime('%Y%m%d', time.localtime(frame_ts))
+        # 如果按玻璃单独目录:  base/日期/pane_cam{idx}_{millis}/{original,ng}
+        if per_pane_folder:
+            pane_root = os.path.join(output_root, day_dir, f"pane_cam{cam_idx}_{millis}")
+            orig_dir = os.path.join(pane_root, 'original')
+            ng_dir = os.path.join(pane_root, 'ng')
+        else:
+            base_dir = os.path.join(output_root, day_dir)
+            orig_dir = os.path.join(base_dir, 'original')
+            ng_dir = os.path.join(base_dir, 'ng')
+        if save_original:
+            os.makedirs(orig_dir, exist_ok=True)
+        if save_ng and report.get('image_status') == 'NG':
+            os.makedirs(ng_dir, exist_ok=True)
+        # 遍历 ROI
+        for roi_idx, roi in enumerate(rois):
+            try:
+                x = int(roi.get('x',0)); y = int(roi.get('y',0))
+                w = int(roi.get('width',0)); h = int(roi.get('height',0))
+                if w <=0 or h<=0: continue
+                crop_gray = image_gray[y:y+h, x:x+w]
+                if crop_gray is None or crop_gray.size == 0: continue
+                filename = f"cam{cam_idx}_ts{millis}_roi{roi_idx}.jpg"
+                if save_original and report.get('state_code',0) > 0:
+                    cv2.imwrite(os.path.join(orig_dir, filename), crop_gray)
+                if save_ng and report.get('image_status') == 'NG':
+                    crop_anno = annotated_bgr[y:y+h, x:x+w]
+                    if crop_anno is not None and crop_anno.size>0:
+                        cv2.imwrite(os.path.join(ng_dir, filename), crop_anno)
+            except Exception:
+                continue
+    except Exception:
+        pass
