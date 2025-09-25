@@ -278,15 +278,15 @@ def main():
     # 可通过 config.collection_output_root 自定义目录
     shared_settings.collection_output_root = config.get('collection_output_root', 'collected_dataset')
     if getattr(shared_settings, 'data_collection_mode', False):
+        # 不再预创建 original / ng 空目录；仅在实际保存 ROI 时按需创建
         try:
             import time
             day_dir = time.strftime('%Y%m%d')
             base_dir = os.path.join(shared_settings.collection_output_root, day_dir)
-            for sub in ['original', 'ng']:
-                os.makedirs(os.path.join(base_dir, sub), exist_ok=True)
-            print(f"[主进程]: 采集模式启用，ROI裁剪保存目录: {base_dir}")
+            os.makedirs(base_dir, exist_ok=True)
+            print(f"[主进程]: 采集模式启用，日期目录: {base_dir} (延迟创建 original/ng)")
         except Exception as e:
-            print(f"[主进程]: 创建采集输出目录失败: {e}")
+            print(f"[主进程]: 创建采集输出日期目录失败: {e}")
     shared_settings.lineName = config.get('lineName', 'UNKNOWN_LINE')
     shared_settings.server = server_config.get('server', '127.0.0.1')
     shared_settings.upload_url = server_config.get('upload_url', f'http://{shared_settings.server}:5000/upload')

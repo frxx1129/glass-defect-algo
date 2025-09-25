@@ -128,14 +128,19 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                         state_code = int(pane_json.get('state_code', 0) or 0)
                         ts_now = int(time.time()*1000)
                         if state_code > 0 and not active:
-                            # 开始新会话
+                            # 开始新会话: 文件夹命名去掉 cam_index, 统一使用 pane_{timestamp}
                             import os, time as _t
                             root = getattr(shared_settings, 'collection_output_root', 'collected_dataset')
                             day_dir = _t.strftime('%Y%m%d')
-                            pane_folder = f"pane_cam{cam_idx}_{ts_now}"
+                            pane_folder = f"pane_{ts_now}"
                             base = os.path.join(root, day_dir, pane_folder)
                             os.makedirs(base, exist_ok=True)
-                            session_info = {'active': True, 'start_ts': ts_now, 'folder': base}
+                            session_info = {
+                                'active': True,
+                                'start_ts': ts_now,
+                                'folder': base,
+                                'cam_index': cam_idx
+                            }
                             data_sessions[str(cam_idx)] = session_info
                         elif state_code == 0 and active:
                             # 结束会话
@@ -161,16 +166,44 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                         os.makedirs(orig_dir, exist_ok=True)
                         if pane_json.get('image_status') == 'NG':
                             os.makedirs(ng_dir, exist_ok=True)
+                        # 预计算每个 ROI 是否存在缺陷: 若任一缺陷落在 ROI 内则标记
+                        defect_rois = set()
+                        if pane_json.get('image_status') == 'NG':
+                            try:
+                                defects = pane_json.get('defects', []) or []
+                                for defect in defects:
+                                    loc = defect.get('location', {}) or {}
+                                    dx = loc.get('x'); dy = loc.get('y')
+                                    if dx is None or dy is None:
+                                        continue
+                                    for ridx, r in enumerate(rois):
+                                        try:
+                                            rx=int(r.get('x',0)); ry=int(r.get('y',0)); rw=int(r.get('width',0)); rh=int(r.get('height',0))
+                                        except Exception:
+                                            continue
+                                        if rw<=0 or rh<=0:
+                                            continue
+                                        if rx <= dx < rx+rw and ry <= dy < ry+rh:
+                                            defect_rois.add(ridx)
+                                            break
+                            except Exception:
+                                pass
+
                         for roi_idx, roi in enumerate(rois):
                             try:
                                 x=int(roi.get('x',0));y=int(roi.get('y',0));w=int(roi.get('width',0));h=int(roi.get('height',0))
-                                if w<=0 or h<=0: continue
+                                if w<=0 or h<=0:
+                                    continue
                                 crop_gray = frame_data[y:y+h, x:x+w]
-                                if crop_gray is None or crop_gray.size==0: continue
+                                if crop_gray is None or crop_gray.size==0:
+                                    continue
                                 fn = f"cam{cam_idx}_ts{millis}_roi{roi_idx}.jpg"
+                                # original: 玻璃存在即保存
                                 if pane_json.get('state_code',0)>0:
                                     cv2.imwrite(os.path.join(orig_dir, fn), crop_gray)
-                                if pane_json.get('image_status')=='NG':
+                                # ng: 仅保存含缺陷的 ROI
+                                if roi_idx in defect_rois:
+                                    os.makedirs(ng_dir, exist_ok=True)
                                     crop_anno = annotated_image[y:y+h, x:x+w]
                                     if crop_anno is not None and crop_anno.size>0:
                                         cv2.imwrite(os.path.join(ng_dir, fn), crop_anno)
