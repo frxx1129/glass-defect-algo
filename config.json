@@ -109,7 +109,7 @@
         "frame_rate": 19
       },
       "exposure": {
-        "value_us": 260
+        "value_us": 200
       },
       "gain": {
         "value_db": 1.2
@@ -124,7 +124,7 @@
     }
   },
   "camera_rois": {
-    "0": "cam5_roi_averaged_by_group.json",
+    "0": "cam1_roi_averaged_by_group.json",
     "1": "cam2_roi_averaged_by_group.json",
     "2": "cam3_roi_averaged_by_group.json",
     "3": "cam4_roi_averaged_by_group.json",
@@ -154,11 +154,11 @@
         8,
         8
       ],
-      "CANNY_THRESHOLD_LOW": 40,
-      "CANNY_THRESHOLD_HIGH": 105
+      "CANNY_THRESHOLD_LOW": 36,
+      "CANNY_THRESHOLD_HIGH": 108
     },
     "HOUGH_TRANSFORM": {
-      "THRESHOLD": 25,
+      "THRESHOLD": 20,
       "MIN_LINE_LENGTH_RATIO": 0.05,
       "MAX_LINE_GAP": 30
     },
@@ -168,13 +168,13 @@
       "TOP_N_EDGES": 6
     },
     "CRACK_CLASSIFICATION": {
-      "ENDPOINT_SHIELD_RATIO": 0.08
+      "ENDPOINT_SHIELD_RATIO": 0.1
     },
     "DEFECT_DETECTION": {
-      "MIN_DEFECT_SIZE_MM": 3.0,
+      "MIN_DEFECT_SIZE_MM": 2.0,
       "MERGE_DEFECTS_KERNEL_SIZE": [
-        5,
-        5
+        9,
+        9
       ],
       "FALSE_DEFECT_MAX_WIDTH": 8.0,
       "FALSE_DEFECT_MIN_ASPECT_RATIO": 5.0,
@@ -187,12 +187,12 @@
       "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR": 200,
       "PERPENDICULAR_ANGLE_TOLERANCE": 10,
       "LUMINOSITY_SCAN_WIDTH": 200,
-      "LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD": 75,
-      "LUMINOSITY_STD_DEV_MULTIPLIER": 2.5,
+      "LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD": 66,
+      "LUMINOSITY_STD_DEV_MULTIPLIER": 2.0,
       "LUMINOSITY_MIN_AREA": 30,
       "LUMINOSITY_EDGE_IGNORE_WIDTH": 6,
       "LUMINOSITY_MIN_GRADIENT": 20,
-      "CHIPPING_ENDPOINT_SHIELD_RADIUS": 10,
+      "CHIPPING_ENDPOINT_SHIELD_RADIUS": 0,
       "RECLASSIFY_B_AS_L_PARAMS": {
         "ENABLE": true,
         "MIN_ASPECT_RATIO": 3.2,
@@ -237,8 +237,8 @@
     "DEFECT_DETECTION": {
       "MIN_DEFECT_SIZE_MM": 3.0,
       "MERGE_DEFECTS_KERNEL_SIZE": [
-        5,
-        5
+        9,
+        9
       ],
       "FALSE_DEFECT_MAX_WIDTH": 8.0,
       "FALSE_DEFECT_MIN_ASPECT_RATIO": 5.0,
@@ -253,8 +253,8 @@
       "LUMINOSITY_SCAN_WIDTH": 200,
       "LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD": 50,
       "LUMINOSITY_STD_DEV_MULTIPLIER": 1.5,
-      "LUMINOSITY_MIN_AREA": 50,
-      "LUMINOSITY_EDGE_IGNORE_WIDTH": 2,
+      "LUMINOSITY_MIN_AREA": 75,
+      "LUMINOSITY_EDGE_IGNORE_WIDTH": 3,
       "LUMINOSITY_MIN_GRADIENT": 10,
       "CHIPPING_ENDPOINT_SHIELD_RADIUS": 0,
       "RECLASSIFY_B_AS_L_PARAMS": {
