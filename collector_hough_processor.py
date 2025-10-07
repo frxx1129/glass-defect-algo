@@ -46,6 +46,56 @@ ANNOTATION_FONT = _get_font(font_size=32)
 # --- 几何学与分析辅助函数 ---
 # ====================================================================================
 
+# --- 单位换算与配置读取辅助 ---
+def _mm_to_px(val_mm: float, pixels_per_mm: float) -> float:
+    return float(val_mm) * float(pixels_per_mm)
+
+def _mm2_to_px2(val_mm2: float, pixels_per_mm: float) -> float:
+    ppm = float(pixels_per_mm)
+    return float(val_mm2) * (ppm * ppm)
+
+def _get_dist_px(cfg: dict, key_mm: str, key_px: str | None, default_mm: float | None, pixels_per_mm: float, default_px: float | None = None) -> float:
+    if key_mm in cfg:
+        return _mm_to_px(cfg[key_mm], pixels_per_mm)
+    if key_px and key_px in cfg:
+        return float(cfg[key_px])
+    if default_mm is not None:
+        return _mm_to_px(default_mm, pixels_per_mm)
+    if default_px is not None:
+        return float(default_px)
+    return 0.0
+
+def _get_area_px2(cfg: dict, key_mm2: str, key_px2: str | None, default_mm2: float | None, pixels_per_mm: float, default_px2: float | None = None) -> float:
+    if key_mm2 in cfg:
+        return _mm2_to_px2(cfg[key_mm2], pixels_per_mm)
+    if key_px2 and key_px2 in cfg:
+        return float(cfg[key_px2])
+    if default_mm2 is not None:
+        return _mm2_to_px2(default_mm2, pixels_per_mm)
+    if default_px2 is not None:
+        return float(default_px2)
+    return 0.0
+
+def _kernel_mm_to_px_odd(kernel_mm: list[float] | tuple[float, float], pixels_per_mm: float, fallback_px: list[int] | None = None) -> tuple[int, int]:
+    if kernel_mm is not None:
+        try:
+            kx_px = int(round(float(kernel_mm[0]) * float(pixels_per_mm)))
+            ky_px = int(round(float(kernel_mm[1]) * float(pixels_per_mm)))
+            if kx_px < 1: kx_px = 1
+            if ky_px < 1: ky_px = 1
+            if kx_px % 2 == 0: kx_px += 1
+            if ky_px % 2 == 0: ky_px += 1
+            return (kx_px, ky_px)
+        except Exception:
+            pass
+    if fallback_px is not None:
+        try:
+            kx_px = int(fallback_px[0]); ky_px = int(fallback_px[1])
+            return (kx_px, ky_px)
+        except Exception:
+            return (5, 5)
+    return (5, 5)
+
 def draw_dashed_line(img, pt1, pt2, color, thickness=1, dash_length=10):
     dist = np.linalg.norm(np.array(pt1) - np.array(pt2))
     if dist == 0: return
@@ -101,23 +151,47 @@ def get_point_line_segment_projection(point, line_segment):
     proj_point = p1 + t * line_vec
     return proj_point, np.linalg.norm(p - proj_point)
 
-def scan_edge_for_luminosity_defects(roi_gray, edge, params):
+def scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm: float):
     p = params["DEFECT_DETECTION"]
     
     p1 = np.array(edge[:2]); p2 = np.array(edge[2:])
-    scan_width = p["LUMINOSITY_SCAN_WIDTH"]
+    scan_width = _get_dist_px(p, "LUMINOSITY_SCAN_WIDTH_MM", "LUMINOSITY_SCAN_WIDTH", None, pixels_per_mm)
     line_vec = p2 - p1; line_length = np.linalg.norm(line_vec)
-    if line_length < 1e-6: return []
+    if line_length < 1e-6:
+        return []
 
-    unit_vec = line_vec / line_length; normal_vec = np.array([-unit_vec[1], unit_vec[0]])
+    unit_vec = line_vec / line_length
+    normal_vec = np.array([-unit_vec[1], unit_vec[0]])
     half_width_vec = (scan_width / 2.0) * normal_vec
+
+    # 两侧半带，选择平均亮度更低的一侧作为扫描区域
     c1 = p1 + half_width_vec; c2 = p2 + half_width_vec
     c3 = p2 - half_width_vec; c4 = p1 - half_width_vec
-    rect_points = np.array([c1, c2, c3, c4], dtype=np.int32).reshape((-1, 1, 2))
-    
-    scan_mask = np.zeros_like(roi_gray)
-    cv2.fillPoly(scan_mask, [rect_points], 255)
-    
+
+    mask_plus = np.zeros_like(roi_gray)
+    poly_plus = np.array([c1, c2, p2, p1], dtype=np.int32).reshape((-1, 1, 2))
+    cv2.fillPoly(mask_plus, [poly_plus], 255)
+
+    mask_minus = np.zeros_like(roi_gray)
+    poly_minus = np.array([p1, p2, c3, c4], dtype=np.int32).reshape((-1, 1, 2))
+    cv2.fillPoly(mask_minus, [poly_minus], 255)
+
+    mean_plus = cv2.mean(roi_gray, mask=mask_plus)[0]
+    mean_minus = cv2.mean(roi_gray, mask=mask_minus)[0]
+    scan_mask = mask_plus if mean_plus < mean_minus else mask_minus
+
+    # 去除边缘线及两端点的圆形区域
+    edge_ignore_px = _get_dist_px(p, "LUMINOSITY_EDGE_IGNORE_WIDTH_MM", "LUMINOSITY_EDGE_IGNORE_WIDTH", 0.0, pixels_per_mm)
+    endpoint_exclude_r = _get_dist_px(p, "LUMINOSITY_ENDPOINT_EXCLUDE_RADIUS_MM", None, None, pixels_per_mm, default_px=0.0)
+    if endpoint_exclude_r is None or endpoint_exclude_r <= 0:
+        endpoint_exclude_r = max(3, int(min(0.3 * scan_width, 15)))
+
+    ignore_mask = np.zeros_like(roi_gray)
+    if edge_ignore_px > 0:
+        cv2.line(ignore_mask, tuple(map(int, p1)), tuple(map(int, p2)), 255, thickness=int(round(edge_ignore_px)))
+    cv2.circle(ignore_mask, tuple(map(int, p1)), int(round(endpoint_exclude_r)), 255, thickness=-1)
+    cv2.circle(ignore_mask, tuple(map(int, p2)), int(round(endpoint_exclude_r)), 255, thickness=-1)
+
     mean, std_dev = cv2.meanStdDev(roi_gray, mask=scan_mask)
     
     initial_contours = []
@@ -125,11 +199,7 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
         threshold_low = mean[0][0] - p["LUMINOSITY_STD_DEV_MULTIPLIER"] * std_dev[0][0]
         potential_defects = (roi_gray < threshold_low).astype(np.uint8) * 255
         defect_mask = cv2.bitwise_and(potential_defects, scan_mask)
-
-        if p.get("LUMINOSITY_EDGE_IGNORE_WIDTH", 0) > 0:
-            ignore_mask = np.zeros_like(roi_gray)
-            cv2.line(ignore_mask, tuple(map(int, p1)), tuple(map(int, p2)), 255, thickness=p["LUMINOSITY_EDGE_IGNORE_WIDTH"])
-            defect_mask = cv2.subtract(defect_mask, ignore_mask)
+        defect_mask = cv2.subtract(defect_mask, ignore_mask)
 
         contours, _ = cv2.findContours(defect_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
@@ -141,8 +211,9 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params):
             grad_y = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
             grad_mag = np.sqrt(grad_x**2 + grad_y**2)
 
+            min_area_px2 = _get_area_px2(p, "LUMINOSITY_MIN_AREA_MM2", "LUMINOSITY_MIN_AREA", None, pixels_per_mm)
             for cnt in contours:
-                if cv2.contourArea(cnt) > p["LUMINOSITY_MIN_AREA"]:
+                if cv2.contourArea(cnt) > min_area_px2:
                     contour_mask = np.zeros_like(roi_gray)
                     cv2.drawContours(contour_mask, [cnt], -1, 255, -1)
                     
@@ -203,7 +274,7 @@ def preprocess_for_hough_enhanced(roi_gray, params):
     enhanced_contrast = clahe.apply(blurred)
     return cv2.Canny(enhanced_contrast, p["CANNY_THRESHOLD_LOW"], p["CANNY_THRESHOLD_HIGH"])
 
-def merge_lines_and_get_main_edges(lines, params):
+def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float):
     if lines is None or len(lines) < 1: return []
     p = params["LINE_MERGING"]
     lines_np = np.array(lines).reshape(-int(len(lines)), 4)
@@ -230,7 +301,8 @@ def merge_lines_and_get_main_edges(lines, params):
                 if line_length > 1e-6:
                     vec2 = p1 - mid_point
                     cross_product_2d = vec_line[0] * vec2[1] - vec_line[1] * vec2[0]
-                    if np.abs(cross_product_2d) / line_length < p["MAX_LATERAL_DISTANCE"]:
+                    max_lat_dist_px = _get_dist_px(p, "MAX_LATERAL_DISTANCE_MM", "MAX_LATERAL_DISTANCE", None, pixels_per_mm)
+                    if np.abs(cross_product_2d) / line_length < max_lat_dist_px:
                         group.append(segment); placed = True; break
             if not placed: proximity_groups.append([segment])
         final_line_groups.extend(proximity_groups)
@@ -248,39 +320,13 @@ def merge_lines_and_get_main_edges(lines, params):
     merged_lines_with_scores.sort(key=lambda item: item['score'], reverse=True)
     return [item['line'] for item in merged_lines_with_scores[:p["TOP_N_EDGES"]]]
 
-def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
+def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: float):
     p_defect = params["DEFECT_DETECTION"]; p_crack = params["CRACK_CLASSIFICATION"]
     num_edges = len(edges); roi_h, roi_w = roi_dims
     
-    crack_defects = []; crack_indices = set(); endpoint_proximity_threshold = 15.0 
-    if num_edges >= 2:
-        for i, j in combinations(range(num_edges), 2):
-            if i in crack_indices or j in crack_indices: continue
-            line1, line2 = edges[i], edges[j]
-            for point1 in [line1[:2], line1[2:]]:
-                proj_point, dist = (get_point_line_segment_projection)(point1, line2)
-                if dist < endpoint_proximity_threshold:
-                    len_line2 = np.linalg.norm(line2[:2] - line2[2:])
-                    if len_line2 > 1e-6:
-                        shield2 = len_line2 * p_crack["ENDPOINT_SHIELD_RATIO"]
-                        if np.linalg.norm(proj_point - line2[:2]) > shield2 and np.linalg.norm(proj_point - line2[2:]) > shield2:
-                            contour = line1.reshape(-1, 2).astype(np.int32)
-                            min_area_rect = cv2.minAreaRect(contour)
-                            box_points = np.intp(cv2.boxPoints(min_area_rect))
-                            crack_defects.append({"type": "L", "box_points": box_points}); crack_indices.add(i); break
-
-            if i in crack_indices: continue
-            for point2 in [line2[:2], line2[2:]]:
-                proj_point, dist = get_point_line_segment_projection(point2, line1)
-                if dist < endpoint_proximity_threshold:
-                    len_line1 = np.linalg.norm(line1[:2] - line1[2:])
-                    if len_line1 > 1e-6:
-                        shield1 = len_line1 * p_crack["ENDPOINT_SHIELD_RATIO"]
-                        if np.linalg.norm(proj_point - line1[:2]) > shield1 and np.linalg.norm(proj_point - line1[2:]) > shield1:
-                            contour = line2.reshape(-1, 2).astype(np.int32)
-                            min_area_rect = cv2.minAreaRect(contour)
-                            box_points = np.intp(cv2.boxPoints(min_area_rect))
-                            crack_defects.append({"type": "L", "box_points": box_points}); crack_indices.add(j); break
+    # 去除基于几何的 L 裂纹判断
+    crack_defects = []
+    crack_indices = set()
 
     true_edges = [edge for i, edge in enumerate(edges) if i not in crack_indices]
     
@@ -324,7 +370,13 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
         line1, line2 = true_edges[i], true_edges[j]
         
         angle_between = calculate_angle_between_lines(line1, line2)
-        max_extension_dist = p_defect["CORNER_MAX_EXTENSION_DIST_PERPENDICULAR"] if abs(angle_between - 90.0) < p_defect["PERPENDICULAR_ANGLE_TOLERANCE"] else p_defect["CORNER_MAX_EXTENSION_DIST_NORMAL"]
+        max_extension_dist = _get_dist_px(
+            p_defect,
+            "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR_MM" if abs(angle_between - 90.0) < p_defect["PERPENDICULAR_ANGLE_TOLERANCE"] else "CORNER_MAX_EXTENSION_DIST_NORMAL_MM",
+            "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR" if abs(angle_between - 90.0) < p_defect["PERPENDICULAR_ANGLE_TOLERANCE"] else "CORNER_MAX_EXTENSION_DIST_NORMAL",
+            None,
+            pixels_per_mm
+        )
         
         intersection = find_line_intersection(line1, line2)
         if intersection is None: continue
@@ -332,9 +384,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
         dists_i = [np.linalg.norm(intersection - line1[:2]), np.linalg.norm(intersection - line1[2:])]; endpoint_idx_i = np.argmin(dists_i)
         dists_j = [np.linalg.norm(intersection - line2[:2]), np.linalg.norm(intersection - line2[2:])]; endpoint_idx_j = np.argmin(dists_j)
 
-        if endpoint_paired_status[i][endpoint_idx_i] or endpoint_paired_status[j][endpoint_idx_j]: continue
-        
-        is_physical = dists_i[endpoint_idx_i] < p_defect["CORNER_MAX_PHYSICAL_GAP"] and dists_j[endpoint_idx_j] < p_defect["CORNER_MAX_PHYSICAL_GAP"]
+        if endpoint_paired_status[i][endpoint_idx_i] or endpoint_paired_status[j][endpoint_idx_j]:
+            continue
+
+        corner_gap_px = _get_dist_px(p_defect, "CORNER_MAX_PHYSICAL_GAP_MM", "CORNER_MAX_PHYSICAL_GAP", None, pixels_per_mm)
+        is_physical = dists_i[endpoint_idx_i] < corner_gap_px and dists_j[endpoint_idx_j] < corner_gap_px
         is_valid_virtual = dists_i[endpoint_idx_i] < max_extension_dist and dists_j[endpoint_idx_j] < max_extension_dist
 
         if (is_physical or is_valid_virtual) and (0 <= intersection[0] < roi_w and 0 <= intersection[1] < roi_h):
@@ -399,16 +453,18 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
 
     all_chipping_contours = []; chipping_defects = []
     for edge in true_edges:
-        all_chipping_contours.extend(scan_edge_for_luminosity_defects(roi_gray, edge, params))
+        all_chipping_contours.extend(scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm))
     if all_chipping_contours:
         defect_canvas = np.zeros(roi_dims, dtype=np.uint8)
         cv2.drawContours(defect_canvas, all_chipping_contours, -1, 255, -1)
-        kernel = np.ones(tuple(p_defect.get("MERGE_DEFECTS_KERNEL_SIZE", [5, 5])), np.uint8)
+        kernel_mm = p_defect.get("MERGE_DEFECTS_KERNEL_MM")
+        kernel = np.ones(_kernel_mm_to_px_odd(kernel_mm, pixels_per_mm, p_defect.get("MERGE_DEFECTS_KERNEL_SIZE", [5, 5])), np.uint8)
         merged_mask = cv2.morphologyEx(defect_canvas, cv2.MORPH_CLOSE, kernel, iterations=2)
         final_contours, _ = cv2.findContours(merged_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for cnt in final_contours:
-            if cv2.contourArea(cnt) < p_defect["LUMINOSITY_MIN_AREA"]:
+            min_area_px2 = _get_area_px2(p_defect, "LUMINOSITY_MIN_AREA_MM2", "LUMINOSITY_MIN_AREA", None, pixels_per_mm)
+            if cv2.contourArea(cnt) < min_area_px2:
                 continue
 
             min_area_rect = cv2.minAreaRect(cnt)
@@ -429,7 +485,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
             })
     
     final_chipping_defects = []
-    shield_radius = p_defect.get("CHIPPING_ENDPOINT_SHIELD_RADIUS", 30)
+    shield_radius = _get_dist_px(p_defect, "CHIPPING_ENDPOINT_SHIELD_RADIUS_MM", "CHIPPING_ENDPOINT_SHIELD_RADIUS", 0.0, pixels_per_mm)
     all_endpoints = [np.array(edge[:2]) for edge in true_edges] + [np.array(edge[2:]) for edge in true_edges]
 
     if not all_endpoints:
@@ -469,7 +525,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params):
     else:
         surviving_chipping_defects = final_chipping_defects
             
-    return edges_for_drawing, corner_defects + surviving_chipping_defects + crack_defects
+    return edges_for_drawing, corner_defects + surviving_chipping_defects
 
 
 def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm):
@@ -493,19 +549,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         should_be_filtered = False
         # --- MODIFICATION END ---
 
-        if defect['type'] == 'L':
-            box_pts = defect.get('box_points')
-            if box_pts is not None and len(box_pts) > 0:
-                x_r, y_r, w_r, h_r = cv2.boundingRect(np.array(box_pts))
-                if w_r > 0 and h_r > 0:
-                    defect_sub_roi = roi_gray[y_r:y_r+h_r, x_r:x_r+w_r]
-                    mean_brightness = cv2.mean(defect_sub_roi)[0]
-                    if mean_brightness > 50:
-                        continue
-                else: 
-                    continue
-            else:
-                continue
+        # 已移除 L 裂纹亮度过滤
 
         if defect['type'] == 'X':
             center = defect.get('center', (0, 0))
@@ -536,7 +580,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 else:
                     length_px, width_px = 0.0, 0.0
             
-            elif defect['type'] in ['L', 'B']:
+            elif defect['type'] in ['B']:
                 box = defect.get('box_points', [])
                 if len(box) >= 4:
                     center = np.mean(box, axis=0)
@@ -554,89 +598,8 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
         
         if new_defect['type'] == 'B':
-            p_reclass = params["DEFECT_DETECTION"].get("RECLASSIFY_B_AS_L_PARAMS", {})
-            min_area_rect = defect.get("min_area_rect")
-            
-            length_mm = location.get('length_mm', 0)
-            width_mm = location.get('width_mm', 0)
-            aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
-
-            if p_reclass.get("ENABLE", False) and min_area_rect and aspect_ratio > p_reclass.get("MIN_ASPECT_RATIO", 4.0):
-                target_edge = None
-                
-                (w_rect, h_rect) = min_area_rect[1]; angle_raw = min_area_rect[2]
-                defect_angle = angle_raw + 90 if w_rect < h_rect else angle_raw
-                defect_angle = (defect_angle % 180 + 180) % 180
-
-                for edge in main_edges:
-                    defect_center = np.array(min_area_rect[0])
-                    _, dist = get_point_line_segment_projection(defect_center, edge)
-                    if dist < p_reclass.get("MAX_DISTANCE_PX", 40):
-                        edge_vec = np.array(edge[2:]) - np.array(edge[:2])
-                        edge_angle = (np.degrees(np.arctan2(edge_vec[1], edge_vec[0])) % 180 + 180) % 180
-                        angle_diff = min(abs(defect_angle - edge_angle), 180 - abs(defect_angle - edge_angle))
-                        if abs(angle_diff - 90.0) < p_reclass.get("ANGLE_TOLERANCE", 15.0):
-                            new_defect['type'] = "L"
-                            target_edge = edge
-                            break
-                
-                # --- MODIFICATION START: Extension and Endpoint Shield Logic ---
-                if new_defect['type'] == "L" and target_edge is not None:
-                    center = np.array(min_area_rect[0])
-                    
-                    defect_length = max(w_rect, h_rect)
-                    defect_width = min(w_rect, h_rect)
-                    
-                    angle_rad = np.deg2rad(defect_angle)
-                    vec = np.array([np.cos(angle_rad), np.sin(angle_rad)])
-                    ep1 = center + vec * defect_length / 2
-                    ep2 = center - vec * defect_length / 2
-                    
-                    _, dist1 = get_point_line_segment_projection(ep1, target_edge)
-                    _, dist2 = get_point_line_segment_projection(ep2, target_edge)
-                    far_endpoint = ep1 if dist1 > dist2 else ep2
-
-                    axis_line = np.hstack([ep1, ep2])
-                    intersection_point = find_line_intersection(axis_line, target_edge)
-
-                    if intersection_point is not None:
-                        # New shield logic to filter corner false positives
-                        is_valid_location = True
-                        shield_ratio = p_reclass.get("ENDPOINT_SHIELD_RATIO_FOR_EXTENDED", 0.1)
-                        if shield_ratio > 0:
-                            edge_p1 = np.array(target_edge[:2])
-                            edge_p2 = np.array(target_edge[2:])
-                            edge_length = np.linalg.norm(edge_p1 - edge_p2)
-                            
-                            if edge_length > 1e-6:
-                                shield_distance = edge_length * shield_ratio
-                                dist_from_p1 = np.linalg.norm(intersection_point - edge_p1)
-                                dist_from_p2 = np.linalg.norm(intersection_point - edge_p2)
-                                
-                                if dist_from_p1 < shield_distance or dist_from_p2 < shield_distance:
-                                    is_valid_location = False
-                        
-                        if is_valid_location:
-                            # If location is valid, proceed with extension
-                            new_length = np.linalg.norm(far_endpoint - intersection_point)
-                            new_center = (far_endpoint + intersection_point) / 2
-                            new_size = (new_length, defect_width) if w_rect > h_rect else (defect_width, new_length)
-                            new_min_area_rect = (tuple(new_center), new_size, angle_raw)
-                            new_box_points = np.intp(cv2.boxPoints(new_min_area_rect))
-                            
-                            defect['box_points'] = new_box_points
-                            location['length_mm'] = float(round(new_length / pixels_per_mm, 2))
-                            location['width_mm'] = float(round(defect_width / pixels_per_mm, 2))
-                            location['x'] = int(new_center[0] + x)
-                            location['y'] = int(new_center[1] + y)
-                            aspect_ratio = new_length / defect_width if defect_width > 1e-6 else float('inf')
-                            if aspect_ratio > 50:
-                                should_be_filtered = True
-                            
-                        else:
-                            # If location is invalid, mark the defect for filtering
-                            should_be_filtered = True
-                # --- MODIFICATION END ---
+            # 移除了将 B 重新归类为 L 的几何逻辑
+            pass
         
         new_defect['raw_defect'] = defect 
         
@@ -658,14 +621,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             if min(length_mm, width_mm) < 2.0: continue
             if length_mm < min_size_mm: continue
             
-        elif new_defect['type'] in ['L', 'B']:
+        elif new_defect['type'] in ['B']:
             if location.get('length_mm', 0) < min_size_mm:
                 continue
-
-        if new_defect['type'] == 'L':
-            if location.get('length_mm', 0) * location.get('width_mm', 0) > 1000: continue
-            if location.get('width_mm', 0) < 0.75: continue
-            if location.get('width_mm', 0) > 10.0: continue
 
         if new_defect['type'] == 'B':
             length_mm = location.get('length_mm', 0); width_mm = location.get('width_mm', 0)
@@ -676,44 +634,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             if area_mm2 > 4000 and width_mm < 50: continue
             if area_mm2 > 1000 and aspect_ratio > 5.0: continue
 
-         #如果两个裂缝的位置有重叠则合并
-        if new_defect['type'] == 'L':
-            existing_L_defects = [d for d in final_defects_for_report if d['type'] == 'L']
-            new_box = defect.get('box_points')
-            if new_box is not None and len(new_box) == 4:
-                new_rect = cv2.minAreaRect(new_box)
-                new_box_pts = cv2.boxPoints(new_rect)
-                new_box_polygon = np.array(new_box_pts, dtype=np.int32)
-                
-                merged = False
-                for existing_defect in existing_L_defects:
-                    existing_box = existing_defect['raw_defect'].get('box_points')
-                    if existing_box is not None and len(existing_box) == 4:
-                        existing_rect = cv2.minAreaRect(existing_box)
-                        existing_box_pts = cv2.boxPoints(existing_rect)
-                        existing_box_polygon = np.array(existing_box_pts, dtype=np.int32)
-                        
-                        intersection_area = cv2.intersectConvexConvex(new_box_polygon, existing_box_polygon)[0]
-                        if intersection_area > 0:
-                            x_coords = np.concatenate((new_box_polygon[:, 0], existing_box_polygon[:, 0]))
-                            y_coords = np.concatenate((new_box_polygon[:, 1], existing_box_polygon[:, 1]))
-                            combined_points = np.column_stack((x_coords, y_coords))
-                            merged_rect = cv2.minAreaRect(combined_points)
-                            merged_box = np.intp(cv2.boxPoints(merged_rect))
-                            
-                            existing_defect['raw_defect']['box_points'] = merged_box
-                            length_mm = max(merged_rect[1])
-                            width_mm = min(merged_rect[1])
-                            existing_defect['location']['length_mm'] = float(round(length_mm / pixels_per_mm, 2))
-                            existing_defect['location']['width_mm'] = float(round(width_mm / pixels_per_mm, 2))
-                            existing_defect['location']['x'] = int(merged_rect[0][0] + x)
-                            existing_defect['location']['y'] = int(merged_rect[0][1] + y)
-                            
-                            merged = True
-                            break
-                if merged:
-                    continue
-                
+        # 移除 L 类型重叠合并
         
         # --- MODIFICATION START: Final check of the filter flag ---
         if not should_be_filtered:

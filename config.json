@@ -37,7 +37,7 @@
     "heartbeat_timeout_ms": 30000,
     "runtime": {
       "use_software_trigger": true,
-      "frame_rate": 19,
+      "frame_rate": 18,
       "enforce_mono8": true
     },
     "network_interfaces": [
@@ -82,12 +82,12 @@
     ],
     "unified_params": {
       "acquisition": {
-        "width": 1280,
-        "height": 960,
-        "frame_rate": 19
+        "width": 2448,
+        "height": 2048,
+        "frame_rate": 18
       },
       "exposure": {
-        "value_us": 400
+        "value_us": 250
       },
       "gain": {
         "value_db": 1.2
@@ -102,9 +102,11 @@
     }
   },
   "camera_rois": {
-    "0": "test.json",
-    "1": "test.json",
-    "2": "test.json"
+    "0": "cam5_roi_averaged_by_group.json",
+    "1": "cam2_roi_averaged_by_group.json",
+    "2": "cam3_roi_averaged_by_group.json",
+    "3": "cam4_roi_averaged_by_group.json",
+    "4": "cam5_roi_averaged_by_group.json"
   },
   "server_config": {
     "server": "localhost",
@@ -125,29 +127,36 @@
   "hough_inspector_params": {
     "PREPROCESSING": {
       "MEDIAN_BLUR_KSIZE": 5,
-      "CLAHE_CLIP_LIMIT": 2.0,
+      "CLAHE_CLIP_LIMIT": 1.8,
       "CLAHE_GRID_SIZE": [
         8,
         8
       ],
-      "CANNY_THRESHOLD_LOW": 36,
-      "CANNY_THRESHOLD_HIGH": 108
+      "CANNY_THRESHOLD_LOW": 30,
+      "CANNY_THRESHOLD_HIGH": 90
     },
     "HOUGH_TRANSFORM": {
       "THRESHOLD": 20,
       "MIN_LINE_LENGTH_RATIO": 0.05,
+      "MAX_LINE_GAP_MM": 10.97,
       "MAX_LINE_GAP": 30
     },
     "LINE_MERGING": {
-      "ANGLE_TOLERANCE": 1.0,
+      "ANGLE_TOLERANCE": 1.8,
+      "MAX_LATERAL_DISTANCE_MM": 10.97,
       "MAX_LATERAL_DISTANCE": 30,
       "TOP_N_EDGES": 6
     },
     "CRACK_CLASSIFICATION": {
-      "ENDPOINT_SHIELD_RATIO": 0.1
+      "ENDPOINT_SHIELD_RATIO": 0.1,
+      "ENDPOINT_PROXIMITY_THRESHOLD_MM": 5.49
     },
     "DEFECT_DETECTION": {
       "MIN_DEFECT_SIZE_MM": 2.0,
+      "MERGE_DEFECTS_KERNEL_MM": [
+        3.29,
+        3.29
+      ],
       "MERGE_DEFECTS_KERNEL_SIZE": [
         9,
         9
@@ -157,21 +166,28 @@
       "ANGLE_DEVIATION_TOLERANCE": 2.0,
       "Q_DEFECT_GRADIENT_THRESHOLD": 3.0,
       "SHADOW_FILTER_MIN_EXTENT_RATIO": 0.25,
+      "CORNER_MAX_PHYSICAL_GAP_MM": 2.56,
       "CORNER_MAX_PHYSICAL_GAP": 7,
       "CORNER_MIN_VIRTUAL_GAP": 7.0,
-      "CORNER_MAX_EXTENSION_DIST_NORMAL": 0,
+      "CORNER_MAX_EXTENSION_DIST_NORMAL_MM": 0.0,
+      "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR_MM": 73.14,
       "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR": 200,
       "PERPENDICULAR_ANGLE_TOLERANCE": 10,
+      "LUMINOSITY_SCAN_WIDTH_MM": 73.14,
       "LUMINOSITY_SCAN_WIDTH": 200,
       "LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD": 66,
       "LUMINOSITY_STD_DEV_MULTIPLIER": 2.0,
+      "LUMINOSITY_MIN_AREA_MM2": 4.01,
       "LUMINOSITY_MIN_AREA": 30,
+      "LUMINOSITY_EDGE_IGNORE_WIDTH_MM": 2.19,
       "LUMINOSITY_EDGE_IGNORE_WIDTH": 6,
       "LUMINOSITY_MIN_GRADIENT": 20,
+      "CHIPPING_ENDPOINT_SHIELD_RADIUS_MM": 0.0,
       "CHIPPING_ENDPOINT_SHIELD_RADIUS": 0,
       "RECLASSIFY_B_AS_L_PARAMS": {
         "ENABLE": true,
         "MIN_ASPECT_RATIO": 3.2,
+        "MAX_DISTANCE_MM": 73.14,
         "MAX_DISTANCE_PX": 200,
         "ANGLE_TOLERANCE": 15.0,
         "ENDPOINT_SHIELD_RATIO_FOR_EXTENDED": 0.1
@@ -197,21 +213,28 @@
     "HOUGH_TRANSFORM": {
       "THRESHOLD": 25,
       "MIN_LINE_LENGTH_RATIO": 0.05,
+      "MAX_LINE_GAP_MM": 5.49,
       "MAX_LINE_GAP": 15
     },
     "LINE_MERGING": {
       "ANGLE_TOLERANCE": 0.8,
+      "MAX_LATERAL_DISTANCE_MM": 4.39,
       "MAX_LATERAL_DISTANCE": 12,
       "TOP_N_EDGES": 8
     },
     "CRACK_CLASSIFICATION": {
       "ENDPOINT_SHIELD_RATIO": 0.1,
+      "ENDPOINT_PROXIMITY_THRESHOLD_MM": 5.49,
       "PARALLEL_CRACK_FILTER_ENABLE": true,
       "PARALLEL_CRACK_FILTER_ANGLE_TOLERANCE": 5.0,
       "PARALLEL_CRACK_FILTER_MAX_DISTANCE_PX": 10.0
     },
     "DEFECT_DETECTION": {
       "MIN_DEFECT_SIZE_MM": 3.0,
+      "MERGE_DEFECTS_KERNEL_MM": [
+        3.29,
+        3.29
+      ],
       "MERGE_DEFECTS_KERNEL_SIZE": [
         9,
         9
@@ -221,21 +244,28 @@
       "ANGLE_DEVIATION_TOLERANCE": 2.0,
       "Q_DEFECT_GRADIENT_THRESHOLD": 4.0,
       "SHADOW_FILTER_MIN_EXTENT_RATIO": 0.25,
+      "CORNER_MAX_PHYSICAL_GAP_MM": 2.56,
       "CORNER_MAX_PHYSICAL_GAP": 7,
       "CORNER_MIN_VIRTUAL_GAP": 7.0,
-      "CORNER_MAX_EXTENSION_DIST_NORMAL": 0,
+      "CORNER_MAX_EXTENSION_DIST_NORMAL_MM": 0.0,
+      "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR_MM": 64.01,
       "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR": 175,
       "PERPENDICULAR_ANGLE_TOLERANCE": 10,
+      "LUMINOSITY_SCAN_WIDTH_MM": 73.14,
       "LUMINOSITY_SCAN_WIDTH": 200,
       "LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD": 50,
       "LUMINOSITY_STD_DEV_MULTIPLIER": 1.5,
+      "LUMINOSITY_MIN_AREA_MM2": 10.02,
       "LUMINOSITY_MIN_AREA": 75,
+      "LUMINOSITY_EDGE_IGNORE_WIDTH_MM": 1.10,
       "LUMINOSITY_EDGE_IGNORE_WIDTH": 3,
       "LUMINOSITY_MIN_GRADIENT": 10,
+      "CHIPPING_ENDPOINT_SHIELD_RADIUS_MM": 0.0,
       "CHIPPING_ENDPOINT_SHIELD_RADIUS": 0,
       "RECLASSIFY_B_AS_L_PARAMS": {
         "ENABLE": true,
         "MIN_ASPECT_RATIO": 4.0,
+        "MAX_DISTANCE_MM": 73.14,
         "MAX_DISTANCE_PX": 200,
         "ANGLE_TOLERANCE": 15.0,
         "ENDPOINT_SHIELD_RATIO_FOR_EXTENDED": 0.1
