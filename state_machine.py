@@ -41,6 +41,18 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     # 不再使用单次触发标志
     rejection_details = {}
     saved_for_this_pane = False
+    # 采集模式下：初始化跨相机共享的 pane 序号与激活标记（通过 shared_settings 暴露给各计算进程）
+    try:
+        if getattr(shared_settings, 'data_collection_mode', False):
+            from datetime import datetime as _dt
+            if not hasattr(shared_settings, 'collection_pane_seq'):
+                shared_settings.collection_pane_seq = 0
+            if not hasattr(shared_settings, 'collection_pane_active'):
+                shared_settings.collection_pane_active = False
+            if not hasattr(shared_settings, 'collection_day_dir'):
+                shared_settings.collection_day_dir = _dt.now().strftime('%Y%m%d')
+    except Exception:
+        pass
     
     # 进入/离开 去抖（帧）——避免算法偶发抖动导致反复进入/离开
     ENTER_CONFIRM_FRAMES = int(getattr(shared_settings, 'enter_confirm_frames', 5))
@@ -200,6 +212,13 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     shared_yield_counter.value = 0
                     last_reset_date_str = now_str
                     yield_manager.save_stats(now_str, total_yield, total_rejections)
+                # 日期变更时，采集模式下 pane 序号从 1 重新开始（此处置 0，进入时 +1）
+                try:
+                    if getattr(shared_settings, 'data_collection_mode', False):
+                        shared_settings.collection_pane_seq = 0
+                        shared_settings.collection_day_dir = datetime.now().strftime('%Y%m%d')
+                except Exception:
+                    pass
 
             if cam_index >= len(last_camera_states):
                 last_camera_states = np.pad(last_camera_states, (0, cam_index - len(last_camera_states) + 1), 'constant')
@@ -216,6 +235,12 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         print("--- [状态机]: 玻璃离开事件 ---")
                         machine_state = "WAITING_FOR_PANE"
                         machine_state_shared.value = 0
+                        # 采集模式下：关闭跨相机 pane 激活标记
+                        try:
+                            if getattr(shared_settings, 'data_collection_mode', False):
+                                shared_settings.collection_pane_active = False
+                        except Exception:
+                            pass
                         absence_streak = 0
                         presence_streak = 0
 
@@ -354,6 +379,19 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             print("    [状态机]: 上一片未滞后剔废，已自动计入产量并上传。")
                         machine_state = "PANE_DETECTED"
                         machine_state_shared.value = 1
+                        # 采集模式下：进入时统一递增 pane 序号并置为激活
+                        try:
+                            if getattr(shared_settings, 'data_collection_mode', False):
+                                try:
+                                    cur_seq = int(getattr(shared_settings, 'collection_pane_seq', 0) or 0)
+                                except Exception:
+                                    cur_seq = 0
+                                shared_settings.collection_pane_seq = cur_seq + 1
+                                shared_settings.collection_pane_active = True
+                                shared_settings.collection_day_dir = datetime.now().strftime('%Y%m%d')
+                                print(f"    [状态机]: 采集会话开启 -> pane{shared_settings.collection_pane_seq}")
+                        except Exception:
+                            pass
                         current_pane_ng_buffer.clear()
                         current_pane_reports.clear()
                         current_pane_folder = None

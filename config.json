@@ -37,7 +37,7 @@
     "heartbeat_timeout_ms": 30000,
     "runtime": {
       "use_software_trigger": true,
-      "frame_rate": 18,
+      "frame_rate": 16,
       "enforce_mono8": true
     },
     "network_interfaces": [
@@ -84,7 +84,7 @@
       "acquisition": {
         "width": 2448,
         "height": 2048,
-        "frame_rate": 18
+        "frame_rate": 16
       },
       "exposure": {
         "value_us": 250
@@ -184,6 +184,12 @@
       "LUMINOSITY_MIN_GRADIENT": 20,
       "CHIPPING_ENDPOINT_SHIELD_RADIUS_MM": 0.0,
       "CHIPPING_ENDPOINT_SHIELD_RADIUS": 0,
+      "LUMINOSITY_ENDPOINT_EXCLUDE_RADIUS_MM": 6.0,
+      "B_FILTER_DISTANCE_TO_EDGE_MAX_MM": 5.0,
+      "B_FILTER_PARALLEL_TOLERANCE_DEG": 10.0,
+      "B_FILTER_NEAR_NONQ_INTERSECTION_RADIUS_MM": 20.0,
+      "B_TO_L_MIN_AR": 7.5,
+      "B_TO_L_PERP_TOLERANCE_DEG": 10.0,
       "RECLASSIFY_B_AS_L_PARAMS": {
         "ENABLE": true,
         "MIN_ASPECT_RATIO": 3.2,
@@ -262,6 +268,12 @@
       "LUMINOSITY_MIN_GRADIENT": 10,
       "CHIPPING_ENDPOINT_SHIELD_RADIUS_MM": 0.0,
       "CHIPPING_ENDPOINT_SHIELD_RADIUS": 0,
+      "LUMINOSITY_ENDPOINT_EXCLUDE_RADIUS_MM": 6.0,
+      "B_FILTER_DISTANCE_TO_EDGE_MAX_MM": 5.0,
+      "B_FILTER_PARALLEL_TOLERANCE_DEG": 10.0,
+      "B_FILTER_NEAR_NONQ_INTERSECTION_RADIUS_MM": 20.0,
+      "B_TO_L_MIN_AR": 7.5,
+      "B_TO_L_PERP_TOLERANCE_DEG": 10.0,
       "RECLASSIFY_B_AS_L_PARAMS": {
         "ENABLE": true,
         "MIN_ASPECT_RATIO": 4.0,

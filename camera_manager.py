@@ -24,21 +24,43 @@ def is_admin():
     except Exception:
         return False
 
-def run_as_admin():
-    """尝试获取管理员权限"""
-    if is_admin():
-        print("[相机初始化]: 已以管理员权限运行")
+def run_as_admin(script_path=None, *argv):
+    """在 Windows 上尝试以管理员权限重新启动当前程序。
+    - 若已是管理员，直接返回 True。
+    - 若非管理员：通过 ShellExecuteW('runas') 启动提升权限的新进程，成功返回 True，失败返回 False。
+    - 参数兼容调用方 (script_path, *sys.argv[1:]) 的用法。
+    """
+    try:
+        # 非 Windows 平台不尝试提权
+        if os.name != 'nt':
+            print("[相机初始化]: 非 Windows 平台，跳过管理员提权。")
+            return False
+        if is_admin():
+            print("[相机初始化]: 已以管理员权限运行")
+            return True
+        print("[相机初始化]: 尝试管理员提权启动...")
+        # 组装参数
+        if script_path is None:
+            script_path = sys.executable if getattr(sys, 'frozen', False) else sys.argv[0]
+        # 若为打包的可执行文件，直接以自身提权；否则以 python.exe 运行脚本
+        if getattr(sys, 'frozen', False):
+            executable = script_path
+            parameters = " ".join(argv)
+        else:
+            executable = sys.executable
+            # 将脚本路径作为第一个参数，其余参数拼接
+            quoted_script = f'"{script_path}"' if ' ' in str(script_path) else str(script_path)
+            quoted_args = " ".join([f'"{a}"' if isinstance(a, str) and (' ' in a) else str(a) for a in argv])
+            parameters = (quoted_script + (" " + quoted_args if quoted_args else "")).strip()
+        # 调用 ShellExecuteW 以 runas 方式启动
+        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, parameters, None, 1)
+        if int(ret) <= 32:
+            print(f"[相机初始化]: ShellExecute 提权失败，返回码: {ret}")
+            return False
         return True
-    else:
-        print("[相机初始化]: ⚠️ 当前无管理员权限，部分网络操作可能失败")
-        try:
-            print("[相机初始化]: 尝试获取管理员权限...")
-            # 无法在程序运行中自动获取管理员权限，需要用户手动以管理员身份启动
-            # 这里只能返回False并提供警告信息
-            return False
-        except Exception as e:
-            print(f"[相机初始化]: 获取管理员权限失败: {e}")
-            return False
+    except Exception as e:
+        print(f"[相机初始化]: 提权过程中发生异常: {e}")
+        return False
 
 # ======================================================================
 # --- 单个相机控制器 ---
