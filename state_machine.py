@@ -15,7 +15,6 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     # alarm_light_controller 实例现在通过函数参数直接传入
     
     STORAGE_PATH = shared_settings.storage_path
-    DATA_COLLECTION_MODE = bool(getattr(shared_settings, 'data_collection_mode', False))
     # 修改：移除产量计数，仅保留剔废计数
     (shared_rejection_counter, shared_yield_counter) = counters  # 0=rejections 1=yield
     (rejection_queue,) = queues
@@ -112,19 +111,12 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     rpt['rejection_time'] = rejection_details['rejection_time'].strftime('%Y-%m-%d %H:%M:%S')
             reports_for_upload.append(rpt)
             images_for_upload.append(res.get('annotated_image_buffer'))
-        if DATA_COLLECTION_MODE:
-            print("    [状态机]: 采集模式 - 跳过上传 (仅本地ROI裁剪保存)。")
-        else:
-            send_reports_batch_to_server(reports_for_upload, images_for_upload, shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
-            print(f"    [状态机]: 本片玻璃上传完成，共 {len(reports_for_upload)} 张 NG 图像。")
+        send_reports_batch_to_server(reports_for_upload, images_for_upload, shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
+        print(f"    [状态机]: 本片玻璃上传完成，共 {len(reports_for_upload)} 张 NG 图像。")
 
     # Initial state fetch
-    initial_state = None
-    if not DATA_COLLECTION_MODE:
-        fetch_collection_id_from_server(shared_settings, shared_collection_id)
-        initial_state = fetch_initial_state_from_server(shared_settings)
-    else:
-        print("[状态机]: 采集模式 - 跳过服务器初始状态获取与上传交互。")
+    fetch_collection_id_from_server(shared_settings, shared_collection_id)
+    initial_state = fetch_initial_state_from_server(shared_settings)
     if initial_state:
         shared_rejection_mode.value = initial_state.get("rejectionMode", 1)
         threshold_int = initial_state.get("rejectionThreshold", 20)
@@ -262,7 +254,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
 
                 # NG 帧处理
                 if result['image_status'] == 'NG':
-                    if current_pane_folder is None and not DATA_COLLECTION_MODE:
+                    if current_pane_folder is None:
                         pane_start_ts = datetime.now()
                         raw_cid = shared_collection_id.value
                         try:
@@ -293,12 +285,10 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     base_name = f"{pane_ng_frame_counter:04d}_Cam{cam_disp}"
                     img_buf = result.get('annotated_image_buffer')
                     if img_buf:
-                        if not DATA_COLLECTION_MODE:
-                            with open(os.path.join(current_pane_folder, base_name + '.jpg'), 'wb') as f:
-                                f.write(img_buf)
-                    if not DATA_COLLECTION_MODE:
-                        with open(os.path.join(current_pane_folder, base_name + '.json'), 'w', encoding='utf-8') as f:
-                            json.dump(rpt, f, ensure_ascii=False, indent=2, default=str)
+                        with open(os.path.join(current_pane_folder, base_name + '.jpg'), 'wb') as f:
+                            f.write(img_buf)
+                    with open(os.path.join(current_pane_folder, base_name + '.json'), 'w', encoding='utf-8') as f:
+                        json.dump(rpt, f, ensure_ascii=False, indent=2, default=str)
                     if not is_current_event_rejected and alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                         try:
                             alarm_light_controller.set_ng_detected_state(shared_settings.ng_buzz_duration_s)

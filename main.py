@@ -247,15 +247,12 @@ def main():
 
     # 确保存储目录存在
     storage_path = config.get('storage_path', 'inspection_results')
-    if not config.get('data_collection_mode', False):
-        if not os.path.exists(storage_path):
-            try:
-                os.makedirs(storage_path)
-                print(f"[主进程]: 创建存储目录: {storage_path}")
-            except Exception as e:
-                print(f"[主进程]: 警告 - 无法创建存储目录 {storage_path}: {e}")
-    else:
-        print("[主进程]: 采集模式启用 -> 禁用 inspection_results 持久化与上传。")
+    if not os.path.exists(storage_path):
+        try:
+            os.makedirs(storage_path)
+            print(f"[主进程]: 创建存储目录: {storage_path}")
+        except Exception as e:
+            print(f"[主进程]: 警告 - 无法创建存储目录 {storage_path}: {e}")
 
     # Shared settings object
     shared_settings = manager.Namespace()
@@ -265,8 +262,7 @@ def main():
     shared_settings.max_defect_size_mm = rejection_params.get('max_defect_size_mm', 20.0)
     shared_settings.REJECTION_PULSE_MS = rejection_params.get('REJECTION_PULSE_MS', 100)
     shared_settings.REJECTION_DELAY_S = rejection_params.get('REJECTION_DELAY_S', 1.5)
-    # 采集模式下仍保留字段但不使用
-    shared_settings.storage_path = '' if config.get('data_collection_mode', False) else config.get('storage_path', 'inspection_results')
+    shared_settings.storage_path = config.get('storage_path', 'inspection_results')
     shared_settings.pixels_per_mm = system_params.get('pixels_per_mm', 2.4)
     # 新增: 算法模式 (1=浅色 2=深色) 默认1
     shared_settings.algorithm_mode = 1
@@ -278,15 +274,15 @@ def main():
     # 可通过 config.collection_output_root 自定义目录
     shared_settings.collection_output_root = config.get('collection_output_root', 'collected_dataset')
     if getattr(shared_settings, 'data_collection_mode', False):
-        # 不再预创建 original / ng 空目录；仅在实际保存 ROI 时按需创建
         try:
             import time
             day_dir = time.strftime('%Y%m%d')
             base_dir = os.path.join(shared_settings.collection_output_root, day_dir)
-            os.makedirs(base_dir, exist_ok=True)
-            print(f"[主进程]: 采集模式启用，日期目录: {base_dir} (延迟创建 original/ng)")
+            for sub in ['original', 'ng']:
+                os.makedirs(os.path.join(base_dir, sub), exist_ok=True)
+            print(f"[主进程]: 采集模式启用，ROI裁剪保存目录: {base_dir}")
         except Exception as e:
-            print(f"[主进程]: 创建采集输出日期目录失败: {e}")
+            print(f"[主进程]: 创建采集输出目录失败: {e}")
     shared_settings.lineName = config.get('lineName', 'UNKNOWN_LINE')
     shared_settings.server = server_config.get('server', '127.0.0.1')
     shared_settings.upload_url = server_config.get('upload_url', f'http://{shared_settings.server}:5000/upload')
