@@ -52,33 +52,19 @@
       {
         "index": 2,
         "ip": "192.168.5.100"
+      },
+      {
+        "index": 3,
+        "ip": "192.168.6.100"
+      },
+      {
+        "index": 4,
+        "ip": "192.168.7.100"
       }
     ],
     "camera_nic_bindings": {
-      "4": 4
     },
     "camera_bindings": [
-      {
-        "index": 0,
-        "physical_index": 0,
-        "mac": "94:AA:B8:01:3A:DF",
-        "ip": "192.168.3.123",
-        "model": "MV-HP120GM"
-      },
-      {
-        "index": 1,
-        "physical_index": 1,
-        "mac": "94:AA:B8:01:FC:E6",
-        "ip": "192.168.4.130",
-        "model": "MV-HP120GM"
-      },
-      {
-        "index": 2,
-        "physical_index": 2,
-        "mac": "94:AA:B8:00:08:A2",
-        "ip": "192.168.5.162",
-        "model": "MV-HP120GM"
-      }
     ],
     "unified_params": {
       "acquisition": {
@@ -102,7 +88,7 @@
     }
   },
   "camera_rois": {
-    "0": "cam5_roi_averaged_by_group.json",
+    "0": "cam1_roi_averaged_by_group.json",
     "1": "cam2_roi_averaged_by_group.json",
     "2": "cam3_roi_averaged_by_group.json",
     "3": "cam4_roi_averaged_by_group.json",
