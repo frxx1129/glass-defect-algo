@@ -3,12 +3,10 @@ import os
 import cv2
 import json
 import base64
-import cv2
 import traceback
 from queue import Empty
 import time
 import fused_image_processor
-from fused_image_processor import save_roi_crops
 
 def should_reject_pane(pane_json, shared_settings, pixels_per_mm):
     """根据缺陷类型与尺寸判定是否剔废。
@@ -131,7 +129,6 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                         ts_now = int(time.time()*1000)
                         # 使用同一个 pane 序号和同一天目录
                         if coll_active and state_code > 0:
-                            import os
                             root = getattr(shared_settings, 'collection_output_root', 'collected_dataset')
                             pane_folder = f"pane{coll_seq}"
                             base = os.path.join(root, day_dir, pane_folder)
@@ -167,10 +164,7 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                         # 使用已建立的会话根目录，不再重复创建 pane_*；save_roi_crops 传 per_pane_folder=False 然后我们手动组织
                         # 将会话下的 original/ng 结构与先前逻辑兼容：直接把会话 folder 当 output_root 且不再创建 date 层
                         # 为复用函数，临时构造一个路径：在函数里 per_pane_folder=False 时会 base_dir=output_root/日期，需要改写: 这里复制函数逻辑较重，改简单包装
-                        from fused_image_processor import save_roi_crops as _s
-                        # 临时 monkey: 直接调用内部函数前改成一个假的 output_root = session_folder_parent 并 per_pane_folder=True => 会自动再创建嵌套 pane_，不符需求
-                        # 简化：复制一份核心循环保存（避免改原函数复杂度）
-                        import os, cv2
+                        # 简化：复制一份核心循环保存（避免改原函数复杂度），避免局部导入以防遮蔽
                         rois = roi_cache[cam_idx]
                         millis = int(time.time()*1000)
                         # 仍使用 original / ng 子目录，便于区分

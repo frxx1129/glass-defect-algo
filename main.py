@@ -104,6 +104,45 @@ def _ensure_single_instance_and_job():
 
 def main():
     """Main function to initialize shared resources, start child processes, and run the API server."""
+    # --- 日志重定向：将控制台输出同时写入 error.log（每次启动覆盖重建） ---
+    log_file = None
+    try:
+        # 在打包场景使用可执行文件目录，否则使用脚本所在目录
+        base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+        log_path = os.path.join(base_dir, 'error.log')
+        log_file = open(log_path, mode='w', encoding='utf-8')
+
+        class _Tee:
+            def __init__(self, *streams):
+                self._streams = [s for s in streams if s]
+            def write(self, data):
+                for s in self._streams:
+                    try:
+                        s.write(data)
+                    except Exception:
+                        pass
+                for s in self._streams:
+                    try:
+                        s.flush()
+                    except Exception:
+                        pass
+            def flush(self):
+                for s in self._streams:
+                    try:
+                        s.flush()
+                    except Exception:
+                        pass
+            def isatty(self):
+                return False
+
+        _orig_stdout, _orig_stderr = sys.stdout, sys.stderr
+        sys.stdout = _Tee(_orig_stdout, log_file)
+        sys.stderr = _Tee(_orig_stderr, log_file)
+        print(f"--- Log start @ {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+    except Exception:
+        # 若日志初始化失败，不影响主体流程
+        pass
+
     multiprocessing.freeze_support()
     cv2.setUseOptimized(True)
     print("[主进程]: 应用程序启动...")
@@ -496,6 +535,13 @@ def main():
                 print(f"[主进程]: 关闭HTTP客户端时出错: {e}")
             
         print("[主进程]: 所有资源已释放，程序退出。")
+        # 关闭日志文件（放在所有打印之后）
+        try:
+            if log_file:
+                log_file.flush()
+                log_file.close()
+        except Exception:
+            pass
 
 if __name__ == '__main__':
     main()
