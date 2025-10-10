@@ -28,6 +28,10 @@
     "ng_buzz_duration_s": 0.1,
     "rejection_buzz_duration_s": 0.3
   },
+  "remote_alarm": {
+    "host": "",
+    "port": 0
+  },
   "camera_setup": {
     "expected_cameras": 3,
     "bootstrap_default_ip": "192.168.1.200",

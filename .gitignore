@@ -27,7 +27,7 @@ build/
 dist/
 .eggs/
 *.egg-info/
-
+*.exe
 *.zip
 *.tar.gz
 *.tar.bz2

@@ -105,31 +105,26 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         }
 
     def upload_current_pane_if_needed():
-        """
-        立即上传策略启用：离开时不再执行批量上传。
-
-        原实现（已注释保留）：
-        在玻璃离开时，对当前 pane 的 NG 报告与图像进行统一批量上传，若发生剔废则统一修正 rejection_type/rejection_time。
-        保留此注释以便随时恢复批量上传策略。
-        """
-        # 原实现参考：
-        # nonlocal current_pane_ng_buffer, current_pane_reports, current_pane_folder
-        # if not current_pane_ng_buffer or not current_pane_reports:
-        #     return
-        # final_type = None
-        # if is_current_event_rejected and rejection_details.get('rejection_type'):
-        #     final_type = rejection_details.get('rejection_type')
-        # reports_for_upload, images_for_upload = [], []
-        # for rpt, res in zip(current_pane_reports, current_pane_ng_buffer):
-        #     if final_type and rpt.get('rejection_type') in ('0', 'pending', 'unknown'):
-        #         rpt['rejection_type'] = final_type
-        #         if 'rejection_time' in rejection_details:
-        #             rpt['rejection_time'] = rejection_details['rejection_time'].strftime('%Y-%m-%d %H:%M:%S')
-        #     reports_for_upload.append(rpt)
-        #     images_for_upload.append(res.get('annotated_image_buffer'))
-        # send_reports_batch_to_server(reports_for_upload, images_for_upload, shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
-        # print(f"    [状态机]: 本片玻璃上传完成，共 {len(reports_for_upload)} 张 NG 图像。")
-        return
+        """在玻璃离开时上传该片期间所有已保存的 NG 报告与图像。"""
+        nonlocal current_pane_ng_buffer, current_pane_reports, current_pane_folder
+        if not current_pane_ng_buffer or not current_pane_reports:
+            return
+        # 统一使用最终剔废类型（若发生剔废则全部标记其类型；否则保持各自已有）
+        final_type = None
+        if is_current_event_rejected and rejection_details.get('rejection_type'):
+            final_type = rejection_details.get('rejection_type')
+        reports_for_upload = []
+        images_for_upload = []
+        for rpt, res in zip(current_pane_reports, current_pane_ng_buffer):
+            if final_type and rpt.get('rejection_type') in ('0', 'pending', 'unknown'):
+                rpt['rejection_type'] = final_type
+                # 统一 rejection_time 为剔废时间
+                if 'rejection_time' in rejection_details:
+                    rpt['rejection_time'] = rejection_details['rejection_time'].strftime('%Y-%m-%d %H:%M:%S')
+            reports_for_upload.append(rpt)
+            images_for_upload.append(res.get('annotated_image_buffer'))
+        send_reports_batch_to_server(reports_for_upload, images_for_upload, shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
+        print(f"    [状态机]: 本片玻璃上传完成，共 {len(reports_for_upload)} 张 NG 图像。")
 
     # Initial state fetch
     fetch_collection_id_from_server(shared_settings, shared_collection_id)
@@ -167,7 +162,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 for rpt in current_pane_reports:
                     rpt['rejection_type'] = '2'
                     rpt['rejection_time'] = rejection_details['rejection_time'].strftime('%Y-%m-%d %H:%M:%S')
-                # 立即上传策略：先前各NG帧已逐帧上传，这里不再批量上传
+                send_reports_batch_to_server(current_pane_reports, [r.get('annotated_image_buffer') for r in current_pane_ng_buffer], shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
                 # 入队硬件动作（滞后手动剔废）
                 try:
                     route = getattr(shared_settings, 'manual_reject_route', None)
@@ -324,11 +319,6 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     if img_buf:
                         with open(os.path.join(current_pane_folder, base_name + '.jpg'), 'wb') as f:
                             f.write(img_buf)
-                        # 立即上传该NG帧
-                        try:
-                            send_report_to_server(rpt, img_buf, shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
-                        except Exception as e:
-                            print(f"    [状态机]: 立即上传NG失败: {e}")
                     with open(os.path.join(current_pane_folder, base_name + '.json'), 'w', encoding='utf-8') as f:
                         json.dump(rpt, f, ensure_ascii=False, indent=2, default=str)
                     if not is_current_event_rejected and alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):

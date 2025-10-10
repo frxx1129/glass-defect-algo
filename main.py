@@ -390,13 +390,43 @@ def main():
             alarm_light_service_thread = threading.Thread(target=alarm_light_service_instance.run, daemon=True)
             alarm_light_service_thread.start()
             alarm_light_controller = AlarmLightController(command_queue=alarm_command_queue)
+            # 应用远程报警推送配置（若存在）
+            try:
+                remote_cfg = config.get('remote_alarm', {}) or {}
+                host = str(remote_cfg.get('host') or '').strip()
+                port = str(remote_cfg.get('port') or '').strip()
+                if host and port:
+                    alarm_light_controller.remote_alarm_host = host
+                    alarm_light_controller.remote_alarm_port = port
+            except Exception:
+                pass
             alarm_light_controller.set_startup_state()
         else:
             print("[主进程]: 声光报警器串口初始化失败，该功能将被禁用。")
             alarm_light_controller = AlarmLightController(command_queue=None)
+            # 即使本地禁用，也可设置远程推送目标用于镜像
+            try:
+                remote_cfg = config.get('remote_alarm', {}) or {}
+                host = str(remote_cfg.get('host') or '').strip()
+                port = str(remote_cfg.get('port') or '').strip()
+                if host and port:
+                    alarm_light_controller.remote_alarm_host = host
+                    alarm_light_controller.remote_alarm_port = port
+            except Exception:
+                pass
     else:
         print("[主进程]: 警告 - 未在config.json中配置声光报警器端口，将不启用该功能。")
         alarm_light_controller = AlarmLightController(command_queue=None)
+        # 仅远程推送场景：允许没有本地串口，仅推送远端
+        try:
+            remote_cfg = config.get('remote_alarm', {}) or {}
+            host = str(remote_cfg.get('host') or '').strip()
+            port = str(remote_cfg.get('port') or '').strip()
+            if host and port:
+                alarm_light_controller.remote_alarm_host = host
+                alarm_light_controller.remote_alarm_port = port
+        except Exception:
+            pass
 
     http_client = NonBlockingHttpClient(max_workers=int(system_params.get('http_client_max_workers', 4) or 4))
 
