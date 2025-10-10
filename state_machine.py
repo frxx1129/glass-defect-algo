@@ -59,6 +59,76 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     LEAVE_CONFIRM_FRAMES = int(getattr(shared_settings, 'leave_confirm_frames', 5))
     presence_streak = 0
     absence_streak = 0
+
+    # 自动分路：每片玻璃内的 NG 汇聚与一次性触发
+    auto_ng_cams = set()           # 出现NG的相机集合（逻辑索引）
+    last_result_by_cam = {}        # 最近一帧NG结果（含缺陷坐标）的引用
+    auto_first_ng_ts_ms = None     # 第一次检测到NG的时间（毫秒）
+
+    def _decide_route_for_auto(expected_cams: int, ng_cams: set) -> str | None:
+        """依据规则决定路由：返回 'left' | 'mid' | 'right' | 'all' 或 None(尚未能决定)。
+        - 公共：len(ng_cams) >= 3 -> 'all'
+        - 4相机：{1,2} -> 'mid'；包含{2,3} -> 'left'；包含{0,1} -> 'right'；单相机2/3->left，0/1->right
+        - 5相机：{1,2}或{2,3} -> 'mid'；{3,4} -> 'left'；{0,1} -> 'right'；仅{2} -> None（坐标判定）；单相机3/4->left，0/1->right
+        """
+        cams = set(ng_cams)
+        if len(cams) >= 3:
+            return 'all'
+        if expected_cams == 4:
+            if {1, 2}.issubset(cams):
+                return 'mid'
+            if {2, 3}.issubset(cams):
+                return 'left'
+            if {0, 1}.issubset(cams):
+                return 'right'
+            if cams.issubset({2, 3}) and len(cams) >= 1:
+                return 'left'
+            if cams.issubset({0, 1}) and len(cams) >= 1:
+                return 'right'
+            return None
+        if expected_cams == 5:
+            if {1, 2}.issubset(cams) or {2, 3}.issubset(cams):
+                return 'mid'
+            if {3, 4}.issubset(cams):
+                return 'left'
+            if {0, 1}.issubset(cams):
+                return 'right'
+            if cams == {2}:
+                return None
+            if cams.issubset({3, 4}) and len(cams) >= 1:
+                return 'left'
+            if cams.issubset({0, 1}) and len(cams) >= 1:
+                return 'right'
+            return None
+        return None
+
+    def _decide_left_right_by_coord_for_cam2(result_obj: dict) -> str | None:
+        """仅在5相机且只有cam2为NG时调用。根据缺陷的x坐标决定左右：小->right，大->left。"""
+        try:
+            W = int(getattr(shared_settings, 'cam_width', 0) or 0)
+            if W <= 0:
+                return None
+            cx_values = []
+            for d in result_obj.get('defects', []):
+                loc = d.get('location', {})
+                if isinstance(loc, dict):
+                    if 'x' in loc and 'width' in loc:
+                        try:
+                            cx_values.append(float(loc.get('x', 0)) + float(loc.get('width', 0)) / 2.0)
+                        except Exception:
+                            pass
+                c = d.get('center')
+                if isinstance(c, (list, tuple)) and len(c) >= 2:
+                    try:
+                        cx_values.append(float(c[0]))
+                    except Exception:
+                        pass
+            if not cx_values:
+                return None
+            avg_cx = sum(cx_values) / len(cx_values)
+            return 'right' if avg_cx < (W / 2.0) else 'left'
+        except Exception:
+            return None
     
     def get_defect_size(defect):
         defect_type = defect.get('type')
@@ -280,6 +350,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                     yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
                                 broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
                             is_current_event_rejected = False
+                            # 重置自动分路聚合状态
+                            auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
                         continue
                 else:
                     absence_streak = 0
@@ -326,29 +398,55 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             alarm_light_controller.set_ng_detected_state(shared_settings.ng_buzz_duration_s)
                         except Exception:
                             pass
+                    # 记录自动分路用的NG集合、结果引用以及第一帧NG时间
+                    try:
+                        cam_i = int(result['camera_index'])
+                        auto_ng_cams.add(cam_i)
+                        last_result_by_cam[cam_i] = result
+                        if auto_first_ng_ts_ms is None:
+                            auto_first_ng_ts_ms = int(time.time() * 1000)
+                    except Exception:
+                        pass
 
                 if np.sum(last_camera_states) > np.sum(max_complexity_snapshot):
                     max_complexity_snapshot = last_camera_states.copy()
 
                 if not is_current_event_rejected:
-                    # 自动剔废
+                    # 自动剔废：汇聚后一次性分路触发
                     if shared_rejection_mode.value == 1 and result.get('should_reject', False):
-                        is_current_event_rejected = True
-                        saved_for_this_pane = True
-                        rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
-                        # 自动模式：暂不分路，route=None -> 控制器将执行 ALL。后续可在此根据缺陷位置决定路由。
-                        rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index, None))
-                        if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
-                            try:
-                                alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
-                            except Exception:
-                                pass
-                        with stats_lock:
-                            total_rejections += 1
-                            shared_rejection_counter.value = total_rejections
-                            yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
-                        broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                        print("    [状态机]: 自动剔废触发！")
+                        try:
+                            hold_ms = int(getattr(shared_settings, 'auto_route_decision_hold_ms', 120) or 120)
+                        except Exception:
+                            hold_ms = 120
+                        now_ms = int(time.time() * 1000)
+                        can_decide_time = (auto_first_ng_ts_ms is not None) and (now_ms - auto_first_ng_ts_ms >= hold_ms)
+                        expected = int(getattr(shared_settings, 'expected_cameras', num_cameras) or num_cameras)
+                        route = _decide_route_for_auto(expected, auto_ng_cams)
+                        if route is None and can_decide_time:
+                            # 特例：5路且仅cam2，根据坐标判定
+                            if expected == 5 and auto_ng_cams == {2}:
+                                base_res = last_result_by_cam.get(2)
+                                if base_res:
+                                    route = _decide_left_right_by_coord_for_cam2(base_res)
+                        # 仍未能决定，但已到达hold窗口，避免漏剔的兜底
+                        if route is None and can_decide_time and len(auto_ng_cams) >= 1:
+                            route = 'all' if len(auto_ng_cams) >= 3 else None
+                        if route is not None:
+                            is_current_event_rejected = True
+                            saved_for_this_pane = True
+                            rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
+                            rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index, route))
+                            if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                                try:
+                                    alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
+                                except Exception:
+                                    pass
+                            with stats_lock:
+                                total_rejections += 1
+                                shared_rejection_counter.value = total_rejections
+                                yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                            broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                            print(f"    [状态机]: 自动剔废触发，路由={route}，NG相机={sorted(list(auto_ng_cams))}")
                     # 即时手动剔废（模式2）
                     elif manual_reject_flag.value and shared_rejection_mode.value == 2:
                         is_current_event_rejected = True
@@ -416,6 +514,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         can_late_reject.value = False
                         presence_streak = 0
                         absence_streak = 0
+                        # 重置自动分路聚合状态
+                        auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                             try:
                                 alarm_light_controller.set_normal_state()

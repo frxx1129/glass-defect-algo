@@ -303,6 +303,23 @@ def main():
     shared_settings.REJECTION_DELAY_S = rejection_params.get('REJECTION_DELAY_S', 1.5)
     shared_settings.storage_path = config.get('storage_path', 'inspection_results')
     shared_settings.pixels_per_mm = system_params.get('pixels_per_mm', 2.4)
+    # 新增: 预期相机数与相机分辨率，供自动分路策略使用
+    try:
+        shared_settings.expected_cameras = int(NUM_CAMERAS)
+    except Exception:
+        shared_settings.expected_cameras = 1
+    try:
+        acq = config.get('camera_setup', {}).get('unified_params', {}).get('acquisition', {})
+        shared_settings.cam_width = int(acq.get('width', 0) or 0)
+        shared_settings.cam_height = int(acq.get('height', 0) or 0)
+    except Exception:
+        shared_settings.cam_width = 0
+        shared_settings.cam_height = 0
+    # 新增: 自动分路汇聚等待时间(ms)
+    try:
+        shared_settings.auto_route_decision_hold_ms = int(system_params.get('auto_route_decision_hold_ms', 120) or 120)
+    except Exception:
+        shared_settings.auto_route_decision_hold_ms = 120
     # 新增: 算法模式 (1=浅色 2=深色) 默认1
     shared_settings.algorithm_mode = 1
     # 数据采集模式标记与输出根目录

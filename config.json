@@ -21,7 +21,8 @@
     "coalesce_max_drain": 500,
     "process_workers": 5,
     "roi_threads": 2,
-    "auto_start": true
+    "auto_start": true,
+    "auto_route_decision_hold_ms": 120
   },
   "alarm_light_params": {
     "port": "COM4",
@@ -33,7 +34,7 @@
     "port": 0
   },
   "camera_setup": {
-    "expected_cameras": 3,
+    "expected_cameras": 4,
     "bootstrap_default_ip": "192.168.1.200",
     "bootstrap_assign_ips": true,
     "open_retry_count": 3,
