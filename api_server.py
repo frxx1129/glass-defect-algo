@@ -225,6 +225,60 @@ def create_app(num_cameras, shared_objects):
                 "message": f"处理请求时发生错误: {str(e)}",
                 "data": None
             }
+
+    # ========== 多路手动剔废接口 ==========
+    def _handle_manual_reject_route(current_user: CurrentUser, route_label: str):
+        # 仅在手动模式下允许
+        if flags[1].value != 2:
+            return {"code": 403, "message": "当前为自动模式，无法进行手动剔废", "data": None}
+        metadata[2].value = current_user.userId  # shared_user_id_manual
+        is_pane_detected = (machine_state_shared.value == 1)
+        is_late_rejection_possible = flags[2].value
+        if not is_pane_detected and not is_late_rejection_possible:
+            return {"code": 201, "message": "当前无玻璃正在检测，且上一片玻璃已过检", "data": None}
+        # 设置手动剔废标志，由状态机线程取走并入队，附带路由。
+        if not flags[0].value:  # manual_reject_flag
+            try:
+                setattr(shared_settings, 'manual_reject_route', route_label)
+            except Exception:
+                pass
+            flags[0].value = True
+            # 在 machine_state 中，若处于 PANE_DETECTED -> 立即入队并附上 route；否则允许滞后剔废
+            # 这里不直接入队，由状态机线程在触发时 enqueue (fire_time, -1, route)
+            return {"code": 200, "message": f"手动剔废({route_label}) 信号已发送", "data": {"reject_triggered": True, "route": route_label}}
+        return {"code": 202, "message": "正在处理上一个剔废信号，请稍候", "data": {"reject_triggered": False}}
+
+    @app.post("/control/rejectLeft")
+    async def manual_reject_left(current_user: CurrentUser):
+        try:
+            return _handle_manual_reject_route(current_user, 'left')
+        except Exception as e:
+            print(f"[API /control/rejectLeft] error: {e}")
+            return {"code": 500, "message": str(e)}
+
+    @app.post("/control/rejectMid")
+    async def manual_reject_mid(current_user: CurrentUser):
+        try:
+            return _handle_manual_reject_route(current_user, 'mid')
+        except Exception as e:
+            print(f"[API /control/rejectMid] error: {e}")
+            return {"code": 500, "message": str(e)}
+
+    @app.post("/control/rejectRight")
+    async def manual_reject_right(current_user: CurrentUser):
+        try:
+            return _handle_manual_reject_route(current_user, 'right')
+        except Exception as e:
+            print(f"[API /control/rejectRight] error: {e}")
+            return {"code": 500, "message": str(e)}
+
+    @app.post("/control/rejectAll")
+    async def manual_reject_all(current_user: CurrentUser):
+        try:
+            return _handle_manual_reject_route(current_user, 'all')
+        except Exception as e:
+            print(f"[API /control/rejectAll] error: {e}")
+            return {"code": 500, "message": str(e)}
     
     def report_system_status_to_server():
         try:

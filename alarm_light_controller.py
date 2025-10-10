@@ -3,6 +3,11 @@ import serial
 import time
 import threading
 from queue import Queue, Empty
+import os
+import threading
+import json
+import urllib.request
+import urllib.error
 
 # -------------------------------------------------------------------
 #  核心控制器（保持私有，在主进程中运行）
@@ -58,7 +63,11 @@ class _AlarmLightService:
                     self._send_command(light=light, buzzer="on" if buzzer_on else "off")
                     if duration > 0:
                         time.sleep(duration)
+                        # 持续时间结束：先关闭蜂鸣
                         self._send_command(light=current_light_state, buzzer="off")
+                        # 若为红色剔废模式，结束后自动恢复为绿色常亮
+                        if str(current_light_state).lower() == "red":
+                            self._send_command(light="green", buzzer="off")
                 
                 elif command == "SHUTDOWN":
                     self._send_command(light="off", buzzer="off")
@@ -91,18 +100,69 @@ class AlarmLightController:
         else:
             self.command_queue = command_queue
             self.is_active = True
+        # 远端推送目标，可通过环境变量或后续赋值配置
+        self.remote_alarm_host = os.environ.get("REMOTE_ALARM_HOST")  # 例如 192.168.1.50
+        self.remote_alarm_port = os.environ.get("REMOTE_ALARM_PORT")  # 例如 9000
+
+    # ---------------- 远端推送辅助 ----------------
+    def _push_remote(self, light: str, buzzer: bool, duration_s: float):
+        host = (self.remote_alarm_host or '').strip()
+        port = (self.remote_alarm_port or '').strip()
+        if not host or not port:
+            return
+        def _send():
+            try:
+                url = f"http://{host}:{port}/alarm/update"
+                data = json.dumps({"light": light, "buzzer": bool(buzzer), "duration_s": float(duration_s or 0.0)}).encode('utf-8')
+                req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+                with urllib.request.urlopen(req, timeout=1.0) as resp:
+                    _ = resp.read()
+            except Exception:
+                pass
+        threading.Thread(target=_send, daemon=True).start()
 
     def set_startup_state(self):
         if self.is_active: self.command_queue.put(("SET_STATE", ("green", True, 0.25)))
+        self._push_remote("green", True, 0.25)
 
     def set_normal_state(self):
         if self.is_active: self.command_queue.put(("SET_STATE", ("green", False, 0)))
+        self._push_remote("green", False, 0)
         
     def set_ng_detected_state(self, duration_s):
         if self.is_active: self.command_queue.put(("SET_STATE", ("yellow", True, duration_s)))
+        self._push_remote("yellow", True, duration_s)
 
     def set_rejection_state(self, duration_s):
         if self.is_active: self.command_queue.put(("SET_STATE", ("red", True, duration_s)))
+        self._push_remote("red", True, duration_s)
+        # 在控制器层也安排一次延时恢复绿色，以保证远端推送同步恢复
+        def _delayed_green():
+            try:
+                import time as _t
+                _t.sleep(max(0.0, float(duration_s or 0.0)))
+                self.set_normal_state()
+            except Exception:
+                pass
+        threading.Thread(target=_delayed_green, daemon=True).start()
+
+    # 通用接口：便于远端服务复用
+    def set_state(self, light: str, buzzer: bool, duration_s: float = 0.0):
+        light = (light or 'off').lower()
+        if light == 'off':
+            # 关闭：用绿色无蜂鸣代表 idle/off
+            if self.is_active: self.command_queue.put(("SET_STATE", ("off", False, 0)))
+            self._push_remote("off", False, 0)
+        elif light == 'green':
+            self.set_normal_state()
+        elif light == 'yellow':
+            if self.is_active: self.command_queue.put(("SET_STATE", ("yellow", bool(buzzer), float(duration_s or 0.0))))
+            self._push_remote("yellow", bool(buzzer), float(duration_s or 0.0))
+        elif light == 'red':
+            if self.is_active: self.command_queue.put(("SET_STATE", ("red", bool(buzzer), float(duration_s or 0.0))))
+            self._push_remote("red", bool(buzzer), float(duration_s or 0.0))
+        else:
+            self.set_normal_state()
     
     def close(self):
         """注意：代理对象的 close 只是发送关闭信号，并不真正关闭串口。"""

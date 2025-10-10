@@ -7,10 +7,27 @@ def rejection_handler_thread(rejection_queue, rejection_controller, stop_event, 
     print("[剔除处理器线程]: 已启动。")
     while not stop_event.is_set():
         try:
-            fire_time, cam_index = rejection_queue.get(timeout=0.1)
+            payload = rejection_queue.get(timeout=0.1)
+            # 兼容旧格式: (fire_time, cam_index)
+            if isinstance(payload, (list, tuple)):
+                if len(payload) == 2:
+                    fire_time, cam_index = payload
+                    route = None
+                elif len(payload) == 3:
+                    fire_time, cam_index, route = payload
+                else:
+                    # 不支持的格式，跳过
+                    continue
+            else:
+                # 不支持的消息格式
+                continue
             if (sleep_duration := fire_time - time.time()) > 0:
                 time.sleep(sleep_duration)
-            rejection_controller.trigger_rejection_signal(cam_index, shared_settings.REJECTION_PULSE_MS)
+            try:
+                pulse_ms = int(getattr(shared_settings, 'REJECTION_PULSE_MS', 100) or 100)
+            except Exception:
+                pulse_ms = 100
+            rejection_controller.trigger_rejection_signal(cam_index, pulse_ms, route)
         except Empty:
             continue
         except Exception as e:

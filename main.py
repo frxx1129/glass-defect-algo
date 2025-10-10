@@ -373,7 +373,16 @@ def main():
     stats_lock = threading.Lock()
 
     # Hardware controllers and services
-    rejection_controller = RejectionController()
+    # 剔废控制器：从配置读取串口与通道映射
+    rej_cfg = config.get('rejection_controller', {}) or {}
+    rej_port = rej_cfg.get('port') or rej_cfg.get('serial_port') or None
+    rej_baud = int(rej_cfg.get('baud', rej_cfg.get('baud_rate', 9600)) or 9600)
+    channel_map = rej_cfg.get('channel_map') or {"left": 1, "mid": 2, "right": 3, "all": 4}
+    try:
+        rejection_controller = RejectionController(port=rej_port, baud=rej_baud, channel_map=channel_map)
+    except Exception as e:
+        print(f"[主进程]: 初始化剔废控制器失败，将使用默认模拟控制器: {e}")
+        rejection_controller = RejectionController()
     
     if shared_settings.alarm_port:
         alarm_light_service_instance = _AlarmLightService(port=shared_settings.alarm_port, baud_rate=9600, command_queue=alarm_command_queue)

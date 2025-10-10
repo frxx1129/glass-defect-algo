@@ -1,0 +1,6 @@
+{
+  "serial_port": "COM3",
+  "baud": 9600,
+  "listen_host": "0.0.0.0",
+  "listen_port": 9000
+}

@@ -1,59 +1,101 @@
-''' 
- @Author: LI Zhaoyang  
- @Date: 2025-08-21 11:16:07  
- @Last Modified by:   LI Zhaoyang  
- @Last Modified time: 2025-08-21 11:16:07  
-''' 
+'''
+ @Author: LI Zhaoyang
+ @Date: 2025-08-21 11:16:07
+ @Last Modified by:   LI Zhaoyang
+ @Last Modified time: 2025-08-21 11:16:07
+'''
 # rejection_controller.py
 
 import time
+from typing import Optional, Dict, Union
+
+try:
+    import serial  # pyserial
+except Exception:
+    serial = None
+
 
 class RejectionController:
     """
-    管理剔废信号的发送。
-    这是一个抽象接口，未来可以填充具体的硬件控制代码（例如USB继电器、DIO卡、以太网模块等）。
+    四路剔废控制器：支持串口协议 A0 xx yy zz（zz=前三字节求和&0xFF）。
+
+    - 通道: 1=Left, 2=Mid, 3=Right, 4=All
+    - 命令: 0x01=ON, 0x00=OFF, 0x02=QUERY
+    - 脉冲: 发送ON, 延时, 发送OFF
+    - 若未配置串口或 pyserial 不可用，则自动降级为模拟模式（仅打印日志）。
     """
-    def __init__(self):
-        """
-        初始化与剔废硬件的连接。
-        """
-        print("✅ [剔除控制器]: 已初始化。当前为模拟模式。")
-        # 示例：未来您可以在此添加硬件初始化代码
-        # import serial
-        # try:
-        #     self.ser = serial.Serial('COM3', 9600, timeout=1)
-        #     print("✅ [剔除控制器]: 成功连接到COM3端口。")
-        # except Exception as e:
-        #     self.ser = None
-        #     print(f"❌ [剔除控制器]: 无法连接到硬件: {e}")
 
-    def trigger_rejection_signal(self, cam_index, pulse_duration_ms=100):
-        """
-        发送一个剔废脉冲信号。
-        :param cam_index: 触发剔除的相机索引，可用于日志或多通道控制。
-        :param pulse_duration_ms: 信号脉冲的持续时间（毫秒）。
-        """
-        
-        # --- 未来在此处填充您的真实硬件控制代码 ---
-        
-        # 目前，我们只打印一条日志信息来模拟信号发送
-        if cam_index == -1:
-            print(f"🔥🔥🔥 [剔除控制器]: 正在发送剔除信号 (持续 {pulse_duration_ms}ms)...")
+    def __init__(self, port: Optional[str] = None, baud: int = 115200, channel_map: Optional[Dict[str, int]] = None):
+        self.port = port
+        self.baud = int(baud or 115200)
+        self.channel_map = channel_map or {"left": 1, "mid": 2, "right": 3, "all": 4}
+        self.ser = None
+        if port and serial is not None:
+            try:
+                self.ser = serial.Serial(port, self.baud, timeout=0.2)
+                print(f"✅ [剔除控制器]: 串口已连接 {port} @ {self.baud}")
+            except Exception as e:
+                self.ser = None
+                print(f"❌ [剔除控制器]: 无法打开串口 {port}: {e}，将使用模拟模式。")
         else:
-            print(f"🔥🔥🔥 [剔除控制器]: 相机 {cam_index+1} 正在发送剔除信号 (持续 {pulse_duration_ms}ms)...")
+            if port and serial is None:
+                print("⚠️ [剔除控制器]: 未安装 pyserial，使用模拟模式。")
+            else:
+                print("✅ [剔除控制器]: 未配置串口，使用模拟模式。")
 
-        # 示例（使用pyserial库）:
-        # if self.ser:
-        #     self.ser.write(b'RELAY_ON_COMMAND')
-        #     time.sleep(pulse_duration_ms / 1000.0)
-        #     self.ser.write(b'RELAY_OFF_COMMAND')
-        
-        time.sleep(pulse_duration_ms / 1000.0) # 模拟硬件操作耗时
-        
-        print(f"🔥🔥🔥 [剔除控制器]: 信号发送完毕。")
+    @staticmethod
+    def _as_channel(route: Optional[Union[str, int]], cam_index: int) -> int:
+        """根据 API 指令 route 解析通道号(1..4)。不使用 cam_index 作为映射依据。"""
+        if isinstance(route, str):
+            r = route.lower()
+            if r in ("l", "left"): return 1
+            if r in ("m", "mid", "middle", "center", "centre"): return 2
+            if r in ("r", "right"): return 3
+            if r in ("a", "all", "any"): return 4
+        if isinstance(route, int) and 1 <= route <= 4:
+            return route
+        # 默认：未指定路由时，使用 ALL
+        return 4
+
+    @staticmethod
+    def _packet(channel: int, cmd: int) -> bytes:
+        head = 0xA0
+        channel = max(1, min(4, int(channel)))
+        cmd = int(cmd) & 0xFF
+        chk = (head + channel + cmd) & 0xFF
+        return bytes([head, channel, cmd, chk])
+
+    def send_command(self, channel: int, cmd: int):
+        pkt = self._packet(channel, cmd)
+        if self.ser:
+            try:
+                self.ser.write(pkt)
+            except Exception as e:
+                print(f"❌ [剔除控制器]: 串口发送失败: {e}")
+        else:
+            print(f"[剔除控制器][模拟] -> {list(pkt)} (ch={channel}, cmd={cmd})")
+
+    def pulse(self, channel: int, duration_ms: int):
+        duration_s = max(0.0, (int(duration_ms or 0)) / 1000.0)
+        self.send_command(channel, 0x01)  # ON
+        time.sleep(duration_s)
+        self.send_command(channel, 0x00)  # OFF
+
+    def query(self, channel: int):
+        self.send_command(channel, 0x02)
+
+    def trigger_rejection_signal(self, cam_index: int, pulse_duration_ms: int = 100, route: Optional[Union[str, int]] = None):
+        channel = self._as_channel(route, cam_index)
+        # 记录日志
+        cam_desc = "ALL" if cam_index == -1 else f"Cam{cam_index+1}"
+        print(f"🔥🔥🔥 [剔除控制器]: {cam_desc} -> 通道 {channel} 脉冲 {pulse_duration_ms}ms")
+        self.pulse(channel, pulse_duration_ms)
+        print("🔥🔥🔥 [剔除控制器]: 脉冲完成。")
 
     def close(self):
-        """关闭硬件连接，释放资源。"""
-        # 在此添加硬件资源释放代码
-        # e.g., if self.ser: self.ser.close()
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
         print("✅ [剔除控制器]: 控制器已关闭。")

@@ -1,4 +1,5 @@
 [主进程]: 应用程序启动...
-请选择运行模式 (1=正常检测 2=采集模式) [默认1]: [主进程]: 运行模式=正常检测 (模式1)
+请选择运行模式 (1=正常检测 2=采集模式) [默认1]: [主进程]: 采集模式载入 camera_rois: {'0': 'cam1_roi_averaged_by_group.json', '1': 'cam2_roi_averaged_by_group.json', '2': 'cam3_roi_averaged_by_group.json', '3': 'cam4_roi_averaged_by_group.json', '4': 'cam5_roi_averaged_by_group.json'}
+[主进程]: 已切换到采集模式 (模式2)，采集配置合并完成
 [主进程]: 使用 camera_rois 中的 'cam1_roi_averaged_by_group.json' 进行ROI越界校验
 错误: ROI 越界校验时出现异常: [Errno 2] No such file or directory: 'cam1_roi_averaged_by_group.json'

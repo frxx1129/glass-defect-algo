@@ -6,7 +6,7 @@
   "user_id_auto": 7,
   "user_id_manual": 9999,
   "system_params": {
-    "pixels_per_mm": 2.735,
+    "pixels_per_mm": 2.44,
     "queue_size_factor": 2,
     "http_client_max_workers": 4,
     "http_get_timeout_s": 5,
@@ -104,6 +104,16 @@
     "upload_url": "http://localhost:8085/fastapi/glass/uploadWithDefects",
     "stats_push_url": "http://localhost:8085/fastapi/glass/updateYieldAndRejections",
     "heartbeat_url": "http://localhost:8085/fastapi/system/heartbeat"
+  },
+  "rejection_controller": {
+    "port": "COM6",
+    "baud": 115200,
+    "channel_map": {
+      "left": 1,
+      "mid": 2,
+      "right": 3,
+      "all": 4
+    }
   },
   "rejection_params": {
     "max_defect_size_mm": 20,
