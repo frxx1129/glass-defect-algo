@@ -359,6 +359,42 @@ def main():
     shared_settings.ng_buzz_duration_s = float(alarm_params.get('ng_buzz_duration_s', 1.0))
     shared_settings.rejection_buzz_duration_s = float(alarm_params.get('rejection_buzz_duration_s', 3.0))
 
+    # 按产线配置的“rejectionMark(参数) -> 通道号(1..n)”映射，支持每条产线独立配置
+    try:
+        mark_map = config.get('rejection_mark_to_channel', {}) or {}
+        # 期望结构示例：{"Line1": {"0":1, "1":2, "2":3, "3":4}, "Line2": {"0":1, "1":2, "2":3, "3":4, "4":5}}
+        # 统一键为字符串，值为整型
+        normalized = {}
+        for line_name, mapping in mark_map.items():
+            if not isinstance(mapping, dict):
+                continue
+            nm = {}
+            for k, v in mapping.items():
+                try:
+                    nm[str(int(k))] = int(v)
+                except Exception:
+                    # 保底：若键不可转为int，按原样存字符串键
+                    try:
+                        nm[str(k)] = int(v)
+                    except Exception:
+                        pass
+            if nm:
+                normalized[str(line_name)] = nm
+        shared_settings.rejection_mark_to_channel = normalized
+        # 轻量校验：若存在 <1 的通道或明显超出 1..8 的值，给出一次性警告
+        try:
+            bad = []
+            for ln, mp in normalized.items():
+                for mk, ch in mp.items():
+                    if not isinstance(ch, int) or ch < 1 or ch > 8:
+                        bad.append((ln, mk, ch))
+            if bad:
+                print(f"[主进程]: 警告 - rejection_mark_to_channel 中存在越界通道: {bad}，请检查配置与硬件接线。")
+        except Exception:
+            pass
+    except Exception:
+        shared_settings.rejection_mark_to_channel = {}
+
     # Queues for data flow
     queue_size_factor = int(system_params.get('queue_size_factor', 2) or 2)
     task_queue = manager.Queue(maxsize=NUM_WORKERS * NUM_CAMERAS * queue_size_factor)
@@ -394,9 +430,8 @@ def main():
     rej_cfg = config.get('rejection_controller', {}) or {}
     rej_port = rej_cfg.get('port') or rej_cfg.get('serial_port') or None
     rej_baud = int(rej_cfg.get('baud', rej_cfg.get('baud_rate', 9600)) or 9600)
-    channel_map = rej_cfg.get('channel_map') or {"left": 1, "mid": 2, "right": 3, "all": 4}
     try:
-        rejection_controller = RejectionController(port=rej_port, baud=rej_baud, channel_map=channel_map)
+        rejection_controller = RejectionController(port=rej_port, baud=rej_baud)
     except Exception as e:
         print(f"[主进程]: 初始化剔废控制器失败，将使用默认模拟控制器: {e}")
         rejection_controller = RejectionController()

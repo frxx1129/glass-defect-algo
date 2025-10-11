@@ -7,7 +7,7 @@
 # rejection_controller.py
 
 import time
-from typing import Optional, Dict, Union
+from typing import Optional, Union
 
 try:
     import serial  # pyserial
@@ -17,18 +17,17 @@ except Exception:
 
 class RejectionController:
     """
-    四路剔废控制器：支持串口协议 A0 xx yy zz（zz=前三字节求和&0xFF）。
+    多路剔废控制器：支持串口协议 A0 xx yy zz（zz=前三字节求和&0xFF）。
 
-    - 通道: 1=Left, 2=Mid, 3=Right, 4=All
+    - 默认通道映射支持 >=4 路，扩展至最多 8 路（根据硬件与配置决定）。
     - 命令: 0x01=ON, 0x00=OFF, 0x02=QUERY
     - 脉冲: 发送ON, 延时, 发送OFF
     - 若未配置串口或 pyserial 不可用，则自动降级为模拟模式（仅打印日志）。
     """
 
-    def __init__(self, port: Optional[str] = None, baud: int = 115200, channel_map: Optional[Dict[str, int]] = None):
+    def __init__(self, port: Optional[str] = None, baud: int = 115200):
         self.port = port
         self.baud = int(baud or 115200)
-        self.channel_map = channel_map or {"left": 1, "mid": 2, "right": 3, "all": 4}
         self.ser = None
         if port and serial is not None:
             try:
@@ -45,14 +44,14 @@ class RejectionController:
 
     @staticmethod
     def _as_channel(route: Optional[Union[str, int]], cam_index: int) -> int:
-        """根据 API 指令 route 解析通道号(1..4)。不使用 cam_index 作为映射依据。"""
+        """根据 API 指令 route 解析通道号(1..8)。不使用 cam_index 作为映射依据。"""
         if isinstance(route, str):
             r = route.lower()
             if r in ("l", "left"): return 1
             if r in ("m", "mid", "middle", "center", "centre"): return 2
             if r in ("r", "right"): return 3
             if r in ("a", "all", "any"): return 4
-        if isinstance(route, int) and 1 <= route <= 4:
+        if isinstance(route, int) and 1 <= route <= 8:
             return route
         # 默认：未指定路由时，使用 ALL
         return 4
@@ -60,7 +59,8 @@ class RejectionController:
     @staticmethod
     def _packet(channel: int, cmd: int) -> bytes:
         head = 0xA0
-        channel = max(1, min(4, int(channel)))
+        # 允许最多 8 路，若硬件不支持，多余通道不会生效
+        channel = max(1, min(8, int(channel)))
         cmd = int(cmd) & 0xFF
         chk = (head + channel + cmd) & 0xFF
         return bytes([head, channel, cmd, chk])

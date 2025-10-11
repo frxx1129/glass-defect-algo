@@ -11,13 +11,17 @@ from pydantic import BaseModel
 from utils import ConnectionManager
 from rejection_control import rejection_handler_thread
 from state_machine import results_and_state_machine_thread
-from server_comms import periodic_stats_pusher
+from server_comms import periodic_stats_pusher, broadcast_yield_and_rejections
 
 class CurrentUser(BaseModel):
-    sessionId: str
-    expiredTime: int
+    sessionId: str  # 每次登录都生成一个，用于有状态登录，判断token是否过期
+    expiredTime: int  # 过期时间
     userId: int
     roleCode: str
+
+class RejectParam(BaseModel):
+    currentUser: CurrentUser
+    rejectionMark: int
 
 def create_app(num_cameras, shared_objects):
     """Creates and configures the FastAPI application instance."""
@@ -182,103 +186,100 @@ def create_app(num_cameras, shared_objects):
             return {"code": 400, "message": f"无效的数值格式: {e}"}
 
     @app.post("/control/reject")
-    async def manual_reject_trigger(current_user: CurrentUser):
+    async def reject(rejectionParam: RejectParam):
+        """参数化剔废：
+        - 产线 Line1/Line3: 接收 4 个参数(0..3)
+        - 产线 Line2: 接收 5 个参数(0..4)
+        - 每个参数 -> 通道号的映射从 config.rejection_mark_to_channel 中读取（每条产线独立）
+        - 仅在手动模式(flags[1]==2)下允许。
+        - 触发硬件剔废并计数、广播；不涉及上传逻辑（由状态机负责）。
+        """
         try:
-            # 1. First, check if the system is in manual mode.
-            if flags[1].value != 2: # flags[1] is shared_rejection_mode
-                return {
-                    "code": 403,
-                    "message": "当前为自动模式，无法进行手动剔废",
-                    "data": None
-                }
+            # 模式校验：仅手动模式有效
+            if flags[1].value != 2:
+                return {"code": 403, "message": "当前为自动模式，无法进行手动剔废", "data": None}
 
-            # 2. Proceed with the original logic only if in manual mode.
-            metadata[2].value = current_user.userId # shared_user_id_manual
-            is_pane_detected = (machine_state_shared.value == 1)
-            is_late_rejection_possible = flags[2].value # can_late_reject
+            # 提取用户、参数
+            current_user = rejectionParam.currentUser
+            mark = int(rejectionParam.rejectionMark)
+            metadata[2].value = current_user.userId  # shared_user_id_manual
 
-            if not is_pane_detected and not is_late_rejection_possible:
-                return {
-                    "code": 201,
-                    "message": "当前无玻璃正在检测，且上一片玻璃已过检",
-                    "data": None
-                }
+            # 校验参数范围依赖于产线名
+            line_name = str(getattr(shared_settings, 'lineName', 'UNKNOWN')).strip()
+            if line_name in ("Line1", "Line3"):
+                valid_range = range(0, 4)  # 0..3
+            elif line_name == "Line2":
+                valid_range = range(0, 5)  # 0..4
+            else:
+                # 未知产线：默认采用 0..3（与历史保持一致）
+                valid_range = range(0, 4)
 
-            if not flags[0].value: # manual_reject_flag
-                flags[0].value = True
-                return {
-                    "code": 200,
-                    "message": "手动剔废信号已发送",
-                    "data": {"reject_triggered": True}
-                }
+            if mark not in valid_range:
+                return {"code": 400, "message": f"rejectionMark 超出范围，期望 {valid_range.start}..{valid_range.stop-1}", "data": None}
 
-            return {
-                "code": 202,
-                "message": "正在处理上一个剔废信号，请稍候",
-                "data": {"reject_triggered": False}
-            }
-
-        except Exception as e:
-            print(f"[API /control/reject] 处理手动剔废请求时出错: {e}")
-            return {
-                "code": 500,
-                "message": f"处理请求时发生错误: {str(e)}",
-                "data": None
-            }
-
-    # ========== 多路手动剔废接口 ==========
-    def _handle_manual_reject_route(current_user: CurrentUser, route_label: str):
-        # 仅在手动模式下允许
-        if flags[1].value != 2:
-            return {"code": 403, "message": "当前为自动模式，无法进行手动剔废", "data": None}
-        metadata[2].value = current_user.userId  # shared_user_id_manual
-        is_pane_detected = (machine_state_shared.value == 1)
-        is_late_rejection_possible = flags[2].value
-        if not is_pane_detected and not is_late_rejection_possible:
-            return {"code": 201, "message": "当前无玻璃正在检测，且上一片玻璃已过检", "data": None}
-        # 设置手动剔废标志，由状态机线程取走并入队，附带路由。
-        if not flags[0].value:  # manual_reject_flag
+            # 查询通道映射：优先 per-line 配置，否则退化到顺序映射 mark->(mark+1)
+            line_map = {}
             try:
-                setattr(shared_settings, 'manual_reject_route', route_label)
+                cfg_map = getattr(shared_settings, 'rejection_mark_to_channel', {}) or {}
+                line_map = cfg_map.get(line_name, {}) or {}
             except Exception:
+                line_map = {}
+            channel = int(line_map.get(str(mark), mark + 1))
+            if channel < 1:
+                channel = 1
+
+            # 触发剔废：直接放入队列，由剔除线程按统一延迟与脉冲宽度执行
+            # 这里 route 直接传递整数通道号，rejection_controller._as_channel 将按 int 处理
+            fire_time = time.time() + getattr(shared_settings, 'REJECTION_DELAY_S', 1.5)
+            queues['rejection'].put((fire_time, -1, channel))
+
+            # 更新本地剔废计数与广播（保持与状态机手动一致：计数+推送看板，不做上传）
+            try:
+                # 计数 +1 并持久化
+                from yield_manager import save_stats, load_stats
+                last_date, total_yield, total_rej = load_stats()
+                total_rej = (total_rej or 0) + 1
+                counters[0].value = total_rej
+                save_stats(last_date, total_yield, total_rej)
+            except Exception as _:
                 pass
-            flags[0].value = True
-            # 在 machine_state 中，若处于 PANE_DETECTED -> 立即入队并附上 route；否则允许滞后剔废
-            # 这里不直接入队，由状态机线程在触发时 enqueue (fire_time, -1, route)
-            return {"code": 200, "message": f"手动剔废({route_label}) 信号已发送", "data": {"reject_triggered": True, "route": route_label}}
-        return {"code": 202, "message": "正在处理上一个剔废信号，请稍候", "data": {"reject_triggered": False}}
+            try:
+                broadcast_yield_and_rejections(shared_settings, metadata[0], counters[1], counters[0], http_client)
+            except Exception as _:
+                pass
 
-    @app.post("/control/rejectLeft")
-    async def manual_reject_left(current_user: CurrentUser):
-        try:
-            return _handle_manual_reject_route(current_user, 'left')
+            print(f"[API /control/reject] user={current_user.userId}, role={current_user.roleCode}, line={line_name}, mark={mark}, channel={channel}")
+            return {"code": 200, "message": "Rejected", "data": {"mark": mark, "channel": channel}}
         except Exception as e:
-            print(f"[API /control/rejectLeft] error: {e}")
-            return {"code": 500, "message": str(e)}
+            print(f"[API /control/reject] 处理剔废请求错误: {e}")
+            return {"code": 500, "message": f"处理请求时发生错误: {e}", "data": None}
 
-    @app.post("/control/rejectMid")
-    async def manual_reject_mid(current_user: CurrentUser):
+    # 旧的 left/mid/right/all 接口已废弃，统一使用 /control/reject(rejectionMark)
+    
+    @app.get("/control/reject/config")
+    def get_reject_config():
+        """返回当前产线的剔废参数范围与通道映射，便于前端渲染与校验。"""
         try:
-            return _handle_manual_reject_route(current_user, 'mid')
+            line_name = str(getattr(shared_settings, 'lineName', 'UNKNOWN')).strip()
+            if line_name in ("Line1", "Line3"):
+                valid_range = (0, 3)
+            elif line_name == "Line2":
+                valid_range = (0, 4)
+            else:
+                valid_range = (0, 3)
+            cfg_map = getattr(shared_settings, 'rejection_mark_to_channel', {}) or {}
+            line_map = cfg_map.get(line_name, {}) or {}
+            return {
+                "code": 200,
+                "message": "Success",
+                "data": {
+                    "lineName": line_name,
+                    "allowedMarkRange": {"start": valid_range[0], "end": valid_range[1]},
+                    "mapping": line_map
+                }
+            }
         except Exception as e:
-            print(f"[API /control/rejectMid] error: {e}")
-            return {"code": 500, "message": str(e)}
-
-    @app.post("/control/rejectRight")
-    async def manual_reject_right(current_user: CurrentUser):
-        try:
-            return _handle_manual_reject_route(current_user, 'right')
-        except Exception as e:
-            print(f"[API /control/rejectRight] error: {e}")
-            return {"code": 500, "message": str(e)}
-
-    @app.post("/control/rejectAll")
-    async def manual_reject_all(current_user: CurrentUser):
-        try:
-            return _handle_manual_reject_route(current_user, 'all')
-        except Exception as e:
-            print(f"[API /control/rejectAll] error: {e}")
-            return {"code": 500, "message": str(e)}
+            return {"code": 500, "message": f"获取配置失败: {e}", "data": None}
     
     def report_system_status_to_server():
         try:

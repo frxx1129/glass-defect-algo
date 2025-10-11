@@ -110,15 +110,14 @@
     "stats_push_url": "http://localhost:8085/fastapi/glass/updateYieldAndRejections",
     "heartbeat_url": "http://localhost:8085/fastapi/system/heartbeat"
   },
+  "rejection_mark_to_channel": {
+    "Line1": { "0": 1, "1": 2, "2": 3, "3": 4 },
+    "Line2": { "0": 1, "1": 2, "2": 3, "3": 4, "4": 5 },
+    "Line3": { "0": 1, "1": 2, "2": 3, "3": 4 }
+  },
   "rejection_controller": {
     "port": "COM6",
-    "baud": 115200,
-    "channel_map": {
-      "left": 1,
-      "mid": 2,
-      "right": 3,
-      "all": 4
-    }
+    "baud": 115200
   },
   "rejection_params": {
     "max_defect_size_mm": 20,
