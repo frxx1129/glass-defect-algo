@@ -221,39 +221,42 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         print("[状态机]: 未能从服务器获取状态，保持当前运行状态。")
     
     while not stop_event.is_set():
-        # 处理滞后剔废（在等待新玻璃状态下）
-        if machine_state == "WAITING_FOR_PANE" and manual_reject_flag.value and can_late_reject.value:
+        # 手动剔废（等待新玻璃状态下也可随时触发）：始终进行剔废控制；仅在既可滞后且确有NG时才上传
+        if machine_state == "WAITING_FOR_PANE" and manual_reject_flag.value:
             manual_reject_flag.value = False
-            can_late_reject.value = False
-            print(f"--- [状态机]: 检测到滞后手动剔废指令 ---")
-            if current_pane_ng_buffer and not is_current_event_rejected:
-                # 更新所有已缓存报告的剔废类型并上传（之前未上传因为处于模式2下且未剔废）
+            # 硬件剔废始终执行
+            try:
+                route = getattr(shared_settings, 'manual_reject_route', None)
+            except Exception:
+                route = None
+            rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, -1, route))
+            if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                try:
+                    alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
+                except Exception:
+                    pass
+            # 计入一次剔废
+            with stats_lock:
+                total_rejections += 1
+                shared_rejection_counter.value = total_rejections
+                yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+            broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+            # 仅当处于可滞后窗口且确有上一片NG缓存时执行上传与回滚，其余情况不上传
+            if can_late_reject.value and current_pane_ng_buffer and not is_current_event_rejected:
+                can_late_reject.value = False
                 rejection_details = {"rejection_time": datetime.now(), "rejection_type": "2"}
                 for rpt in current_pane_reports:
                     rpt['rejection_type'] = '2'
                     rpt['rejection_time'] = rejection_details['rejection_time'].strftime('%Y-%m-%d %H:%M:%S')
                 send_reports_batch_to_server(current_pane_reports, [r.get('annotated_image_buffer') for r in current_pane_ng_buffer], shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
-                # 入队硬件动作（滞后手动剔废）
-                try:
-                    route = getattr(shared_settings, 'manual_reject_route', None)
-                except Exception:
-                    route = None
-                rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, -1, route))
-                if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
-                    try:
-                        alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
-                    except Exception:
-                        pass
+                # 回滚上一片产量（若已计）
                 with stats_lock:
-                    total_rejections += 1
-                    # 之前离开时已把该片计为产量 +1，此处回滚 -1
                     if total_yield > 0:
                         total_yield -= 1
                         shared_yield_counter.value = total_yield
-                    shared_rejection_counter.value = total_rejections
-                    yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                        yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
                 broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                print(f"    [状态机]: 滞后剔废完成并上传。本片NG帧数量: {len(current_pane_ng_buffer)}")
+                print(f"    [状态机]: 手动剔废完成并上传。本片NG帧数量: {len(current_pane_ng_buffer)}")
                 # 上传后清空，为下一片做准备
                 current_pane_ng_buffer.clear()
                 current_pane_reports.clear()
@@ -447,8 +450,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                 yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
                             broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
                             print(f"    [状态机]: 自动剔废触发，路由={route}，NG相机={sorted(list(auto_ng_cams))}")
-                    # 即时手动剔废（模式2）
-                    elif manual_reject_flag.value and shared_rejection_mode.value == 2:
+                    # 即时手动剔废：任何时候都可触发。始终执行硬件动作；仅在有NG缓存时才追加上传
+                    elif manual_reject_flag.value:
                         is_current_event_rejected = True
                         manual_reject_flag.value = False
                         rejection_details = {"rejection_time": datetime.now(), "rejection_type": "2"}
@@ -468,6 +471,9 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
                         broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
                         print("    [状态机]: 即时手动剔废触发！")
+                        # 可选上传：只有当当前片有NG缓存时才上传
+                        if current_pane_ng_buffer and current_pane_reports:
+                            send_reports_batch_to_server(current_pane_reports, [r.get('annotated_image_buffer') for r in current_pane_ng_buffer], shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
 
             elif machine_state == "WAITING_FOR_PANE":
                 if current_total_panes > 0:

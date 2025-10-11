@@ -808,6 +808,45 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     main_edges = merge_lines_and_get_main_edges(raw_lines, params, pixels_per_mm)
     edges_for_drawing, all_defects = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, params, pixels_per_mm)
+
+    # 构建“主边端点扫描带”掩膜：长度默认20mm（可通过 DEFECT_DETECTION.L_ENDPOINT_BELT_LENGTH_MM 配置），
+    # 宽度等于亮度扫描带宽 LUMINOSITY_SCAN_WIDTH_MM；用于过滤位于边端扫描带内的 L 型缺陷（视为误检）。
+    p_def_for_belt = params.get("DEFECT_DETECTION", {})
+    try:
+        scan_width_px_for_belt = _get_dist_px(p_def_for_belt, "LUMINOSITY_SCAN_WIDTH_MM", "LUMINOSITY_SCAN_WIDTH", None, pixels_per_mm)
+    except Exception:
+        scan_width_px_for_belt = 0.0
+    try:
+        belt_len_px = _get_dist_px(p_def_for_belt, "L_ENDPOINT_BELT_LENGTH_MM", None, 20.0, pixels_per_mm)
+    except Exception:
+        belt_len_px = 0.0
+
+    l_endpoint_belt_mask = None
+    if scan_width_px_for_belt and belt_len_px and scan_width_px_for_belt > 0 and belt_len_px > 0 and len(main_edges) > 0:
+        l_endpoint_belt_mask = np.zeros(roi_gray.shape, dtype=np.uint8)
+        for e in main_edges:
+            try:
+                p1 = np.array(e[:2], dtype=float); p2 = np.array(e[2:], dtype=float)
+                v = p2 - p1; L_line = float(np.linalg.norm(v))
+                if L_line < 1e-6:
+                    continue
+                u = v / L_line
+                n = np.array([-u[1], u[0]])
+                half_w_vec = (scan_width_px_for_belt / 2.0) * n
+                d = float(min(belt_len_px, L_line))
+                # 两端的短矩形：p1->p1+u*d 与 p2->p2-u*d
+                segs = [(p1, p1 + u * d), (p2, p2 - u * d)]
+                for s_pt, e_pt in segs:
+                    poly = np.array([
+                        s_pt + half_w_vec,
+                        e_pt + half_w_vec,
+                        e_pt - half_w_vec,
+                        s_pt - half_w_vec
+                    ], dtype=np.int32).reshape((-1, 1, 2))
+                    cv2.fillPoly(l_endpoint_belt_mask, [poly], 255)
+            except Exception:
+                # 忽略个别主边异常，继续其它主边
+                pass
     
     final_defects_for_report = []
     for defect in all_defects:
@@ -992,6 +1031,18 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             # 恢复再分类：细长且长边近似垂直主边的 B 视为 L（裂纹）
             if aspect_ratio > 7.5 and is_perp_to_nearest_edge:
                 new_defect['type'] = 'L'
+                # L 型缺陷若位于主边端点附近的扫描带内（默认20mm），视为误检，进行过滤
+                try:
+                    if l_endpoint_belt_mask is not None:
+                        box = defect.get('box_points')
+                        if box is not None and len(box) >= 4:
+                            tmp_mask = np.zeros(roi_gray.shape, dtype=np.uint8)
+                            cv2.fillPoly(tmp_mask, [np.int32(box)], 255)
+                            inter = cv2.bitwise_and(tmp_mask, l_endpoint_belt_mask)
+                            if cv2.countNonZero(inter) > 0:
+                                should_be_filtered = True
+                except Exception:
+                    pass
             else:
                 # 仅对仍为 B 的缺陷应用 B 专属筛选
                 if area_mm2 < 25 and width_mm < min_size_mm: continue

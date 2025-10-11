@@ -295,6 +295,11 @@ def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, 
             print("[相机池]: ⚠️ 无法获取管理员权限，某些相机操作可能受限")
     
     # 1) 启动阶段：扫描并创建相机MAC映射，如果没有则执行自动发现
+    # 引导绑定：只在配置缺少绑定时执行
+    try:
+        has_bindings = bool(((config.get('camera_setup') or {}).get('camera_bindings') or []))
+    except Exception:
+        has_bindings = False
     setup_tool.bootstrap_mac_bindings()
     
     # 2) 可选：自动配置本机网卡到正确网段（需要管理员权限）
@@ -302,7 +307,20 @@ def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, 
         setup_tool.auto_configure_nics()
     
     # 3) 统一扫描并分配相机IP（无论初始IP是什么）
-    if (config.get('camera_setup', {}) or {}).get('bootstrap_assign_ips', True):
+    # 仅在缺少IP或绑定不完整时尝试统一分配IP，避免重复打印与不必要的变更
+    try:
+        do_assign_ips = (config.get('camera_setup', {}) or {}).get('bootstrap_assign_ips', True)
+        bindings = (config.get('camera_setup', {}) or {}).get('camera_bindings', [])
+        need_ip_assign = True
+        if isinstance(bindings, list) and bindings:
+            # 如果每条绑定都已有 ip 字段，则无需再次分配
+            need_ip_assign = any((not isinstance(b, dict)) or (not b.get('ip')) for b in bindings)
+        if do_assign_ips and need_ip_assign:
+            setup_tool.auto_assign_ips()
+        elif do_assign_ips:
+            print("[相机池]: 已存在完整的IP绑定，跳过自动分配IP。")
+    except Exception:
+        # 出错则保守执行一次，确保连通
         setup_tool.auto_assign_ips()
 
     # 优先使用 MVEnumerateAllDevices() 检测所有相机，包括不在同一网段的
@@ -442,38 +460,58 @@ def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, 
     # ---------------------------- 实机模式 ----------------------------
     print(f"[相机池]: 检测到 {num_cameras} 台相机")
     setup_tool.cleanup()
-    
-    # 确认预期的相机数量与实际发现的相机数量
-    expected_cameras = int((config.get('camera_setup', {}) or {}).get('expected_cameras', num_cameras) or num_cameras)
-    if num_cameras < expected_cameras:
-        print(f"[相机池]: ⚠️ 预期 {expected_cameras} 台相机，实际只检测到 {num_cameras} 台")
-    
-    # 使用多进程为每个相机启动一个采集进程
+
+    # 优先使用配置的逻辑绑定顺序启动 worker；若无绑定则按物理枚举顺序
+    camera_bindings = (config.get('camera_setup', {}) or {}).get('camera_bindings', [])
     procs = []
-    for i in range(num_cameras):
-        p = mp.Process(target=_camera_worker_process,
-                       args=(i, task_queue, stop_event, run_event, config, shared_states, capture_interval_s, use_soft_trigger),
-                       name=f"cam_proc_{i}", daemon=False)
-        p.start()
-        procs.append(p)
+    if isinstance(camera_bindings, list) and camera_bindings:
+        try:
+            sorted_bindings = sorted(camera_bindings, key=lambda b: int(b.get('index', 0)))
+        except Exception:
+            sorted_bindings = camera_bindings
+        logical_indices = [int(b.get('index')) for b in sorted_bindings if b.get('index') is not None]
+        print(f"[相机池]: 按逻辑索引启动相机进程: {logical_indices}")
+        for idx in logical_indices:
+            p = mp.Process(target=_camera_worker_process,
+                           args=(idx, task_queue, stop_event, run_event, config, shared_states, capture_interval_s, use_soft_trigger),
+                           name=f"cam_proc_{idx}", daemon=False)
+            p.start()
+            procs.append(p)
+    else:
+        # 无绑定信息时，退回到物理枚举顺序
+        # 确认预期的相机数量与实际发现的相机数量
+        expected_cameras = int((config.get('camera_setup', {}) or {}).get('expected_cameras', num_cameras) or num_cameras)
+        if num_cameras < expected_cameras:
+            print(f"[相机池]: ⚠️ 预期 {expected_cameras} 台相机，实际只检测到 {num_cameras} 台")
+        for i in range(num_cameras):
+            p = mp.Process(target=_camera_worker_process,
+                           args=(i, task_queue, stop_event, run_event, config, shared_states, capture_interval_s, use_soft_trigger),
+                           name=f"cam_proc_{i}", daemon=False)
+            p.start()
+            procs.append(p)
 
     # 等待所有相机状态更新完成
     start_time = time.time()
     timeout = 30  # 30秒超时
     all_ready = False
-    
+    # 采用实际启动的逻辑索引集合用于就绪判定
+    try:
+        started_indices = set(logical_indices) if (isinstance(camera_bindings, list) and camera_bindings) else set(range(num_cameras))
+    except Exception:
+        started_indices = set(range(num_cameras))
+
     while not stop_event.is_set() and not all_ready and (time.time() - start_time) < timeout:
         time.sleep(0.5)  # 每0.5秒检查一次
-        
+
         # 检查所有相机是否已更新状态
         initialized_cameras = 0
-        for i in range(num_cameras):
+        for i in started_indices:
             if i in shared_states and shared_states[i]:
                 initialized_cameras += 1
-        
-        if initialized_cameras == num_cameras:
+
+        if initialized_cameras == len(started_indices):
             all_ready = True
-            print(f"[相机池]: 所有 {num_cameras} 台相机已就绪")
+            print(f"[相机池]: 所有 {len(started_indices)} 台相机已就绪")
             
             # 检查是否需要更新camera_nic_bindings和camera_rois
             try:
@@ -484,7 +522,7 @@ def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, 
             cameras_ready_event.set()
     
     if not all_ready and not stop_event.is_set():
-        print(f"[相机池]: 警告 - 超时未能初始化所有相机，继续运行")
+        print(f"[相机池]: 警告 - 超时未能初始化所有相机，继续运行 (已就绪 {initialized_cameras}/{len(started_indices)})")
         # 即使有相机未准备好，也发送就绪事件以避免主进程无限等待
         cameras_ready_event.set()
 
