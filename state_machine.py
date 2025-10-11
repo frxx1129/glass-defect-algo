@@ -203,7 +203,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         shared_rejection_mode.value = initial_state.get("rejectionMode", 1)
         threshold_int = initial_state.get("rejectionThreshold", 20)
         shared_settings.max_defect_size_mm = threshold_int if threshold_int else 20
-        shared_user_id_auto.value = initial_state.get("algUserVO", {}).get("userId", 7)
+        shared_user_id_auto.value = initial_state.get("algUserVO", {}).get("id", 7)
         # 新增: 读取算法模式 (1=浅色 2=深色)
         try:
             init_algo_mode = int(initial_state.get("algorithmMode", getattr(shared_settings, 'algorithm_mode', 1)) or 1)
