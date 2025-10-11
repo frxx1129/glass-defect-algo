@@ -132,6 +132,23 @@ def calculate_vertex_angle(p_prev, p_curr, p_next):
     angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
     return np.degrees(angle)
 
+def _adjust_angle_near_90(angle_deg: float) -> float:
+    """角度修约规则：
+    - 若 86°..94°，直接视为 90°；
+    - 若 80°..100°，将与 90° 的差值缩小一半（向 90° 拉近）；
+    - 其他范围保持不变。
+    """
+    try:
+        a = float(angle_deg)
+    except Exception:
+        return angle_deg
+    if 86.0 <= a <= 94.0:
+        return 90.0
+    if 80.0 <= a <= 100.0:
+        dev = a - 90.0
+        return 90.0 + 0.5 * dev
+    return a
+
 def calculate_angle_between_lines(line1, line2):
     v1 = np.array(line1[2:]) - np.array(line1[:2])
     v2 = np.array(line2[2:]) - np.array(line2[:2])
@@ -141,7 +158,8 @@ def calculate_angle_between_lines(line1, line2):
     angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
     angle_deg = np.degrees(angle)
     if angle_deg > 90.0: angle_deg = 180.0 - angle_deg
-    return angle_deg
+    # 应用 90° 邻域修约
+    return _adjust_angle_near_90(angle_deg)
 
 def get_point_line_segment_projection(point, line_segment):
     p = np.array(point); p1 = np.array(line_segment[:2]); p2 = np.array(line_segment[2:])
@@ -499,27 +517,15 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
 
             def _handle_as_x_defect():
                 angle = calculate_vertex_angle(p1_far, intersection, p2_far)
-                # --- BUG FIX START: Corrected X-Defect (斜边) Logic ---
-                if angle < 45. or angle > 135:
+                # 仅在合理范围考虑 X（避免尖角/钝角极端值）
+                if angle < 45.0 or angle > 135.0:
                     return
-                # 取消 90° 周围的角度修正，仅使用原始角度参与容差判定
-                corrected_angle = angle
-                # deviation = abs(angle - 90.0)
-                # sign = 1.0 if angle > 90.0 else -1.0
-                # if deviation <= 16.0:
-                #     corrected_deviation = deviation
-                #     if deviation <= 4.0:
-                #         corrected_deviation = (deviation - 3.0) * 0.5
-                #     elif deviation <= 8.0:
-                #         corrected_deviation = (deviation - 4.0) * 0.6
-                #     else:  # 8 to 16
-                #         corrected_deviation = (deviation - 5.0) * 0.7
-                #     corrected_angle = 90.0 + sign * corrected_deviation
+                # 按规则对 90° 邻域进行修约
+                corrected_angle = _adjust_angle_near_90(angle)
                 corrected_deviation_final = abs(corrected_angle - 90.0)
                 angle_tolerance = p_defect.get("ANGLE_DEVIATION_TOLERANCE", 4.0)
                 if corrected_deviation_final > angle_tolerance:
                     corner_defects.append({"type": "X", "center": tuple(map(int, intersection)), "angle": corrected_angle})
-                # --- BUG FIX END ---
 
             if is_valid_virtual and not is_physical:
                 # 缺角(Q)亮度门控：取交点与上下左右4个点(共5点)的均值亮度
