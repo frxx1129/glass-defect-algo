@@ -830,8 +830,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 "contour": hull.astype(np.int32)
             })
 
-    # 合并结果 = 其他类型 + 不参与合并的小 B + 合并后的 B
-    surviving_chipping_defects = others + b_small_list + fused_b_list
+        # 合并结果 = 其他类型 + 不参与合并的小 B + 合并后的 B
+        surviving_chipping_defects = others + b_small_list + fused_b_list
             
     return edges_for_drawing, corner_defects + surviving_chipping_defects
 
