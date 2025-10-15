@@ -134,15 +134,14 @@
     "stats_push_url": "http://localhost:8085/fastapi/glass/updateYieldAndRejections",
     "heartbeat_url": "http://localhost:8085/fastapi/system/heartbeat"
   },
+  "rejection_mark_to_channel": {
+    "Line1": { "0": 1, "1": 2, "2": 3, "3": 4 },
+    "Line2": { "0": 1, "1": 2, "2": 3, "3": 4, "4": 5 },
+    "Line3": { "0": 1, "1": 2, "2": 3, "3": 4 }
+  },
   "rejection_controller": {
     "port": "COM6",
-    "baud": 115200,
-    "channel_map": {
-      "left": 1,
-      "mid": 2,
-      "right": 3,
-      "all": 4
-    }
+    "baud": 115200
   },
   "rejection_params": {
     "max_defect_size_mm": 20,
@@ -182,7 +181,8 @@
       "FALSE_DEFECT_MAX_WIDTH": 8.0,
       "FALSE_DEFECT_MIN_ASPECT_RATIO": 5.0,
       "ANGLE_DEVIATION_TOLERANCE": 2.0,
-      "Q_DEFECT_GRADIENT_THRESHOLD": 3.0,
+  "Q_DEFECT_GRADIENT_THRESHOLD": 3.0,
+  "Q_DEFECT_SEARCH_WIDTH_PX": 2,
       "SHADOW_FILTER_MIN_EXTENT_RATIO": 0.25,
       "CORNER_MAX_PHYSICAL_GAP": 7,
       "CORNER_MIN_VIRTUAL_GAP": 7.0,

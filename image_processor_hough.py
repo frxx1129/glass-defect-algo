@@ -250,7 +250,7 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm: floa
     return initial_contours
 
 
-def find_gradient_endpoint(start_point, line_vec_normalized, roi_gray_blurred, max_search_dist, search_width=7, gradient_stop_threshold=20.0):
+def find_gradient_endpoint(start_point, line_vec_normalized, roi_gray_blurred, max_search_dist, search_width=2, gradient_stop_threshold=20.0):
     h, w = roi_gray_blurred.shape
     perp_vec = np.array([-line_vec_normalized[1], line_vec_normalized[0]])
     half_width = (search_width - 1) // 2
@@ -550,12 +550,21 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     vec2 = p2_far - intersection; norm2 = np.linalg.norm(vec2)
                     if norm2 > 1e-6: vec2 /= norm2
                     grad_thresh = p_defect.get("Q_DEFECT_GRADIENT_THRESHOLD", 20.0)
-                    new_p1 = find_gradient_endpoint(intersection, vec1, roi_gray_blurred, max_extension_dist, gradient_stop_threshold=grad_thresh)
-                    new_p2 = find_gradient_endpoint(intersection, vec2, roi_gray_blurred, max_extension_dist, gradient_stop_threshold=grad_thresh)
-                    final_p1 = new_p1 if new_p1 is not None else p1_near
-                    final_p2 = new_p2 if new_p2 is not None else p2_near
-                    corner_defects.append({"type": "Q", "center": tuple(map(int, intersection)), "endpoints": (final_p1, final_p2), "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])})
-                    q_created = True
+                    search_w = int(max(1, int(p_defect.get("Q_DEFECT_SEARCH_WIDTH_PX", 2))))
+                    new_p1 = find_gradient_endpoint(intersection, vec1, roi_gray_blurred, max_extension_dist, search_width=search_w, gradient_stop_threshold=grad_thresh)
+                    new_p2 = find_gradient_endpoint(intersection, vec2, roi_gray_blurred, max_extension_dist, search_width=search_w, gradient_stop_threshold=grad_thresh)
+                    # 取消回退：若任一端未找到有效梯度终止点，则认为是正常角点，不生成 Q
+                    if (new_p1 is not None) and (new_p2 is not None):
+                        corner_defects.append({
+                            "type": "Q",
+                            "center": tuple(map(int, intersection)),
+                            "endpoints": (new_p1, new_p2),
+                            "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])
+                        })
+                        q_created = True
+                    else:
+                        # 可选：按原逻辑检测是否属于 X（若角度偏差较大）
+                        _handle_as_x_defect()
                 else:
                     _handle_as_x_defect()
             else:
@@ -714,6 +723,30 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         b_list = [bd for bd in surviving_chipping_defects if bd.get('type') == 'B']
         others = [bd for bd in surviving_chipping_defects if bd.get('type') != 'B']
 
+        # 新增：只有尺寸至少 2mm x 2mm 的 B 才参与“邻域/重叠合并”（可配 DEFECT_DETECTION.B_MERGE_MIN_SIDE_MM）
+        try:
+            b_merge_min_side_mm = float(params.get('DEFECT_DETECTION', {}).get('B_MERGE_MIN_SIDE_MM', 2.0))
+        except Exception:
+            b_merge_min_side_mm = 2.0
+
+        b_merge_list = []
+        b_small_list = []  # 不满足 2mm x 2mm 的 B，不参与合并但保留原状
+        for bd in b_list:
+            rect = bd.get('min_area_rect')
+            if rect is None or not isinstance(rect, tuple) or len(rect) < 2:
+                b_small_list.append(bd)
+                continue
+            try:
+                w_px, h_px = float(rect[1][0] or 0.0), float(rect[1][1] or 0.0)
+                w_mm = w_px / float(pixels_per_mm if pixels_per_mm else 1.0)
+                h_mm = h_px / float(pixels_per_mm if pixels_per_mm else 1.0)
+                if min(w_mm, h_mm) >= b_merge_min_side_mm:
+                    b_merge_list.append(bd)
+                else:
+                    b_small_list.append(bd)
+            except Exception:
+                b_small_list.append(bd)
+
         def _rotated_rect_intersect(rect1, rect2, box1, box2):
             try:
                 ret, pts = cv2.rotatedRectangleIntersection(rect1, rect2)
@@ -739,7 +772,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 return False
 
         # 并查集分组
-        n = len(b_list)
+        n = len(b_merge_list)
         parent = list(range(n))
         def find(x):
             while parent[x] != x:
@@ -752,13 +785,13 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 parent[rb] = ra
 
         for i in range(n):
-            rect_i = b_list[i].get('min_area_rect')
-            box_i = b_list[i].get('box_points')
+            rect_i = b_merge_list[i].get('min_area_rect')
+            box_i = b_merge_list[i].get('box_points')
             if rect_i is None or box_i is None: 
                 continue
             for j in range(i + 1, n):
-                rect_j = b_list[j].get('min_area_rect')
-                box_j = b_list[j].get('box_points')
+                rect_j = b_merge_list[j].get('min_area_rect')
+                box_j = b_merge_list[j].get('box_points')
                 if rect_j is None or box_j is None:
                     continue
                 if _rotated_rect_intersect(rect_i, rect_j, box_i, box_j):
@@ -772,17 +805,17 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         fused_b_list = []
         for _, indices in groups.items():
             if len(indices) == 1:
-                fused_b_list.append(b_list[indices[0]])
+                fused_b_list.append(b_merge_list[indices[0]])
                 continue
             # 融合：将所有 box_points 聚合做凸包，然后用 minAreaRect 得到新的旋转矩形
             pts = []
             for k in indices:
-                box = b_list[k].get('box_points')
+                box = b_merge_list[k].get('box_points')
                 if box is not None and len(box) >= 4:
                     pts.extend([p for p in box])
             if not pts:
                 # 回退：直接合并第一个
-                fused_b_list.append(b_list[indices[0]])
+                fused_b_list.append(b_merge_list[indices[0]])
                 continue
             pts_np = np.array(pts, dtype=np.float32)
             hull = cv2.convexHull(pts_np)
@@ -797,7 +830,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 "contour": hull.astype(np.int32)
             })
 
-        surviving_chipping_defects = others + fused_b_list
+    # 合并结果 = 其他类型 + 不参与合并的小 B + 合并后的 B
+    surviving_chipping_defects = others + b_small_list + fused_b_list
             
     return edges_for_drawing, corner_defects + surviving_chipping_defects
 
@@ -910,6 +944,17 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
         new_defect['location'] = location
         
+        # 新增：按最短边（width_mm）过滤缺陷，默认阈值 5mm，可通过 DEFECT_DETECTION.MIN_WIDTH_MM 配置
+        try:
+            min_width_mm_rule = float(params.get("DEFECT_DETECTION", {}).get("MIN_WIDTH_MM", 5.0))
+        except Exception:
+            min_width_mm_rule = 5.0
+        # 规则仅对 Q 以及“未被重分类为 L 的 B”生效：
+        # 这里先对 Q 进行早期过滤；B 的过滤放到后续 B 分支且“未转为 L”时执行。
+        if new_defect['type'] == 'Q':
+            if float(location.get('width_mm', 0.0) or 0.0) < min_width_mm_rule:
+                continue
+
         min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
         
         if new_defect['type'] == 'B':
@@ -1051,6 +1096,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     pass
             else:
                 # 仅对仍为 B 的缺陷应用 B 专属筛选
+                # 宽度过滤（仅对未被转为 L 的 B 生效）
+                if width_mm < min_width_mm_rule:
+                    continue
                 if area_mm2 < 25 and width_mm < min_size_mm: continue
                 if area_mm2 > 4000 and width_mm < 50: continue
                 if area_mm2 > 1000 and aspect_ratio > 5.0: continue

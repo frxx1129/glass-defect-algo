@@ -144,8 +144,14 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     def build_report_for_frame(result_obj, rejection_details_to_save):
         defects = result_obj.get('defects', [])
         def primary_size(d):
+            # 修改：按缺陷的“最短边”来确定尺寸标签
             loc = d.get('location', {})
-            return max(loc.get('length_mm', 0), loc.get('width_mm', 0))
+            length = float(loc.get('length_mm', 0) or 0)
+            width = float(loc.get('width_mm', 0) or 0)
+            if length <= 0 and width <= 0:
+                return 0.0
+            return min(length, width)
+        # 汇总：取所有缺陷“最短边”的最大值，作为 size_label 的数值
         max_defect_size = max([primary_size(d) for d in defects] or [0])
         has_x_defect = any(d.get('type') == 'X' for d in defects)
         size_label_parts = []
