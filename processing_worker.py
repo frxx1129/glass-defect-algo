@@ -81,22 +81,25 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
         except Empty:
             continue
         try:
-            latest_by_cam = {}
-            if first_task is not None and 'cam_index' in first_task:
-                latest_by_cam[first_task['cam_index']] = first_task
+            # 取消“只取最新”的合并策略：改为按入队顺序处理所有已取出的任务，避免丢弃旧帧
+            tasks_to_process = []
+            if first_task is not None:
+                tasks_to_process.append(first_task)
             t0 = time.perf_counter()
             drained = 0
-            while drained < max(1, drain_max_n) and (time.perf_counter() - t0) * 1000.0 < max(0, drain_budget_ms):
+            # 继续在时间/数量预算内尽可能多取任务，但不去重/覆盖，保持 FIFO 处理
+            while drained < max(0, drain_max_n - 1) and (time.perf_counter() - t0) * 1000.0 < max(0, drain_budget_ms):
                 try:
                     item = task_queue.get_nowait()
-                    cam_idx = item.get('cam_index')
-                    if cam_idx is not None:
-                        latest_by_cam[cam_idx] = item
+                    tasks_to_process.append(item)
                     drained += 1
                 except Empty:
                     break
 
-            for cam_idx, task_data in latest_by_cam.items():
+            for task_data in tasks_to_process:
+                cam_idx = task_data.get('cam_index')
+                if cam_idx is None:
+                    continue
                 frame_data = task_data.get('data')
                 if frame_data is None:
                     continue
