@@ -518,7 +518,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             def _handle_as_x_defect():
                 angle = calculate_vertex_angle(p1_far, intersection, p2_far)
                 # 仅在合理范围考虑 X（避免尖角/钝角极端值）
-                if angle < 45.0 or angle > 135.0:
+                if angle < 20.0 or angle > 160.0:
                     return
                 # 按规则对 90° 邻域进行修约
                 corrected_angle = _adjust_angle_near_90(angle)
