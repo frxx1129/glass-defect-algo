@@ -68,14 +68,14 @@
     },
     "camera_bindings": [
       {
-        "index": 2,
+        "index": 1,
         "physical_index": 0,
         "mac": "94:AA:B8:03:DD:F7",
         "ip": "192.168.5.147",
         "model": "MV-HP500GM"
       },
       {
-        "index": 1,
+        "index": 2,
         "physical_index": 1,
         "mac": "94:AA:B8:04:6B:18",
         "ip": "192.168.6.124",
@@ -119,8 +119,8 @@
   },
   "camera_rois": {
     "0": "cam4_roi_averaged_by_group.json",
-    "1": "cam2_roi_averaged_by_group.json",
-    "2": "cam1_roi_averaged_by_group.json",
+    "1": "cam1_roi_averaged_by_group.json",
+    "2": "cam2_roi_averaged_by_group.json",
     "3": "cam3_roi_averaged_by_group.json"
   },
   "server_config": {
