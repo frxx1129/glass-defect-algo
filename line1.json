@@ -150,7 +150,7 @@
   },
   "hough_inspector_params": {
     "PREPROCESSING": {
-      "MEDIAN_BLUR_KSIZE": 5,
+      "MEDIAN_BLUR_KSIZE": 7,
       "CLAHE_CLIP_LIMIT": 2.0,
       "CLAHE_GRID_SIZE": [
         8,
@@ -165,7 +165,7 @@
       "MAX_LINE_GAP": 30
     },
     "LINE_MERGING": {
-      "ANGLE_TOLERANCE": 1.0,
+      "ANGLE_TOLERANCE": 1.8,
       "MAX_LATERAL_DISTANCE": 30,
       "TOP_N_EDGES": 6
     },
@@ -173,7 +173,7 @@
       "ENDPOINT_SHIELD_RATIO": 0.1
     },
     "DEFECT_DETECTION": {
-      "MIN_DEFECT_SIZE_MM": 2.5,
+      "MIN_DEFECT_SIZE_MM": 4.5,
       "MERGE_DEFECTS_KERNEL_SIZE": [
         9,
         9
