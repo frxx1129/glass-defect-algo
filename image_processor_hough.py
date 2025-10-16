@@ -40,6 +40,7 @@ def _get_font(font_size=36):
         return None
 
 ANNOTATION_FONT = _get_font(font_size=32)
+import math
 
 
 # ====================================================================================
@@ -542,6 +543,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 line_mean2 = _edge_line_mean(line2)
                 line_mean_ref = max(line_mean1, line_mean2)
 
+                # 新规则：当找到 Q 的两个端点后，用“缺角三角形区域的平均亮度”对比“主边缘扫描带的平均亮度（背景）”做门控
+                # 这里先进行预处理与向量准备，端点找到后再执行区域与扫描带的均值比较
                 if inter_mean > line_mean_ref:
                     p_preproc = params["PREPROCESSING"]
                     roi_gray_blurred = cv2.medianBlur(roi_gray, p_preproc["MEDIAN_BLUR_KSIZE"])
@@ -555,13 +558,108 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     new_p2 = find_gradient_endpoint(intersection, vec2, roi_gray_blurred, max_extension_dist, search_width=search_w, gradient_stop_threshold=grad_thresh)
                     # 取消回退：若任一端未找到有效梯度终止点，则认为是正常角点，不生成 Q
                     if (new_p1 is not None) and (new_p2 is not None):
-                        corner_defects.append({
-                            "type": "Q",
-                            "center": tuple(map(int, intersection)),
-                            "endpoints": (new_p1, new_p2),
-                            "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])
-                        })
-                        q_created = True
+                        # --- 计算缺角三角形区域与主边缘扫描带的平均亮度 ---
+                        cx, cy = float(intersection[0]), float(intersection[1])
+                        a = (int(round(cx)), int(round(cy)))
+                        b = (int(round(new_p1[0])), int(round(new_p1[1])))
+                        c = (int(round(new_p2[0])), int(round(new_p2[1])))
+
+                        h_mask, w_mask = roi_h, roi_w
+                        tri_mask = np.zeros((h_mask, w_mask), dtype=np.uint8)
+                        cv2.fillPoly(tri_mask, [np.array([a, b, c], dtype=np.int32)], 255)
+                        # 忽略三角形边缘：做一次轻微腐蚀
+                        erode_px = max(1, int(search_w))
+                        ksize = max(3, erode_px * 2 + 1)
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+                        tri_core = cv2.erode(tri_mask, kernel, iterations=1)
+
+                        # 沿两条主边，使用“崩边扫描带”的定义构建背景带（与 scan_edge_for_luminosity_defects 一致）：
+                        # 宽度来自 LUMINOSITY_SCAN_WIDTH(_MM)，选择亮度更低的一侧，并剔除边线本体与端点区域和三角核心。
+                        scan_width = _get_dist_px(p_defect, "LUMINOSITY_SCAN_WIDTH_MM", "LUMINOSITY_SCAN_WIDTH", None, pixels_per_mm)
+                        edge_ignore_px = _get_dist_px(p_defect, "LUMINOSITY_EDGE_IGNORE_WIDTH_MM", "LUMINOSITY_EDGE_IGNORE_WIDTH", 0.0, pixels_per_mm)
+                        endpoint_exclude_r = _get_dist_px(p_defect, "LUMINOSITY_ENDPOINT_EXCLUDE_RADIUS_MM", None, None, pixels_per_mm, default_px=0.0)
+                        if endpoint_exclude_r is None or endpoint_exclude_r <= 0:
+                            endpoint_exclude_r = max(3, int(min(0.3 * scan_width, 15)))
+
+                        def _make_chipping_belt_for_segment(p_start, p_end):
+                            p1f = np.array([float(p_start[0]), float(p_start[1])])
+                            p2f = np.array([float(p_end[0]), float(p_end[1])])
+                            line_vec = p2f - p1f
+                            line_length = float(np.linalg.norm(line_vec))
+                            if line_length < 1e-6:
+                                return np.zeros((h_mask, w_mask), dtype=np.uint8)
+                            unit_vec = line_vec / line_length
+                            normal_vec = np.array([-unit_vec[1], unit_vec[0]])
+                            half_width_vec = (scan_width / 2.0) * normal_vec
+
+                            c1 = p1f + half_width_vec; c2 = p2f + half_width_vec
+                            c3 = p2f - half_width_vec; c4 = p1f - half_width_vec
+
+                            mask_plus = np.zeros((h_mask, w_mask), dtype=np.uint8)
+                            poly_plus = np.array([c1, c2, p2f, p1f], dtype=np.int32).reshape((-1, 1, 2))
+                            cv2.fillPoly(mask_plus, [poly_plus], 255)
+
+                            mask_minus = np.zeros((h_mask, w_mask), dtype=np.uint8)
+                            poly_minus = np.array([p1f, p2f, c3, c4], dtype=np.int32).reshape((-1, 1, 2))
+                            cv2.fillPoly(mask_minus, [poly_minus], 255)
+
+                            # 选择亮度更低的一侧作为背景（一致性：使用未模糊图计算侧均值）
+                            mean_plus = cv2.mean(roi_gray, mask=mask_plus)[0]
+                            mean_minus = cv2.mean(roi_gray, mask=mask_minus)[0]
+                            scan_mask = mask_plus if mean_plus < mean_minus else mask_minus
+
+                            # 剔除边线与端点邻域
+                            ignore_mask = np.zeros((h_mask, w_mask), dtype=np.uint8)
+                            if edge_ignore_px > 0:
+                                cv2.line(ignore_mask, (int(round(p1f[0])), int(round(p1f[1]))), (int(round(p2f[0])), int(round(p2f[1]))), 255, thickness=int(round(edge_ignore_px)))
+                            cv2.circle(ignore_mask, (int(round(p1f[0])), int(round(p1f[1]))), int(round(endpoint_exclude_r)), 255, thickness=-1)
+                            cv2.circle(ignore_mask, (int(round(p2f[0])), int(round(p2f[1]))), int(round(endpoint_exclude_r)), 255, thickness=-1)
+
+                            scan_mask = cv2.bitwise_and(scan_mask, cv2.bitwise_not(ignore_mask))
+                            # 排除缺角三角形核心区域，避免把缺角本体计入背景
+                            scan_mask = cv2.bitwise_and(scan_mask, cv2.bitwise_not(tri_core))
+                            return scan_mask
+
+                        belt1 = _make_chipping_belt_for_segment(a, b)
+                        belt2 = _make_chipping_belt_for_segment(a, c)
+
+                        # 计算均值（使用模糊后的灰度以降低噪声）
+                        tri_vals = roi_gray_blurred[tri_core == 255]
+                        belt1_vals = roi_gray_blurred[belt1 == 255]
+                        belt2_vals = roi_gray_blurred[belt2 == 255]
+
+                        valid_tri = tri_vals.size >= 10  # 至少若干像素才有统计意义
+                        valid_b1 = belt1_vals.size >= 10
+                        valid_b2 = belt2_vals.size >= 10
+
+                        accept_q = False
+                        if valid_tri and (valid_b1 or valid_b2):
+                            tri_mean = float(np.mean(tri_vals))
+                            # 背景取两条扫描带的均值（若两者都有），或仅用可用的一条
+                            if valid_b1 and valid_b2:
+                                bg_mean = float((np.mean(belt1_vals) + np.mean(belt2_vals)) / 2.0)
+                            elif valid_b1:
+                                bg_mean = float(np.mean(belt1_vals))
+                            else:
+                                bg_mean = float(np.mean(belt2_vals))
+                            # 判定：缺角区域应当比背景更亮（与原先的“比主边线更亮”标准相近）
+                            # 可按需加入余量，例如 p_defect.get('Q_TRIANGLE_BRIGHTNESS_MARGIN', 0.0)
+                            margin = float(p_defect.get('Q_TRIANGLE_BRIGHTNESS_MARGIN', 0.0))
+                            accept_q = (tri_mean > (bg_mean + margin))
+                        else:
+                            # 若统计不足，退化为旧规则（intersection 均值 vs 线均值）
+                            accept_q = inter_mean > line_mean_ref
+
+                        if accept_q:
+                            corner_defects.append({
+                                "type": "Q",
+                                "center": tuple(map(int, intersection)),
+                                "endpoints": (new_p1, new_p2),
+                                "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])
+                            })
+                            q_created = True
+                        else:
+                            _handle_as_x_defect()
                     else:
                         # 可选：按原逻辑检测是否属于 X（若角度偏差较大）
                         _handle_as_x_defect()
