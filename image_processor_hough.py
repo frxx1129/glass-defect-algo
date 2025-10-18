@@ -846,26 +846,31 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 b_small_list.append(bd)
 
         def _rotated_rect_intersect(rect1, rect2, box1, box2):
+            """判断两个旋转矩形是否相交/包含。
+            优先使用 cv2.rotatedRectangleIntersection；若返回不稳定，再使用凸多边形相交测试(cv2.intersectConvexConvex)。
+            注意：彻底弃用基于 AABB 的 cv2.boundingRect 回退，避免与最短边过滤规则不一致。
+            """
             try:
                 ret, pts = cv2.rotatedRectangleIntersection(rect1, rect2)
                 # ret: 0-不相交，1-相交，2-包含
-                if ret and pts is not None and len(pts) >= 3:
-                    # 面积很小的交集也算合并，避免碎片
-                    area = cv2.contourArea(pts)
-                    if area >= 1.0:
+                if ret in (1, 2):
+                    if pts is not None and len(pts) >= 3:
+                        # 面积很小的交集也算合并，避免碎片
+                        area = cv2.contourArea(pts)
+                        if area >= 1.0:
+                            return True
+                    else:
+                        # 包含情形有时不会返回 pts，多数情况下可视为相交
                         return True
-                # 回退到 AABB 检查，给少量容差
-                def _aabb(bb):
-                    x, y, w, h = cv2.boundingRect(bb.astype(np.int32))
-                    return x, y, x + w, y + h
-                x1, y1, X1, Y1 = _aabb(np.array(box1))
-                x2, y2, X2, Y2 = _aabb(np.array(box2))
-                # 扩张 2px 容差
-                x1 -= 2; y1 -= 2; X1 += 2; Y1 += 2
-                x2 -= 2; y2 -= 2; X2 += 2; Y2 += 2
-                inter_w = min(X1, X2) - max(x1, x2)
-                inter_h = min(Y1, Y2) - max(y1, y2)
-                return inter_w > 0 and inter_h > 0
+
+                # 回退：使用凸多边形相交（以 minAreaRect 的 box_points 为准）
+                box1f = np.array(box1, dtype=np.float32).reshape(-1, 2)
+                box2f = np.array(box2, dtype=np.float32).reshape(-1, 2)
+                try:
+                    inter_area, _ = cv2.intersectConvexConvex(box1f, box2f)
+                    return float(inter_area) >= 1.0
+                except Exception:
+                    return False
             except Exception:
                 return False
 
@@ -1201,6 +1206,48 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 if area_mm2 > 4000 and width_mm < 50: continue
                 if area_mm2 > 1000 and aspect_ratio > 5.0: continue
         
+        # 新增：L 型缺陷过滤——若 L 的长边近似平行于任一主边，且其到该主边的距离在指定阈值（默认 5mm）内，则视为误检
+        if new_defect.get('type') == 'L':
+            try:
+                raw_l = new_defect.get('raw_defect', {})
+                box = raw_l.get('box_points')
+                rect = raw_l.get('min_area_rect')
+                if box is not None and len(box) >= 4 and len(main_edges) > 0:
+                    box_np = np.array(box, dtype=float).reshape(-1, 2)
+                    # 选取长边段（相邻点之间长度最大的边）
+                    adj_pairs = [
+                        (box_np[0], box_np[1]),
+                        (box_np[1], box_np[2]),
+                        (box_np[2], box_np[3]),
+                        (box_np[3], box_np[0])
+                    ]
+                    lengths = [np.linalg.norm(b - a) for a, b in adj_pairs]
+                    idx_long = int(np.argmax(lengths))
+                    long_a, long_b = adj_pairs[idx_long]
+                    rect_long_seg = [float(long_a[0]), float(long_a[1]), float(long_b[0]), float(long_b[1])]
+
+                    # 取矩形中心用于距离计算
+                    if rect is not None and isinstance(rect, tuple) and len(rect) >= 2:
+                        cx, cy = rect[0]
+                        center_pt = np.array([float(cx), float(cy)], dtype=float)
+                    else:
+                        center_pt = np.mean(box_np, axis=0)
+
+                    parallel_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('L_FILTER_PARALLEL_TOLERANCE_DEG', 10.0))
+                    max_dist_mm = float(params.get('DEFECT_DETECTION', {}).get('L_FILTER_MAX_DISTANCE_TO_EDGE_MM', 5.0))
+
+                    for e in main_edges:
+                        a = np.array(e[:2], dtype=float); b = np.array(e[2:], dtype=float)
+                        angle_deg = calculate_angle_between_lines(rect_long_seg, [a[0], a[1], b[0], b[1]])
+                        if angle_deg <= parallel_tol_deg:
+                            _, d_px = get_point_line_segment_projection(center_pt, [a[0], a[1], b[0], b[1]])
+                            d_mm = d_px / float(pixels_per_mm if pixels_per_mm else 1.0)
+                            if d_mm <= max_dist_mm:
+                                should_be_filtered = True
+                                break
+            except Exception:
+                pass
+
         # --- MODIFICATION START: Final check of the filter flag ---
         if not should_be_filtered:
             final_defects_for_report.append(new_defect)
