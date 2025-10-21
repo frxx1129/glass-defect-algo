@@ -1209,7 +1209,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 if area_mm2 > 4000 and width_mm < 50: continue
                 if area_mm2 > 1000 and aspect_ratio > 5.0: continue
         
-        # 新增：L 型缺陷过滤——若 L 的长边近似平行于任一主边，且其到该主边的距离在指定阈值（默认 5mm）内，则视为误检
+        # 新增：L 型缺陷过滤——在完成 B→L 重分类之后，屏蔽主边缘附近(≤阈值，默认5mm)的所有 L 型缺陷
         if new_defect.get('type') == 'L':
             try:
                 raw_l = new_defect.get('raw_defect', {})
@@ -1217,18 +1217,6 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 rect = raw_l.get('min_area_rect')
                 if box is not None and len(box) >= 4 and len(main_edges) > 0:
                     box_np = np.array(box, dtype=float).reshape(-1, 2)
-                    # 选取长边段（相邻点之间长度最大的边）
-                    adj_pairs = [
-                        (box_np[0], box_np[1]),
-                        (box_np[1], box_np[2]),
-                        (box_np[2], box_np[3]),
-                        (box_np[3], box_np[0])
-                    ]
-                    lengths = [np.linalg.norm(b - a) for a, b in adj_pairs]
-                    idx_long = int(np.argmax(lengths))
-                    long_a, long_b = adj_pairs[idx_long]
-                    rect_long_seg = [float(long_a[0]), float(long_a[1]), float(long_b[0]), float(long_b[1])]
-
                     # 取矩形中心用于距离计算
                     if rect is not None and isinstance(rect, tuple) and len(rect) >= 2:
                         cx, cy = rect[0]
@@ -1236,18 +1224,15 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     else:
                         center_pt = np.mean(box_np, axis=0)
 
-                    parallel_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('L_FILTER_PARALLEL_TOLERANCE_DEG', 10.0))
                     max_dist_mm = float(params.get('DEFECT_DETECTION', {}).get('L_FILTER_MAX_DISTANCE_TO_EDGE_MM', 5.0))
-
+                    # 与任一主边的最小距离（使用缺陷中心到线段的距离）
                     for e in main_edges:
                         a = np.array(e[:2], dtype=float); b = np.array(e[2:], dtype=float)
-                        angle_deg = calculate_angle_between_lines(rect_long_seg, [a[0], a[1], b[0], b[1]])
-                        if angle_deg <= parallel_tol_deg:
-                            _, d_px = get_point_line_segment_projection(center_pt, [a[0], a[1], b[0], b[1]])
-                            d_mm = d_px / float(pixels_per_mm if pixels_per_mm else 1.0)
-                            if d_mm <= max_dist_mm:
-                                should_be_filtered = True
-                                break
+                        _, d_px = get_point_line_segment_projection(center_pt, [a[0], a[1], b[0], b[1]])
+                        d_mm = d_px / float(pixels_per_mm if pixels_per_mm else 1.0)
+                        if d_mm <= max_dist_mm:
+                            should_be_filtered = True
+                            break
             except Exception:
                 pass
 

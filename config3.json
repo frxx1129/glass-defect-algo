@@ -6,7 +6,7 @@
   "user_id_auto": 7,
   "user_id_manual": 9999,
   "system_params": {
-    "pixels_per_mm": 2.44,
+    "pixels_per_mm": 2.246,
     "queue_size_factor": 2,
     "http_client_max_workers": 4,
     "http_get_timeout_s": 5,
@@ -21,17 +21,12 @@
     "coalesce_max_drain": 500,
     "process_workers": 5,
     "roi_threads": 2,
-    "auto_start": false,
-    "auto_route_decision_hold_ms": 120
+    "auto_start": true
   },
   "alarm_light_params": {
-    "port": "COM4",
+    "port": "COM3",
     "ng_buzz_duration_s": 0.1,
     "rejection_buzz_duration_s": 0.3
-  },
-  "remote_alarm": {
-    "host": "192.168.1.102",
-    "port": 9000
   },
   "camera_setup": {
     "expected_cameras": 5,
@@ -86,7 +81,7 @@
         "model": "MV-HP500GM"
       },
       {
-        "index": 4,
+        "index": 2,
         "physical_index": 2,
         "mac": "94:AA:B8:00:74:DB",
         "ip": "192.168.5.119",
@@ -100,7 +95,7 @@
         "model": "MV-HP500GM"
       },
       {
-        "index": 2,
+        "index": 4,
         "physical_index": 4,
         "mac": "94:AA:B8:01:1E:1C",
         "ip": "192.168.7.128",
@@ -114,7 +109,7 @@
         "frame_rate": 16
       },
       "exposure": {
-        "value_us": 200
+        "value_us": 250
       },
       "gain": {
         "value_db": 1.2
@@ -131,9 +126,9 @@
   "camera_rois": {
     "0": "cam1_roi_averaged_by_group.json",
     "1": "cam2_roi_averaged_by_group.json",
-    "2": "cam5_roi_averaged_by_group.json",
+    "2": "cam3_roi_averaged_by_group.json",
     "3": "cam4_roi_averaged_by_group.json",
-    "4": "cam3_roi_averaged_by_group.json"
+    "4": "cam5_roi_averaged_by_group.json"
   },
   "server_config": {
     "server": "localhost",
@@ -146,30 +141,15 @@
     "stats_push_url": "http://localhost:8085/fastapi/glass/updateYieldAndRejections",
     "heartbeat_url": "http://localhost:8085/fastapi/system/heartbeat"
   },
-  "rejection_mark_to_channel": {
-    "Line1": {
-      "0": 4,
-      "1": 1,
-      "2": 2,
-      "3": 3
-    },
-    "Line2": {
-      "0": 5,
-      "1": 1,
-      "2": 2,
-      "3": 3,
-      "4": 4
-    },
-    "Line3": {
-      "0": 4,
-      "1": 1,
-      "2": 2,
-      "3": 3
-    }
-  },
   "rejection_controller": {
-    "port": "COM5",
-    "baud": 115200
+    "port": "COM6",
+    "baud": 115200,
+    "channel_map": {
+      "left": 1,
+      "mid": 2,
+      "right": 3,
+      "all": 4
+    }
   },
   "rejection_params": {
     "max_defect_size_mm": 20,
@@ -184,11 +164,11 @@
         8,
         8
       ],
-      "CANNY_THRESHOLD_LOW": 45,
-      "CANNY_THRESHOLD_HIGH": 140
+      "CANNY_THRESHOLD_LOW": 30,
+      "CANNY_THRESHOLD_HIGH": 90
     },
     "HOUGH_TRANSFORM": {
-      "THRESHOLD": 75,
+      "THRESHOLD": 20,
       "MIN_LINE_LENGTH_RATIO": 0.05,
       "MAX_LINE_GAP_MM": 10.97,
       "MAX_LINE_GAP": 30
@@ -204,7 +184,7 @@
       "ENDPOINT_PROXIMITY_THRESHOLD_MM": 5.49
     },
     "DEFECT_DETECTION": {
-      "MIN_DEFECT_SIZE_MM": 4.5,
+      "MIN_DEFECT_SIZE_MM": 2.0,
       "MERGE_DEFECTS_KERNEL_MM": [
         3.29,
         3.29
@@ -215,33 +195,27 @@
       ],
       "FALSE_DEFECT_MAX_WIDTH": 8.0,
       "FALSE_DEFECT_MIN_ASPECT_RATIO": 5.0,
-      "ANGLE_DEVIATION_TOLERANCE": 5.0,
+      "ANGLE_DEVIATION_TOLERANCE": 2.0,
       "Q_DEFECT_GRADIENT_THRESHOLD": 3.0,
-      "Q_DEFECT_SEARCH_WIDTH_PX": 2,
-      "Q_TRIANGLE_BRIGHTNESS_MARGIN": 5.0,
       "SHADOW_FILTER_MIN_EXTENT_RATIO": 0.25,
       "CORNER_MAX_PHYSICAL_GAP_MM": 2.56,
       "CORNER_MAX_PHYSICAL_GAP": 7,
       "CORNER_MIN_VIRTUAL_GAP": 7.0,
       "CORNER_MAX_EXTENSION_DIST_NORMAL_MM": 0.0,
-      "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR_MM": 20,
+      "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR_MM": 73.14,
       "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR": 200,
       "PERPENDICULAR_ANGLE_TOLERANCE": 10,
-  "LUMINOSITY_SCAN_WIDTH_MM": 50.0,
+      "LUMINOSITY_SCAN_WIDTH_MM": 73.14,
       "LUMINOSITY_SCAN_WIDTH": 200,
       "LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD": 66,
-      "LUMINOSITY_STD_DEV_MULTIPLIER": 2.5,
-      "LUMINOSITY_MIN_AREA_MM2": 16,
+      "LUMINOSITY_STD_DEV_MULTIPLIER": 2.0,
+      "LUMINOSITY_MIN_AREA_MM2": 4.01,
       "LUMINOSITY_MIN_AREA": 30,
       "LUMINOSITY_EDGE_IGNORE_WIDTH_MM": 2.19,
       "LUMINOSITY_EDGE_IGNORE_WIDTH": 6,
       "LUMINOSITY_MIN_GRADIENT": 20,
       "CHIPPING_ENDPOINT_SHIELD_RADIUS_MM": 0.0,
       "CHIPPING_ENDPOINT_SHIELD_RADIUS": 0,
-      "MIN_WIDTH_MM": 5.0,
-      "B_MERGE_MIN_SIDE_MM": 2.0,
-      "L_ENDPOINT_BELT_LENGTH_MM": 20.0,
-      "B_MAX_DISTANCE_TO_EDGE_MM": 5.0,
       "LUMINOSITY_ENDPOINT_EXCLUDE_RADIUS_MM": 6.0,
       "B_FILTER_DISTANCE_TO_EDGE_MAX_MM": 5.0,
       "B_FILTER_PARALLEL_TOLERANCE_DEG": 10.0,
@@ -307,8 +281,6 @@
       "FALSE_DEFECT_MIN_ASPECT_RATIO": 5.0,
       "ANGLE_DEVIATION_TOLERANCE": 2.0,
       "Q_DEFECT_GRADIENT_THRESHOLD": 4.0,
-  "Q_DEFECT_SEARCH_WIDTH_PX": 2,
-  "Q_TRIANGLE_BRIGHTNESS_MARGIN": 5.0,
       "SHADOW_FILTER_MIN_EXTENT_RATIO": 0.25,
       "CORNER_MAX_PHYSICAL_GAP_MM": 2.56,
       "CORNER_MAX_PHYSICAL_GAP": 7,
@@ -317,7 +289,7 @@
       "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR_MM": 64.01,
       "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR": 175,
       "PERPENDICULAR_ANGLE_TOLERANCE": 10,
-  "LUMINOSITY_SCAN_WIDTH_MM": 50.0,
+      "LUMINOSITY_SCAN_WIDTH_MM": 73.14,
       "LUMINOSITY_SCAN_WIDTH": 200,
       "LUMINOSITY_MAX_BRIGHTNESS_THRESHOLD": 50,
       "LUMINOSITY_STD_DEV_MULTIPLIER": 1.5,
