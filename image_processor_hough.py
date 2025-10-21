@@ -831,9 +831,66 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
 
     final_chipping_defects = []
     if true_edges:
+        # 仅当 B 细长且窄时，才启用“距主边距离”门控；距离按中心点到直线（无限延长）计算
+        try:
+            ar_min_for_gate = float(p_defect.get('B_FILTER_PARALLEL_AR_MIN', 10.0))
+        except Exception:
+            ar_min_for_gate = 10.0
+        try:
+            min_side_mm_for_gate = float(p_defect.get('B_FILTER_PARALLEL_MIN_SIDE_MM', 2.0))
+        except Exception:
+            min_side_mm_for_gate = 2.0
+
         for bd in chipping_defects:
-            dmin = _min_dist_rect_to_edges(bd, true_edges)
-            if dmin <= b_max_edge_dist_px:
+            rect = bd.get('min_area_rect')
+            box = bd.get('box_points')
+            # 计算中心点（优先用 minAreaRect 中心）
+            if rect is not None and isinstance(rect, tuple) and len(rect) >= 2:
+                cx, cy = rect[0]
+                center_pt = np.array([float(cx), float(cy)], dtype=float)
+                w_px = float(rect[1][0] or 0.0)
+                h_px = float(rect[1][1] or 0.0)
+            else:
+                if box is not None and len(box) >= 4:
+                    box_np = np.array(box, dtype=float).reshape(-1, 2)
+                    center_pt = np.mean(box_np, axis=0)
+                    # 回推 w,h
+                    try:
+                        tmp_rect = cv2.minAreaRect(box_np.astype(np.float32))
+                        w_px = float(tmp_rect[1][0] or 0.0)
+                        h_px = float(tmp_rect[1][1] or 0.0)
+                    except Exception:
+                        w_px = 0.0; h_px = 0.0
+                else:
+                    # 缺乏几何信息，保守保留
+                    final_chipping_defects.append(bd)
+                    continue
+
+            width_px = float(min(w_px, h_px))
+            length_px = float(max(w_px, h_px))
+            width_mm = width_px / float(pixels_per_mm if pixels_per_mm else 1.0)
+            ar = (length_px / width_px) if width_px > 1e-6 else float('inf')
+
+            need_distance_gate = (ar > ar_min_for_gate) and (width_mm < min_side_mm_for_gate)
+
+            if need_distance_gate:
+                # 计算中心点到所有主边直线的最小垂直距离（像素）
+                min_d_px = float('inf')
+                for e in true_edges:
+                    a = np.array(e[:2], dtype=float); b = np.array(e[2:], dtype=float)
+                    dpx = get_point_line_perpendicular_distance(center_pt, [a[0], a[1], b[0], b[1]])
+                    if dpx < min_d_px:
+                        min_d_px = dpx
+                        if min_d_px <= b_max_edge_dist_px:
+                            break
+                if min_d_px <= b_max_edge_dist_px:
+                    # 距主边足够近，保留该 B
+                    final_chipping_defects.append(bd)
+                else:
+                    # 距主边过远，过滤该 B
+                    pass
+            else:
+                # 不细长或不够窄：不启用距离门控，直接保留
                 final_chipping_defects.append(bd)
     else:
         # 没有主边缘时，保守处理：保留原 B 列表（通常此场景不会出现，因为扫描依赖主边）
@@ -1317,26 +1374,21 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 rect = raw_l.get('min_area_rect')
                 if box is not None and len(box) >= 4 and len(main_edges) > 0:
                     box_np = np.array(box, dtype=float).reshape(-1, 2)
-                    # 距离采样点：四角 + 中心
-                    pts = [p for p in box_np]
+                    # 距离采样点：仅中心
                     if rect is not None and isinstance(rect, tuple) and len(rect) >= 2:
                         cx, cy = rect[0]
                         center_pt = np.array([float(cx), float(cy)], dtype=float)
                     else:
                         center_pt = np.mean(box_np, axis=0)
-                    pts.append(center_pt)
 
                     max_dist_mm = float(params.get('DEFECT_DETECTION', {}).get('L_FILTER_MAX_DISTANCE_TO_EDGE_MM', 5.0))
-                    # 与任一主边的最小“点到直线（无限延长）”垂直距离
+                    # 遍历所有主边，使用“中心点到直线（无限延长）”垂直距离
                     for e in main_edges:
                         a = np.array(e[:2], dtype=float); b = np.array(e[2:], dtype=float)
-                        for pt in pts:
-                            d_px = get_point_line_perpendicular_distance(pt, [a[0], a[1], b[0], b[1]])
-                            d_mm = d_px / float(pixels_per_mm if pixels_per_mm else 1.0)
-                            if d_mm <= max_dist_mm:
-                                should_be_filtered = True
-                                break
-                        if should_be_filtered:
+                        d_px = get_point_line_perpendicular_distance(center_pt, [a[0], a[1], b[0], b[1]])
+                        d_mm = d_px / float(pixels_per_mm if pixels_per_mm else 1.0)
+                        if d_mm <= max_dist_mm:
+                            should_be_filtered = True
                             break
             except Exception:
                 pass
@@ -1346,6 +1398,49 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             final_defects_for_report.append(new_defect)
         # --- MODIFICATION END ---
         
+    # 调试输出：对通过所有过滤的 L 缺陷，打印中心点到每个主边的垂直距离（mm）
+    try:
+        if len(main_edges) > 0 and final_defects_for_report:
+            for _df in final_defects_for_report:
+                if _df.get('type') != 'L':
+                    continue
+                raw = _df.get('raw_defect', {})
+                # 中心点（ROI 坐标）：优先用 minAreaRect 的中心；否则用 location 减去 ROI 偏移
+                center_pt = None
+                rect = raw.get('min_area_rect') if isinstance(raw, dict) else None
+                if rect is not None and isinstance(rect, tuple) and len(rect) >= 2:
+                    try:
+                        cx, cy = rect[0]
+                        center_pt = np.array([float(cx), float(cy)], dtype=float)
+                    except Exception:
+                        center_pt = None
+                if center_pt is None:
+                    loc = _df.get('location', {})
+                    try:
+                        gx = float(loc.get('x', 0.0) or 0.0)
+                        gy = float(loc.get('y', 0.0) or 0.0)
+                        center_pt = np.array([gx - float(x), gy - float(y)], dtype=float)
+                    except Exception:
+                        continue
+
+                distances_mm = []
+                for ei, e in enumerate(main_edges):
+                    a = np.array(e[:2], dtype=float); b = np.array(e[2:], dtype=float)
+                    d_px = get_point_line_perpendicular_distance(center_pt, [a[0], a[1], b[0], b[1]])
+                    d_mm = d_px / float(pixels_per_mm if pixels_per_mm else 1.0)
+                    distances_mm.append((ei, d_mm))
+
+                gloc = _df.get('location', {})
+                try:
+                    gx_i = int(gloc.get('x', 0))
+                    gy_i = int(gloc.get('y', 0))
+                except Exception:
+                    gx_i = gloc.get('x'); gy_i = gloc.get('y')
+                msg = ", ".join([f"e{ei}:{dm:.2f}" for ei, dm in distances_mm])
+                print(f"[ROI {roi_idx}] L defect at ({gx_i}, {gy_i}) -> distances to main edges (mm): {msg}")
+    except Exception:
+        pass
+
     # 统计“近竖直”的主边数量（0~2 常见）：基于主边段方向角(相对x轴 0~90°)，角度>=90°-tol 视为近竖直
     try:
         vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
