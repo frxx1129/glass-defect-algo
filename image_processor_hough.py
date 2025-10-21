@@ -198,6 +198,7 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm: floa
     p1 = np.array(edge[:2]); p2 = np.array(edge[2:])
     # 宽度以毫米配置, 转像素
     scan_width = _get_dist_px(p, "LUMINOSITY_SCAN_WIDTH_MM", "LUMINOSITY_SCAN_WIDTH", None, pixels_per_mm)
+    scan_width = max(1, scan_width)  # Ensure scan width is at least 1 pixel
     line_vec = p2 - p1; line_length = np.linalg.norm(line_vec)
     if line_length < 1e-6:
         return []
@@ -1316,22 +1317,26 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 rect = raw_l.get('min_area_rect')
                 if box is not None and len(box) >= 4 and len(main_edges) > 0:
                     box_np = np.array(box, dtype=float).reshape(-1, 2)
-                    # 取矩形中心用于距离计算
+                    # 距离采样点：四角 + 中心
+                    pts = [p for p in box_np]
                     if rect is not None and isinstance(rect, tuple) and len(rect) >= 2:
                         cx, cy = rect[0]
                         center_pt = np.array([float(cx), float(cy)], dtype=float)
                     else:
                         center_pt = np.mean(box_np, axis=0)
+                    pts.append(center_pt)
 
                     max_dist_mm = float(params.get('DEFECT_DETECTION', {}).get('L_FILTER_MAX_DISTANCE_TO_EDGE_MM', 5.0))
-                    # 与任一主边的最小距离（使用缺陷中心到线段的距离）
+                    # 与任一主边的最小“点到直线（无限延长）”垂直距离
                     for e in main_edges:
                         a = np.array(e[:2], dtype=float); b = np.array(e[2:], dtype=float)
-                        # 使用点到直线（无限延长）的垂直距离来判定
-                        d_px = get_point_line_perpendicular_distance(center_pt, [a[0], a[1], b[0], b[1]])
-                        d_mm = d_px / float(pixels_per_mm if pixels_per_mm else 1.0)
-                        if d_mm <= max_dist_mm:
-                            should_be_filtered = True
+                        for pt in pts:
+                            d_px = get_point_line_perpendicular_distance(pt, [a[0], a[1], b[0], b[1]])
+                            d_mm = d_px / float(pixels_per_mm if pixels_per_mm else 1.0)
+                            if d_mm <= max_dist_mm:
+                                should_be_filtered = True
+                                break
+                        if should_be_filtered:
                             break
             except Exception:
                 pass
