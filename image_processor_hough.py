@@ -172,6 +172,26 @@ def get_point_line_segment_projection(point, line_segment):
     proj_point = p1 + t * line_vec
     return proj_point, np.linalg.norm(p - proj_point)
 
+def get_point_line_perpendicular_distance(point, line_segment):
+    """计算点到由线段两端点确定的直线的垂直距离（无限延长线）。
+    当线段退化（端点重合）时，退化为点到该点的距离。
+    参数:
+        point: (x, y)
+        line_segment: [x1, y1, x2, y2]
+    返回:
+        距离（像素，float）
+    """
+    p = np.array(point, dtype=float)
+    a = np.array(line_segment[:2], dtype=float)
+    b = np.array(line_segment[2:], dtype=float)
+    v = b - a
+    denom = float(np.linalg.norm(v))
+    if denom < 1e-8:
+        return float(np.linalg.norm(p - a))
+    # 2D 叉积的模 |v x (p-a)| / |v|
+    cross = float(v[0] * (p[1] - a[1]) - v[1] * (p[0] - a[0]))
+    return abs(cross) / denom
+
 def scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm: float):
     p = params["DEFECT_DETECTION"]
     
@@ -419,7 +439,70 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float):
 
     filtered = [merged_lines_with_scores[k] for k in range(n) if valid[k]]
     filtered.sort(key=lambda item: item['score'], reverse=True)
-    return [item['line'] for item in filtered[:p["TOP_N_EDGES"]]]
+
+    # 根据是否与其它直线（实际或小范围延长后）相交，决定用于角度/扫描/过滤的有效线段：
+    # - 不相交：保持原始长度
+    # - 相交（含延长容差内相交）：使用“交点 → 原始线段最远端点”的新线段
+    edges = [item['line'] for item in filtered[:p["TOP_N_EDGES"]]]
+    m = len(edges)
+    if m <= 1:
+        return edges
+
+    best_intersection = [None] * m  # (inter_pt, t_i, d_perp_i, len_i)
+    # 复用上面定义的 _t_param_and_perp_dist 与 extend 容差
+    def _inter_score(t: float):
+        # 优先选择落在段内的交点；若不在段内，选择距离[0,1]最近者
+        if 0.0 <= t <= 1.0:
+            return (0, 0.0)
+        # 距离[0,1]的外侧距离
+        return (1, min(abs(t - 0.0), abs(t - 1.0)))
+
+    for i in range(m):
+        li = edges[i]
+        ai = np.array(li[:2], dtype=float); bi = np.array(li[2:], dtype=float)
+        for j in range(i + 1, m):
+            lj = edges[j]
+            aj = np.array(lj[:2], dtype=float); bj = np.array(lj[2:], dtype=float)
+
+            inter = find_line_intersection(li, lj)
+            if inter is None:
+                continue
+
+            t_i, d_perp_i, len_i = _t_param_and_perp_dist(inter, ai, bi)
+            t_j, d_perp_j, len_j = _t_param_and_perp_dist(inter, aj, bj)
+            if len_i < 1e-6 or len_j < 1e-6:
+                continue
+
+            ext_tol_i = extend_margin_px_default / len_i
+            ext_tol_j = extend_margin_px_default / len_j
+            near_line = (d_perp_i < 1.5) and (d_perp_j < 1.5)
+            within_i = (-ext_tol_i <= t_i <= 1.0 + ext_tol_i)
+            within_j = (-ext_tol_j <= t_j <= 1.0 + ext_tol_j)
+            if near_line and within_i and within_j:
+                score_i = _inter_score(t_i)
+                prev_i = best_intersection[i]
+                if (prev_i is None) or (score_i < _inter_score(prev_i[1])):
+                    best_intersection[i] = (inter.astype(float), t_i, d_perp_i, len_i)
+                score_j = _inter_score(t_j)
+                prev_j = best_intersection[j]
+                if (prev_j is None) or (score_j < _inter_score(prev_j[1])):
+                    best_intersection[j] = (inter.astype(float), t_j, d_perp_j, len_j)
+
+    adjusted_edges = []
+    for idx, seg in enumerate(edges):
+        bi = best_intersection[idx]
+        if bi is None:
+            adjusted_edges.append(seg)
+            continue
+        inter_pt = bi[0]
+        p1 = np.array(seg[:2], dtype=float); p2 = np.array(seg[2:], dtype=float)
+        # 选择“交点到原始段最远端点”的新线段
+        d1 = float(np.linalg.norm(inter_pt - p1))
+        d2 = float(np.linalg.norm(inter_pt - p2))
+        far = p1 if d1 >= d2 else p2
+        adjusted_edges.append(np.array([inter_pt[0], inter_pt[1], far[0], far[1]], dtype=float))
+
+    return adjusted_edges
 
 def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: float):
     p_defect = params["DEFECT_DETECTION"]; p_crack = params["CRACK_CLASSIFICATION"]
@@ -735,7 +818,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             for e in edge_list:
                 a = np.array(e[:2], dtype=float); b = np.array(e[2:], dtype=float)
                 for pt in pts:
-                    _, d = get_point_line_segment_projection(pt, [a[0], a[1], b[0], b[1]])
+                    # 使用点到直线（无限延长）的垂直距离
+                    d = get_point_line_perpendicular_distance(pt, [a[0], a[1], b[0], b[1]])
                     if d < min_dist:
                         min_dist = d
                         if min_dist <= b_max_edge_dist_px:
@@ -1212,6 +1296,21 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         # 新增：L 型缺陷过滤——在完成 B→L 重分类之后，屏蔽主边缘附近(≤阈值，默认5mm)的所有 L 型缺陷
         if new_defect.get('type') == 'L':
             try:
+                # 若该 L 由 B 重分类而来，则复用 B 的后置规则（最短边过滤除外）
+                try:
+                    if new_defect.get('raw_defect', {}).get('type') == 'B':
+                        length_mm = float(location.get('length_mm', 0.0) or 0.0)
+                        width_mm = float(location.get('width_mm', 0.0) or 0.0)
+                        area_mm2 = length_mm * width_mm
+                        aspect_ratio = (length_mm / width_mm) if width_mm > 1e-6 else float('inf')
+                        # 对应 B 分支中的面积/比例启发式（不包含 MIN_WIDTH_MM 最短边过滤）
+                        if (area_mm2 < 25 and width_mm < min_size_mm) \
+                           or (area_mm2 > 4000 and width_mm < 50) \
+                           or (area_mm2 > 1000 and aspect_ratio > 5.0):
+                            should_be_filtered = True
+                except Exception:
+                    pass
+
                 raw_l = new_defect.get('raw_defect', {})
                 box = raw_l.get('box_points')
                 rect = raw_l.get('min_area_rect')
@@ -1228,7 +1327,8 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     # 与任一主边的最小距离（使用缺陷中心到线段的距离）
                     for e in main_edges:
                         a = np.array(e[:2], dtype=float); b = np.array(e[2:], dtype=float)
-                        _, d_px = get_point_line_segment_projection(center_pt, [a[0], a[1], b[0], b[1]])
+                        # 使用点到直线（无限延长）的垂直距离来判定
+                        d_px = get_point_line_perpendicular_distance(center_pt, [a[0], a[1], b[0], b[1]])
                         d_mm = d_px / float(pixels_per_mm if pixels_per_mm else 1.0)
                         if d_mm <= max_dist_mm:
                             should_be_filtered = True
