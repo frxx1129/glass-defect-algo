@@ -27,7 +27,10 @@ def rejection_handler_thread(rejection_queue, rejection_controller, stop_event, 
                 pulse_ms = int(getattr(shared_settings, 'REJECTION_PULSE_MS', 100) or 100)
             except Exception:
                 pulse_ms = 100
-            rejection_controller.trigger_rejection_signal(cam_index, pulse_ms, route)
+            # 支持一次触发多个路由（列表或元组）
+            routes = route if isinstance(route, (list, tuple)) else [route]
+            for r in routes:
+                rejection_controller.trigger_rejection_signal(cam_index, pulse_ms, r)
         except Empty:
             continue
         except Exception as e:

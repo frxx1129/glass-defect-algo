@@ -1111,14 +1111,17 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
                     if nearest_edge is not None:
                         angle_deg = calculate_angle_between_lines(rect_long_seg, nearest_edge)  # [0,90]
-                        parallel_tol = float(params.get('DEFECT_DETECTION', {}).get('B_FILTER_PARALLEL_TOLERANCE_DEG', 10.0))
+                        p_def = params.get('DEFECT_DETECTION', {})
+                        parallel_tol = float(p_def.get('B_FILTER_PARALLEL_TOLERANCE_DEG', 10.0))
                         is_parallel = angle_deg <= parallel_tol
 
                         # 取当前 B 的长短边（mm）
                         length_mm = location.get('length_mm', 0.0)
                         width_mm = location.get('width_mm', 0.0)
                         ar = (length_mm / width_mm) if width_mm > 1e-6 else float('inf')
-                        if is_parallel and (ar > 10.0 or width_mm < 2.0):
+                        ar_min = float(p_def.get('B_FILTER_PARALLEL_AR_MIN', 10.0))
+                        min_side_mm = float(p_def.get('B_FILTER_PARALLEL_MIN_SIDE_MM', 2.0))
+                        if is_parallel and (ar > ar_min or width_mm < min_side_mm):
                             continue
             except Exception:
                 pass
@@ -1253,10 +1256,32 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             final_defects_for_report.append(new_defect)
         # --- MODIFICATION END ---
         
+    # 统计“近竖直”的主边数量（0~2 常见）：基于主边段方向角(相对x轴 0~90°)，角度>=90°-tol 视为近竖直
+    try:
+        vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+    except Exception:
+        vertical_tol_deg = 10.0
+    def _line_angle_deg(line):
+        x1, y1, x2, y2 = map(float, line)
+        dx, dy = (x2 - x1), (y2 - y1)
+        ang = abs(np.degrees(np.arctan2(dy, dx)))
+        if ang > 90.0:
+            ang = 180.0 - ang
+        return ang  # [0,90]
+    near_vertical_count = 0
+    try:
+        for e in main_edges:
+            ang = _line_angle_deg(e)
+            if ang >= (90.0 - vertical_tol_deg):
+                near_vertical_count += 1
+    except Exception:
+        near_vertical_count = 0
+
     roi_report = {
         "roi_idx": roi_idx, "x": x, "y": y, "w": w, "h": h,
         "defects": [d.copy() for d in final_defects_for_report],
-        "edges_found": len(main_edges)
+        "edges_found": len(main_edges),
+        "near_vertical_line_count": int(near_vertical_count)
     }
     for d in roi_report['defects']:
         d.pop('raw_defect', None)

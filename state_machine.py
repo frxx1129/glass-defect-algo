@@ -141,6 +141,56 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         if not ng_buffer: return None
         return max(ng_buffer, key=lambda r: max([get_defect_size(d) for d in r.get('defects', [])] or [-1]))
 
+    def _count_near_vertical_per_cam(result_obj: dict) -> int:
+        """统计该相机返回的各 ROI 中近竖直主边的数量总和（按 roi_report['near_vertical_line_count'] 汇总）。"""
+        try:
+            rois = result_obj.get('rois', [])
+            if isinstance(rois, list) and rois:
+                return int(sum(int(r.get('near_vertical_line_count', 0) or 0) for r in rois))
+        except Exception:
+            pass
+        return 0
+
+    def _decide_reject_marks_by_vertical_counts(line_name: str, cam_vertical_counts: dict, expected_cams: int) -> list[int] | None:
+        """根据每相机近竖直主边数量估计切割（0=一整块，2=一切二，3=一切三），并返回要触发的剔废mark列表；
+        不同产线以配置中的 lineName 区分（"Line1" / "Line2" / "Line3"）。
+        - 若所有相机竖直到1条或更少：认为一整块（0），若需要剔废则触发 mark 0（通道映射由配置决定）。
+        - 若恰有单个相机竖直=2条：认为一切二，按该相机索引划分左右，触发左右两侧的 mark（line1/3：左1右3；line2：左1右3 或 左2右4 视现场接线习惯，这里提供两组供配置映射）。
+        - 若恰有两个相机竖直=2条：认为一切三，按位置取中间相机为中线，两边划分三路；
+          line1/3 -> 触发 1 或 2 或 3； line2 -> 触发 1 或 2 或 3 或 4（根据映射组成列表）。
+        具体 mark->通道由 shared_settings.rejection_mark_to_channel 决定。
+        """
+        # 收集两条竖直的相机索引
+        two_line_cams = sorted([ci for ci, cnt in cam_vertical_counts.items() if cnt >= 2])
+        max_cnt = max(cam_vertical_counts.values()) if cam_vertical_counts else 0
+
+        # 一整块：所有相机 0或1条
+        if max_cnt <= 1:
+            return [0]
+
+        # 一切二：恰好一个相机两条
+        if len(two_line_cams) == 1:
+            mid_cam = two_line_cams[0]
+            # 左右划分：以中间索引为分界（小于mid为右，大于mid为左，与相机坐标系一致）
+            # 最终触发由服务器配置映射到具体通道
+            if str(line_name).strip() == "Line2":
+                # 产线2支持双侧两通道，使用 1/2 表示左侧组合，3/4 表示右侧组合（实际映射由 config 决定）
+                return [1, 3]  # 由调用处按左右拆分具体触发
+            else:
+                return [1, 3]
+
+        # 一切三：恰好两个相机两条（取较小/较大为两次切割位置，形成三段）
+        if len(two_line_cams) == 2:
+            left_idx, right_idx = two_line_cams[0], two_line_cams[1]
+            # 触发三路，具体通道映射交由配置
+            if str(line_name).strip() == "Line2":
+                return [1, 2, 3, 4]  # line2 可用四路，实际触发时按位置选择其中三路
+            else:
+                return [1, 2, 3]
+
+        # 其它复杂情况：兜底全部
+        return [0]
+
     def build_report_for_frame(result_obj, rejection_details_to_save):
         defects = result_obj.get('defects', [])
         def primary_size(d):
@@ -431,6 +481,35 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         can_decide_time = (auto_first_ng_ts_ms is not None) and (now_ms - auto_first_ng_ts_ms >= hold_ms)
                         expected = int(getattr(shared_settings, 'expected_cameras', num_cameras) or num_cameras)
                         route = _decide_route_for_auto(expected, auto_ng_cams)
+                        # 新增：基于竖直线统计的多路剔废逻辑
+                        try:
+                            # 汇总每个相机的“近竖直主边”数量
+                            vertical_counts = {}
+                            for ci, res in last_result_by_cam.items():
+                                vertical_counts[ci] = _count_near_vertical_per_cam(res)
+                            if vertical_counts:
+                                line_name = str(getattr(shared_settings, 'lineName', 'UNKNOWN')).strip()
+                                marks = _decide_reject_marks_by_vertical_counts(line_name, vertical_counts, expected)
+                                if marks:
+                                    is_current_event_rejected = True
+                                    saved_for_this_pane = True
+                                    rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
+                                    # 将 marks 列表直接作为 route 传入，由 rejection_control 逐一触发
+                                    rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index, marks))
+                                    if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                                        try:
+                                            alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
+                                        except Exception:
+                                            pass
+                                    with stats_lock:
+                                        total_rejections += 1
+                                        shared_rejection_counter.value = total_rejections
+                                        yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                                    broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                                    print(f"    [状态机]: 基于竖直线统计剔废触发，marks={marks}，counts={vertical_counts}")
+                                    continue
+                        except Exception as e:
+                            print(f"[状态机]: 竖直线分路逻辑异常: {e}")
                         if route is None and can_decide_time:
                             # 特例：5路且仅cam2，根据坐标判定
                             if expected == 5 and auto_ng_cams == {2}:
