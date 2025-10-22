@@ -655,7 +655,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     corner_defects.append({"type": "X", "center": tuple(map(int, intersection)), "angle": corrected_angle})
 
             if is_valid_virtual and not is_physical:
-                # 方案一：仅使用 Canny 引导的端点定位（不做亮度门控）
+                # 方案一：仅使用 Canny 引导的端点定位（从交点出发，沿主边方向寻找“黑→白”的第一处）
                 vec1 = p1_far - intersection; n1 = np.linalg.norm(vec1)
                 if n1 > 1e-6: vec1 = vec1 / n1
                 vec2 = p2_far - intersection; n2 = np.linalg.norm(vec2)
@@ -666,8 +666,12 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 min_run_px = int(round(_get_dist_px(p_defect, 'Q_CANNY_MIN_EDGE_RUN_MM', None, 2.0, pixels_per_mm)))
                 gap_min_px = int(round(_get_dist_px(p_defect, 'Q_CANNY_GAP_MIN_LEN_MM', None, 0.8, pixels_per_mm)))
 
-                new_p1 = _search_endpoint_canny(np.array(intersection, dtype=float), vec1, binary_edges, max_extension_dist, stripe_half, min_run_px, gap_min_px)
-                new_p2 = _search_endpoint_canny(np.array(intersection, dtype=float), vec2, binary_edges, max_extension_dist, stripe_half, min_run_px, gap_min_px)
+                # 将最大搜索距离限制为(远端点到交点)与配置上限的较小值，起点设为交点
+                max_d1 = float(min(max_extension_dist, np.linalg.norm(p1_far - intersection))) if n1 > 1e-6 else 0.0
+                max_d2 = float(min(max_extension_dist, np.linalg.norm(p2_far - intersection))) if n2 > 1e-6 else 0.0
+
+                new_p1 = _search_endpoint_canny(np.array(intersection, dtype=float), vec1, binary_edges, max_d1, stripe_half, min_run_px, gap_min_px)
+                new_p2 = _search_endpoint_canny(np.array(intersection, dtype=float), vec2, binary_edges, max_d2, stripe_half, min_run_px, gap_min_px)
 
                 if (new_p1 is not None) and (new_p2 is not None):
                     corner_defects.append({
