@@ -10,6 +10,7 @@ import cv2
 import signal
 import time
 import ctypes
+import yaml
 
 # Import process and thread functions from their respective modules
 from http_client import NonBlockingHttpClient

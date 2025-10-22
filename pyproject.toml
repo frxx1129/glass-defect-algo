@@ -30,5 +30,6 @@ dependencies = [
 	"pyserial",
 	"opencv-contrib-python",
 	"tqdm",
-	"Pillow"
+	"Pillow",
+	"pyyaml"
 ]

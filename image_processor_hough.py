@@ -505,7 +505,7 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float):
 
     return adjusted_edges
 
-def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: float):
+def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: float, binary_edges=None):
     p_defect = params["DEFECT_DETECTION"]; p_crack = params["CRACK_CLASSIFICATION"]
     num_edges = len(edges); roi_h, roi_w = roi_dims
     
@@ -563,6 +563,48 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     else:
         potential_pairs = []
 
+    # --- Canny 端点搜索辅助：沿主边方向的窄通道 run-length 检测 ---
+    def _search_endpoint_canny(start_pt, dir_unit_vec, edge_img, max_search_dist_px: float,
+                               stripe_half_w_px: int, min_edge_run_px: int, gap_min_px: int):
+        if edge_img is None:
+            return None
+        h, w = edge_img.shape[:2]
+        # 垂直方向单位向量（用于条带）
+        perp = np.array([-dir_unit_vec[1], dir_unit_vec[0]], dtype=float)
+        run_len = 0
+        gap_len = 0
+        last_edge_pos = None
+        steps = int(max(1, int(round(float(max_search_dist_px)))))
+        for i_step in range(1, steps + 1):
+            p = start_pt + dir_unit_vec * i_step
+            x, y = float(p[0]), float(p[1])
+            if not (0 <= x < w and 0 <= y < h):
+                break
+            # 采样条带：[-half, +half]，取任何白点即认为该位置有边
+            has_edge_here = False
+            for off in range(-stripe_half_w_px, stripe_half_w_px + 1):
+                q = p + perp * off
+                qx, qy = int(round(q[0])), int(round(q[1]))
+                if 0 <= qx < w and 0 <= qy < h:
+                    if edge_img[qy, qx] != 0:
+                        has_edge_here = True
+                        break
+            if has_edge_here:
+                run_len += 1
+                gap_len = 0
+                last_edge_pos = p
+            else:
+                if run_len >= min_edge_run_px:
+                    gap_len += 1
+                    if gap_len >= gap_min_px:
+                        # 在足够长的“完好边”之后出现连续缺失，即认为端点在缺失开始前的最后一处边
+                        if last_edge_pos is not None:
+                            return last_edge_pos
+                        else:
+                            return p
+                # 边尚未形成稳定 run，继续前进
+        return None
+
     for i, j in potential_pairs:
         if all(endpoint_paired_status.get(i, [True,True])) or all(endpoint_paired_status.get(j, [True,True])): continue
         line1, line2 = true_edges[i], true_edges[j]
@@ -613,140 +655,28 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     corner_defects.append({"type": "X", "center": tuple(map(int, intersection)), "angle": corrected_angle})
 
             if is_valid_virtual and not is_physical:
-                # 缺角(Q)亮度门控：取交点与上下左右4个点(共5点)的均值亮度
-                ix, iy = int(round(float(intersection[0]))), int(round(float(intersection[1])))
-                neighbor_coords = [
-                    (ix, iy), (ix - 1, iy), (ix + 1, iy), (ix, iy - 1), (ix, iy + 1)
-                ]
-                samples = []
-                for px, py in neighbor_coords:
-                    if 0 <= px < roi_w and 0 <= py < roi_h:
-                        samples.append(float(roi_gray[py, px]))
-                inter_mean = float(np.mean(samples)) if samples else 0.0
-                line_mean1 = _edge_line_mean(line1)
-                line_mean2 = _edge_line_mean(line2)
-                line_mean_ref = max(line_mean1, line_mean2)
+                # 方案一：仅使用 Canny 引导的端点定位（不做亮度门控）
+                vec1 = p1_far - intersection; n1 = np.linalg.norm(vec1)
+                if n1 > 1e-6: vec1 = vec1 / n1
+                vec2 = p2_far - intersection; n2 = np.linalg.norm(vec2)
+                if n2 > 1e-6: vec2 = vec2 / n2
 
-                # 新规则：当找到 Q 的两个端点后，用“缺角三角形区域的平均亮度”对比“主边缘扫描带的平均亮度（背景）”做门控
-                # 这里先进行预处理与向量准备，端点找到后再执行区域与扫描带的均值比较
-                if inter_mean > line_mean_ref:
-                    p_preproc = params["PREPROCESSING"]
-                    roi_gray_blurred = cv2.medianBlur(roi_gray, p_preproc["MEDIAN_BLUR_KSIZE"])
-                    vec1 = p1_far - intersection; norm1 = np.linalg.norm(vec1)
-                    if norm1 > 1e-6: vec1 /= norm1
-                    vec2 = p2_far - intersection; norm2 = np.linalg.norm(vec2)
-                    if norm2 > 1e-6: vec2 /= norm2
-                    grad_thresh = p_defect.get("Q_DEFECT_GRADIENT_THRESHOLD", 20.0)
-                    search_w = int(max(1, int(p_defect.get("Q_DEFECT_SEARCH_WIDTH_PX", 2))))
-                    new_p1 = find_gradient_endpoint(intersection, vec1, roi_gray_blurred, max_extension_dist, search_width=search_w, gradient_stop_threshold=grad_thresh)
-                    new_p2 = find_gradient_endpoint(intersection, vec2, roi_gray_blurred, max_extension_dist, search_width=search_w, gradient_stop_threshold=grad_thresh)
-                    # 取消回退：若任一端未找到有效梯度终止点，则认为是正常角点，不生成 Q
-                    if (new_p1 is not None) and (new_p2 is not None):
-                        # --- 计算缺角三角形区域与主边缘扫描带的平均亮度 ---
-                        cx, cy = float(intersection[0]), float(intersection[1])
-                        a = (int(round(cx)), int(round(cy)))
-                        b = (int(round(new_p1[0])), int(round(new_p1[1])))
-                        c = (int(round(new_p2[0])), int(round(new_p2[1])))
+                # 参数（像素）：条带半宽 / 最小连续边长度 / 判定断边的最小连续缺失
+                stripe_half = int(max(1, int(params.get('DEFECT_DETECTION', {}).get('Q_CANNY_STRIPE_HALF_WIDTH_PX', 2))))
+                min_run_px = int(round(_get_dist_px(p_defect, 'Q_CANNY_MIN_EDGE_RUN_MM', None, 2.0, pixels_per_mm)))
+                gap_min_px = int(round(_get_dist_px(p_defect, 'Q_CANNY_GAP_MIN_LEN_MM', None, 0.8, pixels_per_mm)))
 
-                        h_mask, w_mask = roi_h, roi_w
-                        tri_mask = np.zeros((h_mask, w_mask), dtype=np.uint8)
-                        cv2.fillPoly(tri_mask, [np.array([a, b, c], dtype=np.int32)], 255)
-                        # 忽略三角形边缘：做一次轻微腐蚀
-                        erode_px = max(1, int(search_w))
-                        ksize = max(3, erode_px * 2 + 1)
-                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-                        tri_core = cv2.erode(tri_mask, kernel, iterations=1)
+                new_p1 = _search_endpoint_canny(np.array(intersection, dtype=float), vec1, binary_edges, max_extension_dist, stripe_half, min_run_px, gap_min_px)
+                new_p2 = _search_endpoint_canny(np.array(intersection, dtype=float), vec2, binary_edges, max_extension_dist, stripe_half, min_run_px, gap_min_px)
 
-                        # 沿两条主边，使用“崩边扫描带”的定义构建背景带（与 scan_edge_for_luminosity_defects 一致）：
-                        # 宽度来自 LUMINOSITY_SCAN_WIDTH(_MM)，选择亮度更低的一侧，并剔除边线本体与端点区域和三角核心。
-                        scan_width = _get_dist_px(p_defect, "LUMINOSITY_SCAN_WIDTH_MM", "LUMINOSITY_SCAN_WIDTH", None, pixels_per_mm)
-                        edge_ignore_px = _get_dist_px(p_defect, "LUMINOSITY_EDGE_IGNORE_WIDTH_MM", "LUMINOSITY_EDGE_IGNORE_WIDTH", 0.0, pixels_per_mm)
-                        endpoint_exclude_r = _get_dist_px(p_defect, "LUMINOSITY_ENDPOINT_EXCLUDE_RADIUS_MM", None, None, pixels_per_mm, default_px=0.0)
-                        if endpoint_exclude_r is None or endpoint_exclude_r <= 0:
-                            endpoint_exclude_r = max(3, int(min(0.3 * scan_width, 15)))
-
-                        def _make_chipping_belt_for_segment(p_start, p_end):
-                            p1f = np.array([float(p_start[0]), float(p_start[1])])
-                            p2f = np.array([float(p_end[0]), float(p_end[1])])
-                            line_vec = p2f - p1f
-                            line_length = float(np.linalg.norm(line_vec))
-                            if line_length < 1e-6:
-                                return np.zeros((h_mask, w_mask), dtype=np.uint8)
-                            unit_vec = line_vec / line_length
-                            normal_vec = np.array([-unit_vec[1], unit_vec[0]])
-                            half_width_vec = (scan_width / 2.0) * normal_vec
-
-                            c1 = p1f + half_width_vec; c2 = p2f + half_width_vec
-                            c3 = p2f - half_width_vec; c4 = p1f - half_width_vec
-
-                            mask_plus = np.zeros((h_mask, w_mask), dtype=np.uint8)
-                            poly_plus = np.array([c1, c2, p2f, p1f], dtype=np.int32).reshape((-1, 1, 2))
-                            cv2.fillPoly(mask_plus, [poly_plus], 255)
-
-                            mask_minus = np.zeros((h_mask, w_mask), dtype=np.uint8)
-                            poly_minus = np.array([p1f, p2f, c3, c4], dtype=np.int32).reshape((-1, 1, 2))
-                            cv2.fillPoly(mask_minus, [poly_minus], 255)
-
-                            # 选择亮度更低的一侧作为背景（一致性：使用未模糊图计算侧均值）
-                            mean_plus = cv2.mean(roi_gray, mask=mask_plus)[0]
-                            mean_minus = cv2.mean(roi_gray, mask=mask_minus)[0]
-                            scan_mask = mask_plus if mean_plus < mean_minus else mask_minus
-
-                            # 剔除边线与端点邻域
-                            ignore_mask = np.zeros((h_mask, w_mask), dtype=np.uint8)
-                            if edge_ignore_px > 0:
-                                cv2.line(ignore_mask, (int(round(p1f[0])), int(round(p1f[1]))), (int(round(p2f[0])), int(round(p2f[1]))), 255, thickness=int(round(edge_ignore_px)))
-                            cv2.circle(ignore_mask, (int(round(p1f[0])), int(round(p1f[1]))), int(round(endpoint_exclude_r)), 255, thickness=-1)
-                            cv2.circle(ignore_mask, (int(round(p2f[0])), int(round(p2f[1]))), int(round(endpoint_exclude_r)), 255, thickness=-1)
-
-                            scan_mask = cv2.bitwise_and(scan_mask, cv2.bitwise_not(ignore_mask))
-                            # 排除缺角三角形核心区域，避免把缺角本体计入背景
-                            scan_mask = cv2.bitwise_and(scan_mask, cv2.bitwise_not(tri_core))
-                            return scan_mask
-
-                        belt1 = _make_chipping_belt_for_segment(a, b)
-                        belt2 = _make_chipping_belt_for_segment(a, c)
-
-                        # 计算均值（使用模糊后的灰度以降低噪声）
-                        tri_vals = roi_gray_blurred[tri_core == 255]
-                        belt1_vals = roi_gray_blurred[belt1 == 255]
-                        belt2_vals = roi_gray_blurred[belt2 == 255]
-
-                        valid_tri = tri_vals.size >= 10  # 至少若干像素才有统计意义
-                        valid_b1 = belt1_vals.size >= 10
-                        valid_b2 = belt2_vals.size >= 10
-
-                        accept_q = False
-                        if valid_tri and (valid_b1 or valid_b2):
-                            tri_mean = float(np.mean(tri_vals))
-                            # 背景取两条扫描带的均值（若两者都有），或仅用可用的一条
-                            if valid_b1 and valid_b2:
-                                bg_mean = float((np.mean(belt1_vals) + np.mean(belt2_vals)) / 2.0)
-                            elif valid_b1:
-                                bg_mean = float(np.mean(belt1_vals))
-                            else:
-                                bg_mean = float(np.mean(belt2_vals))
-                            # 判定：缺角区域应当比背景更亮（与原先的“比主边线更亮”标准相近）
-                            # 可按需加入余量，例如 p_defect.get('Q_TRIANGLE_BRIGHTNESS_MARGIN', 0.0)
-                            margin = float(p_defect.get('Q_TRIANGLE_BRIGHTNESS_MARGIN', 0.0))
-                            accept_q = (tri_mean > (bg_mean + margin))
-                        else:
-                            # 若统计不足，退化为旧规则（intersection 均值 vs 线均值）
-                            accept_q = inter_mean > line_mean_ref
-
-                        if accept_q:
-                            corner_defects.append({
-                                "type": "Q",
-                                "center": tuple(map(int, intersection)),
-                                "endpoints": (new_p1, new_p2),
-                                "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])
-                            })
-                            q_created = True
-                        else:
-                            _handle_as_x_defect()
-                    else:
-                        # 可选：按原逻辑检测是否属于 X（若角度偏差较大）
-                        _handle_as_x_defect()
+                if (new_p1 is not None) and (new_p2 is not None):
+                    corner_defects.append({
+                        "type": "Q",
+                        "center": tuple(map(int, intersection)),
+                        "endpoints": (new_p1, new_p2),
+                        "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])
+                    })
+                    q_created = True
                 else:
                     _handle_as_x_defect()
             else:
@@ -1092,7 +1022,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     raw_lines = cv2.HoughLinesP(binary_edges, 1, np.pi / 180, p_hough["THRESHOLD"], minLineLength=min_len_pixels, maxLineGap=max_line_gap_px)
     
     main_edges = merge_lines_and_get_main_edges(raw_lines, params, pixels_per_mm)
-    edges_for_drawing, all_defects = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, params, pixels_per_mm)
+    edges_for_drawing, all_defects = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, params, pixels_per_mm, binary_edges)
 
     # 构建“主边端点扫描带”掩膜：长度默认20mm（可通过 DEFECT_DETECTION.L_ENDPOINT_BELT_LENGTH_MM 配置），
     # 宽度等于亮度扫描带宽 LUMINOSITY_SCAN_WIDTH_MM；用于过滤位于边端扫描带内的 L 型缺陷（视为误检）。
@@ -1478,11 +1408,10 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
     
-    #for edge in edges_for_drawing:
-    #    pt1 = tuple(map(int, edge[:2]))
-    #    pt2 = tuple(map(int, edge[2:]))
-    #    cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
-
+    for edge in edges_for_drawing:
+        pt1 = tuple(map(int, edge[:2]))
+        pt2 = tuple(map(int, edge[2:]))
+        cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
     annotations_to_draw = []
     
     for defect_report in final_defects_for_report:

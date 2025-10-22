@@ -1,0 +1,29 @@
+{
+    "average_roi_overall": {
+        "x": 13,
+        "y": 667,
+        "width": 2100,
+        "height": 271
+    },
+    "total_images_annotated": 1,
+    "total_rois_annotated": 2,
+    "detailed_data": [
+        {
+            "filename": "cam5_0003_153410_annotated.mp4_20251022_123637.564.bmp",
+            "rois": [
+                [
+                    19,
+                    263,
+                    2059,
+                    267
+                ],
+                [
+                    7,
+                    1071,
+                    2142,
+                    275
+                ]
+            ]
+        }
+    ]
+}
