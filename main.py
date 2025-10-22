@@ -169,11 +169,20 @@ def main():
     if hasattr(signal, 'SIGBREAK'):  # Windows特有
         signal.signal(signal.SIGBREAK, signal_handler)
 
+    # 优先读取 YAML 配置；若不存在则回退到 JSON（并尝试用 YAML 解析器解析 JSON，失败再用 json.load）
     try:
-        with open('config.json', 'r', encoding='utf-8') as f:
-            config = json.load(f)
+        cfg_path = 'config.yaml' if os.path.exists('config.yaml') else 'config.json'
+        with open(cfg_path, 'r', encoding='utf-8') as f:
+            if cfg_path.endswith(('.yml', '.yaml')):
+                config = yaml.safe_load(f)
+            else:
+                try:
+                    config = yaml.safe_load(f)  # YAML 能解析 JSON 子集
+                except Exception:
+                    f.seek(0)
+                    config = json.load(f)
     except Exception as e:
-        sys.exit(f"错误: 无法加载 config.json: {e}")
+        sys.exit(f"错误: 无法加载 {cfg_path}: {e}")
 
     # ================= 运行模式选择 =================
     # 模式1: 正常检测 (默认)
@@ -468,7 +477,7 @@ def main():
             except Exception:
                 pass
     else:
-        print("[主进程]: 警告 - 未在config.json中配置声光报警器端口，将不启用该功能。")
+        print("[主进程]: 警告 - 配置中未设置声光报警器端口，将不启用该功能。")
         alarm_light_controller = AlarmLightController(command_queue=None)
         # 仅远程推送场景：允许没有本地串口，仅推送远端
         try:

@@ -1,5 +1,6 @@
 import os
 import json
+import yaml
 import cv2
 import time
 import argparse
@@ -8,9 +9,22 @@ import numpy as np
 
 # 批处理 valid 文件夹下图片，复用现有算法/参数
 
-def load_config(cfg_path: str = 'config.json'):
+def load_config(cfg_path: str = None):
+    """优先加载 YAML；若为 JSON 则兼容解析。
+    - 当 cfg_path 为空时：优先选择工作目录下的 config.yaml，否则回退到 config.json
+    - 当 cfg_path 指定为 .yaml/.yml：使用 yaml.safe_load
+    - 其他扩展名：先尝试 yaml.safe_load（可解析 JSON 子集），失败再 json.load
+    """
+    if not cfg_path:
+        cfg_path = 'config.yaml' if os.path.exists('config.yaml') else 'config.json'
     with open(cfg_path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+        if cfg_path.endswith(('.yml', '.yaml')):
+            return yaml.safe_load(f)
+        try:
+            return yaml.safe_load(f)
+        except Exception:
+            f.seek(0)
+            return json.load(f)
 
 def load_template_rois(config, cam_idx: int = 0):
     camera_rois_cfg = config.get('camera_rois', {})
@@ -169,7 +183,8 @@ def _export_intermediates(img_path, template_rois, config, out_dir):
 
 def main():
     parser = argparse.ArgumentParser(description='批量处理 valid 目录下图片')
-    parser.add_argument('--config', default='config.json', help='配置文件路径')
+    default_cfg = 'config.yaml' if os.path.exists('config.yaml') else 'config.json'
+    parser.add_argument('--config', default=default_cfg, help='配置文件路径（支持 YAML/JSON，默认优先读取 config.yaml）')
     parser.add_argument('--input', default='valid', help='输入图片目录')
     parser.add_argument('--output', default='valid_results', help='输出结果目录')
     parser.add_argument('--ext', nargs='*', default=['.jpg', '.png', '.bmp'], help='允许的扩展名')

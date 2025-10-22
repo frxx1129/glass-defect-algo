@@ -1,5 +1,6 @@
 import cv2
 import json
+import yaml
 import time
 import os
 import argparse
@@ -12,7 +13,7 @@ import image_processor_hough as image_processor
 # --- 模拟 SharedSettings 类 (来自 glass_inspector 项目，简化用于测试) ---
 class MockSharedSettings:
     def __init__(self):
-        self.max_defect_size_mm = 20 # 示例值，实际应从 config.json 获取
+        self.max_defect_size_mm = 20 # 示例值，实际应从配置读取
 
 # --- 模拟 should_reject_pane 函数 (来自 processing_worker.py，简化用于测试) ---
 def should_reject_pane(pane_json, shared_settings, pixels_per_mm):
@@ -79,7 +80,8 @@ def main():
     parser = argparse.ArgumentParser(description="处理视频文件或图片文件夹中的玻璃缺陷。")
     parser.add_argument('-i', '--input', required=True, help="输入视频文件或图片文件夹的路径。")
     parser.add_argument('-o', '--output', default='hough_results', help="保存结果的输出文件夹路径。")
-    parser.add_argument('--config', default='config.json', help="配置文件的路径。")
+    default_cfg = 'config.yaml' if os.path.exists('config.yaml') else 'config.json'
+    parser.add_argument('--config', default=default_cfg, help="配置文件的路径（支持 YAML/JSON，默认优先读取 config.yaml）。")
     args = parser.parse_args()
 
     # 1. 检查输入路径是否存在
@@ -92,12 +94,19 @@ def main():
     # 2. 加载配置文件
     try:
         with open(args.config, 'r', encoding='utf-8') as f:
-            config = json.load(f)
+            if args.config.endswith(('.yml', '.yaml')):
+                config = yaml.safe_load(f)
+            else:
+                try:
+                    config = yaml.safe_load(f)  # YAML 解析器可兼容 JSON 子集
+                except Exception:
+                    f.seek(0)
+                    config = json.load(f)
         print(f"成功加载配置: {args.config}")
     except FileNotFoundError:
         print(f"错误: 配置文件 '{args.config}' 未找到。")
         return
-    except json.JSONDecodeError as e:
+    except Exception as e:
         print(f"错误: 解析配置文件 '{args.config}' 失败: {e}")
         return
 
