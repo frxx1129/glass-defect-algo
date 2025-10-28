@@ -192,6 +192,110 @@ def get_point_line_perpendicular_distance(point, line_segment):
     cross = float(v[0] * (p[1] - a[1]) - v[1] * (p[0] - a[0]))
     return abs(cross) / denom
 
+def _find_q_endpoints_harris(roi_gray, intersection, u_vec, v_vec,
+                             len_u_px: float, len_v_px: float,
+                             lateral_tol_px: int,
+                             pixels_per_mm: float,
+                             line1, line2):
+    """
+    在由两主边构成的旋转矩形（以交点为角、边沿各自方向延伸）内做 Harris 角点检测：
+    - 忽略交点 5mm 半径内的角点；
+    - 将候选按“与两条直线的距离”分配到最近的那条；
+    - 对每条直线保留距交点最近、且横向距离小于容差的一个角点；
+    - 返回两条直线各自的端点（整数像素坐标）。
+    """
+    try:
+        if roi_gray is None:
+            return (None, None)
+        H, W = roi_gray.shape[:2]
+        if len_u_px <= 1 or len_v_px <= 1:
+            return (None, None)
+
+        u = np.array(u_vec, dtype=float)
+        v = np.array(v_vec, dtype=float)
+        nu = float(np.linalg.norm(u))
+        nv = float(np.linalg.norm(v))
+        if nu < 1e-6 or nv < 1e-6:
+            return (None, None)
+        u /= nu
+        v /= nv
+
+        inter = np.array(intersection, dtype=float)
+
+        # 以交点为角，沿两主边方向构造近似矩形（平行四边形）区域
+        p0 = inter
+        p1 = inter + u * float(len_u_px)
+        p2 = inter + u * float(len_u_px) + v * float(len_v_px)
+        p3 = inter + v * float(len_v_px)
+        poly = np.vstack([p0, p1, p2, p3]).astype(np.float32)
+        poly_i = np.round(poly).astype(np.int32)
+
+        # 掩膜及局部裁剪
+        mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, poly_i, 255)
+        x, y, w, h = cv2.boundingRect(poly_i)
+        x0 = max(0, x); y0 = max(0, y)
+        x1 = min(W, x + w); y1 = min(H, y + h)
+        if x1 <= x0 or y1 <= y0:
+            return (None, None)
+
+        sub = roi_gray[y0:y1, x0:x1]
+        sub_mask = mask[y0:y1, x0:x1]
+        if sub.size == 0 or cv2.countNonZero(sub_mask) == 0:
+            return (None, None)
+
+        # Harris 角点
+        sub_f = np.float32(sub)
+        try:
+            sub_f = cv2.GaussianBlur(sub_f, (3, 3), 0)
+        except Exception:
+            pass
+        harris = cv2.cornerHarris(sub_f, blockSize=2, ksize=3, k=0.04)
+        harris_dil = cv2.dilate(harris, None)
+        max_val = float(harris.max()) if harris.size > 0 else 0.0
+        if not np.isfinite(max_val) or max_val <= 0:
+            return (None, None)
+        thr = max_val * 0.01  # 经验阈值
+        cand_mask = (harris == harris_dil) & (harris > thr) & (sub_mask > 0)
+        ys, xs = np.where(cand_mask)
+        if xs.size == 0:
+            return (None, None)
+
+        # 忽略交点 5mm 半径内的角点
+        r_ignore = float(5.0 * max(0.1, float(pixels_per_mm)))
+        tol = max(2, int(lateral_tol_px))
+
+        best1 = None  # (dist_to_intersection, (x,y))
+        best2 = None
+        for cx, cy in zip(xs, ys):
+            gx = x0 + int(cx); gy = y0 + int(cy)
+            d_to_inter = float(np.hypot(gx - inter[0], gy - inter[1]))
+            if d_to_inter < r_ignore:
+                continue
+
+            # 距离两条直线的垂直距离
+            d1 = get_point_line_perpendicular_distance((gx, gy), line1)
+            d2 = get_point_line_perpendicular_distance((gx, gy), line2)
+
+            pt_vec = np.array([gx, gy], dtype=float) - inter
+            if d1 <= d2 and d1 <= tol:
+                # 确保沿 u 方向远离交点
+                proj = float(pt_vec.dot(u))
+                if 1.0 <= proj <= (float(len_u_px) + tol):
+                    if (best1 is None) or (d_to_inter < best1[0]):
+                        best1 = (d_to_inter, (int(gx), int(gy)))
+            elif d2 < d1 and d2 <= tol:
+                proj = float(pt_vec.dot(v))
+                if 1.0 <= proj <= (float(len_v_px) + tol):
+                    if (best2 is None) or (d_to_inter < best2[0]):
+                        best2 = (d_to_inter, (int(gx), int(gy)))
+
+        p1_ret = best1[1] if best1 is not None else None
+        p2_ret = best2[1] if best2 is not None else None
+        return (p1_ret, p2_ret)
+    except Exception:
+        return (None, None)
+
 def scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm: float):
     p = params["DEFECT_DETECTION"]
     
@@ -655,23 +759,28 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     corner_defects.append({"type": "X", "center": tuple(map(int, intersection)), "angle": corrected_angle})
 
             if is_valid_virtual and not is_physical:
-                # 方案一：仅使用 Canny 引导的端点定位（从交点出发，沿主边方向寻找“黑→白”的第一处）
+                # 方案改为：在由两条主边（以交点为角）构成的旋转矩形内做 Harris 角点检测，
+                # 忽略交点 5mm 半径内的角点；对每条主边选取“离该边最近且离交点最近”的一个角点作为端点。
                 vec1 = p1_far - intersection; n1 = np.linalg.norm(vec1)
                 if n1 > 1e-6: vec1 = vec1 / n1
                 vec2 = p2_far - intersection; n2 = np.linalg.norm(vec2)
                 if n2 > 1e-6: vec2 = vec2 / n2
 
-                # 参数（像素）：条带半宽 / 最小连续边长度 / 判定断边的最小连续缺失
+                # lateral 宽度容差采用既有 Q_CANNY_STRIPE_HALF_WIDTH_PX（像素）
                 stripe_half = int(max(1, int(params.get('DEFECT_DETECTION', {}).get('Q_CANNY_STRIPE_HALF_WIDTH_PX', 2))))
-                min_run_px = int(round(_get_dist_px(p_defect, 'Q_CANNY_MIN_EDGE_RUN_MM', None, 2.0, pixels_per_mm)))
-                gap_min_px = int(round(_get_dist_px(p_defect, 'Q_CANNY_GAP_MIN_LEN_MM', None, 0.8, pixels_per_mm)))
-
-                # 将最大搜索距离限制为(远端点到交点)与配置上限的较小值，起点设为交点
+                # Harris 搜索范围：沿两主边的最大延伸（像素）
                 max_d1 = float(min(max_extension_dist, np.linalg.norm(p1_far - intersection))) if n1 > 1e-6 else 0.0
                 max_d2 = float(min(max_extension_dist, np.linalg.norm(p2_far - intersection))) if n2 > 1e-6 else 0.0
 
-                new_p1 = _search_endpoint_canny(np.array(intersection, dtype=float), vec1, binary_edges, max_d1, stripe_half, min_run_px, gap_min_px)
-                new_p2 = _search_endpoint_canny(np.array(intersection, dtype=float), vec2, binary_edges, max_d2, stripe_half, min_run_px, gap_min_px)
+                new_p1, new_p2 = _find_q_endpoints_harris(
+                    roi_gray,
+                    intersection,
+                    vec1, vec2,
+                    max_d1, max_d2,
+                    stripe_half,
+                    pixels_per_mm,
+                    line1, line2
+                )
 
                 if (new_p1 is not None) and (new_p2 is not None):
                     corner_defects.append({
@@ -1282,8 +1391,6 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 if width_mm < min_width_mm_rule:
                     continue
                 if area_mm2 < 25 and width_mm < min_size_mm: continue
-                if area_mm2 > 4000 and width_mm < 50: continue
-                if area_mm2 > 1000 and aspect_ratio > 5.0: continue
         
         # 新增：L 型缺陷过滤——在完成 B→L 重分类之后，屏蔽主边缘附近(≤阈值，默认5mm)的所有 L 型缺陷
         if new_defect.get('type') == 'L':
@@ -1296,9 +1403,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                         area_mm2 = length_mm * width_mm
                         aspect_ratio = (length_mm / width_mm) if width_mm > 1e-6 else float('inf')
                         # 对应 B 分支中的面积/比例启发式（不包含 MIN_WIDTH_MM 最短边过滤）
-                        if (area_mm2 < 25 and width_mm < min_size_mm) \
-                           or (area_mm2 > 4000 and width_mm < 50) \
-                           or (area_mm2 > 1000 and aspect_ratio > 5.0):
+                        if (area_mm2 < 25 and width_mm < 2.0):
                             should_be_filtered = True
                 except Exception:
                     pass
