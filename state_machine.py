@@ -59,6 +59,12 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     LEAVE_CONFIRM_FRAMES = int(getattr(shared_settings, 'leave_confirm_frames', 12))
     presence_streak = 0
     absence_streak = 0
+    # 新增：玻璃进入后的最大持续时间（秒），超时强制退出
+    try:
+        pane_max_duration_s = float(getattr(shared_settings, 'pane_max_duration_s', 5.0) or 5.0)
+    except Exception:
+        pane_max_duration_s = 5.0
+    pane_enter_time_s = None
 
     # 自动分路：每片玻璃内的 NG 汇聚与一次性触发
     auto_ng_cams = set()           # 出现NG的相机集合（逻辑索引）
@@ -340,6 +346,11 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             if now_str != last_reset_date_str:
                 with stats_lock:
                     print(f"--- [状态机]: 日期变更，保存 {last_reset_date_str} 日志并重置计数 ---")
+                    # 先刷新 collection_id，再进行当天产量重置
+                    try:
+                        fetch_collection_id_from_server(shared_settings, shared_collection_id)
+                    except Exception as e:
+                        print(f"[状态机]: 刷新 collection_id 失败: {e}")
                     yield_manager.save_daily_report(last_reset_date_str, total_yield, total_rejections)
                     total_rejections = 0
                     total_yield = 0
@@ -347,6 +358,11 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     shared_yield_counter.value = 0
                     last_reset_date_str = now_str
                     yield_manager.save_stats(now_str, total_yield, total_rejections)
+                # （可选）立即广播一次新的统计（包含新的 collection_id）
+                try:
+                    broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                except Exception as e:
+                    print(f"[状态机]: 日期变更后广播统计失败: {e}")
                 # 日期变更时，采集模式下 pane 序号从 1 重新开始（此处置 0，进入时 +1）
                 try:
                     if getattr(shared_settings, 'data_collection_mode', False):
@@ -411,9 +427,55 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             is_current_event_rejected = False
                             # 重置自动分路聚合状态
                             auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
+                        pane_enter_time_s = None
                         continue
                 else:
                     absence_streak = 0
+
+                # 超时强制退出：玻璃处于检测状态超过 pane_max_duration_s
+                try:
+                    if pane_enter_time_s is not None and (time.time() - pane_enter_time_s) >= pane_max_duration_s:
+                        print(f"--- [状态机]: 玻璃检测超时（>{pane_max_duration_s:.1f}s），强制退出 ---")
+                        machine_state = "WAITING_FOR_PANE"
+                        machine_state_shared.value = 0
+                        try:
+                            if getattr(shared_settings, 'data_collection_mode', False):
+                                shared_settings.collection_pane_active = False
+                        except Exception:
+                            pass
+                        absence_streak = 0
+                        presence_streak = 0
+                        if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                            try:
+                                if is_current_event_rejected:
+                                    alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
+                                else:
+                                    alarm_light_controller.set_normal_state()
+                            except Exception:
+                                pass
+                        # 超时强退时，与“离开事件”一致的上传/计数策略
+                        if shared_rejection_mode.value == 2 and not is_current_event_rejected and current_pane_ng_buffer:
+                            can_late_reject.value = True
+                            print("    [状态机]: 等待可能的滞后剔废（模式2），暂不上传。")
+                        else:
+                            upload_current_pane_if_needed()
+                            current_pane_ng_buffer.clear()
+                            current_pane_reports.clear()
+                            current_pane_folder = None
+                            pane_ng_frame_counter = 0
+                            can_late_reject.value = False
+                            if not is_current_event_rejected:
+                                with stats_lock:
+                                    total_yield += 1
+                                    shared_yield_counter.value = total_yield
+                                    yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                                broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                            is_current_event_rejected = False
+                            auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
+                        pane_enter_time_s = None
+                        continue
+                except Exception:
+                    pass
 
                 # NG 帧处理
                 if result['image_status'] == 'NG':
@@ -612,6 +674,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                 alarm_light_controller.set_normal_state()
                             except Exception:
                                 pass
+                        pane_enter_time_s = time.time()
                         print("--- [状态机]: 玻璃进入事件 ---")
                 else:
                     presence_streak = 0
