@@ -672,6 +672,70 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
 
     edge_quadrants = [get_line_quadrant(edge, roi_w, roi_h) for edge in true_edges]
 
+    # 新增：按角度将主边分类为 平行 / 垂直 / 斜边，并为斜边生成基于 boundingRect 的缺陷
+    skew_line_defects = []
+    try:
+        vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 15.0))
+    except Exception:
+        vertical_tol_deg = 15.0
+
+    def _angle_to_x_axis_deg(line):
+        x1, y1, x2, y2 = map(float, line)
+        dx, dy = (x2 - x1), (y2 - y1)
+        ang = abs(np.degrees(np.arctan2(dy, dx)))
+        if ang > 90.0:
+            ang = 180.0 - ang
+        return ang  # [0,90]
+
+    def _axis_aligned_box_points_for_line(seg, pad: int = 2):
+        # 用线段端点生成窄矩形，再取其 axis-aligned 外接框
+        p1 = np.array(seg[:2], dtype=float); p2 = np.array(seg[2:], dtype=float)
+        v = p2 - p1
+        L = float(np.linalg.norm(v))
+        if L < 1e-6:
+            x = int(round(min(p1[0], p2[0]))); y = int(round(min(p1[1], p2[1])))
+            w = h = max(1, int(pad*2))
+        else:
+            u = v / L
+            n = np.array([-u[1], u[0]])
+            half_w = float(max(1, pad))
+            quad = np.array([
+                p1 + n * half_w,
+                p2 + n * half_w,
+                p2 - n * half_w,
+                p1 - n * half_w
+            ], dtype=np.float32)
+            x, y, w, h = cv2.boundingRect(np.int32(quad))
+        box = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.int32)
+        return box
+
+    # 计算“参考垂直角”：用当前 ROI 中被判为垂直的边的角度均值；若无，则用 90°
+    try:
+        all_angles_deg = []
+        for e in true_edges:
+            all_angles_deg.append(_angle_to_x_axis_deg(e))
+        vertical_angles = [a for a in all_angles_deg if a >= (90.0 - vertical_tol_deg)]
+        vertical_ref_deg = (float(np.mean(vertical_angles)) if vertical_angles else 90.0)
+    except Exception:
+        vertical_ref_deg = 90.0
+
+    # 分类并收集斜边（非平行且非垂直）
+    for e in true_edges:
+        try:
+            a_deg = _angle_to_x_axis_deg(e)
+            is_parallel = (a_deg <= vertical_tol_deg)
+            is_vertical = (abs(a_deg - vertical_ref_deg) <= vertical_tol_deg)
+            if not is_parallel and not is_vertical:
+                angle_to_vertical = float(abs(a_deg - vertical_ref_deg))
+                box_pts = _axis_aligned_box_points_for_line(e, pad=3)
+                skew_line_defects.append({
+                    'type': 'X',
+                    'box_points': box_pts,
+                    'skew_angle_deg': angle_to_vertical
+                })
+        except Exception:
+            continue
+
     # 计算某条主边缘“线段像素”的均值亮度（厚度=1px），用于缺角亮度门控
     def _edge_line_mean(edge_line):
         p1 = tuple(map(int, edge_line[:2]))
@@ -831,6 +895,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 except Exception:
                     pass
 
+    # 将斜边缺陷并入后续缺陷列表
     all_chipping_contours = []; chipping_defects = []
     for edge in true_edges:
         all_chipping_contours.extend(scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm))
@@ -1150,7 +1215,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         # 合并结果 = 其他类型 + 不参与合并的小 B + 合并后的 B
         surviving_chipping_defects = others + b_small_list + fused_b_list
             
-    return edges_for_drawing, corner_defects + surviving_chipping_defects
+    # 合并输出缺陷：角点/崩边/斜边
+    return edges_for_drawing, corner_defects + surviving_chipping_defects + skew_line_defects
 
 
 def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm):
@@ -1215,10 +1281,30 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         # --- MODIFICATION END ---
 
         if defect['type'] == 'X':
-            center = defect.get('center', (0, 0))
-            location['x'] = int(center[0] + x)
-            location['y'] = int(center[1] + y)
-            location['angle'] = float(round(defect.get('angle', 0.0), 2))
+            # 支持两种 X：
+            # 1) 交点型（有 center + angle）
+            # 2) 斜边型（有 box_points + skew_angle_deg）
+            if 'box_points' in defect:
+                box = defect.get('box_points')
+                if isinstance(box, (list, np.ndarray)) and len(box) >= 4:
+                    box_np = np.array(box, dtype=float).reshape(-1, 2)
+                    center = np.mean(box_np, axis=0)
+                    location['x'] = int(center[0] + x)
+                    location['y'] = int(center[1] + y)
+                    # 角度记录为与竖直边夹角
+                    try:
+                        location['angle'] = float(round(defect.get('skew_angle_deg', 0.0), 2))
+                    except Exception:
+                        location['angle'] = float(round(defect.get('angle', 0.0), 2))
+                else:
+                    location['x'] = x
+                    location['y'] = y
+                    location['angle'] = float(round(defect.get('skew_angle_deg', 0.0), 2))
+            else:
+                center = defect.get('center', (0, 0))
+                location['x'] = int(center[0] + x)
+                location['y'] = int(center[1] + y)
+                location['angle'] = float(round(defect.get('angle', 0.0), 2))
         else:
             length_px, width_px = 0.0, 0.0
             if defect['type'] == 'Q':
@@ -1511,9 +1597,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
     # 统计“近竖直”的主边数量（0~2 常见）：基于主边段方向角(相对x轴 0~90°)，角度>=90°-tol 视为近竖直
     try:
-        vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+        vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 5.0))
     except Exception:
-        vertical_tol_deg = 10.0
+        vertical_tol_deg = 5.0
     def _line_angle_deg(line):
         x1, y1, x2, y2 = map(float, line)
         dx, dy = (x2 - x1), (y2 - y1)
@@ -1574,20 +1660,6 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             p1_orig, p2_orig = np.array(defect["endpoints"][0]), np.array(defect["endpoints"][1])
             v1_final, v2_final = p1_orig, p2_orig 
 
-            if "distances" in defect:
-                retreat_threshold = p_vis.get("RETREAT_DISTANCE_THRESHOLD", 100.0)
-                retreat_len = p_vis.get("EDGE_ENDPOINT_FIXED_LENGTH", 20)
-                dist1, dist2 = defect["distances"]
-                if dist1 > retreat_threshold:
-                    vec1 = (p1_orig - center); norm_vec1 = np.linalg.norm(vec1)
-                    if norm_vec1 > 1e-6: v1_final = center + (vec1 / norm_vec1) * retreat_len
-                if dist2 > retreat_threshold:
-                    vec2 = (p2_orig - center); norm_vec2 = np.linalg.norm(vec2)
-                    if norm_vec2 > 1e-6: v2_final = center + (vec2 / norm_vec2) * retreat_len
-                try:
-                    defect_report.setdefault('_adjusted_q_lengths_px', [float(np.linalg.norm(v1_final - center)), float(np.linalg.norm(v2_final - center))])
-                except Exception: pass
-
             triangle_vertices = np.array([tuple(map(int, center)), tuple(map(int, v1_final)), tuple(map(int, v2_final))], dtype=np.int32)
             overlay = roi_color.copy()
             cv2.fillPoly(overlay, [triangle_vertices], color_bgr)
@@ -1599,7 +1671,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         elif defect["type"] == "X" and "center" in defect:
             cv2.circle(roi_color, defect["center"], 15, color_bgr, THICKNESS)
             
-        elif defect_report["type"] in ["L", "B"] and "box_points" in defect:
+        elif defect_report["type"] in ["L", "B", "X"] and "box_points" in defect:
             box_points = defect["box_points"]
             overlay = roi_color.copy()
             cv2.fillPoly(overlay, [box_points], color_bgr)

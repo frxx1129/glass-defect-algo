@@ -55,8 +55,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         pass
     
     # 进入/离开 去抖（帧）——避免算法偶发抖动导致反复进入/离开
-    ENTER_CONFIRM_FRAMES = int(getattr(shared_settings, 'enter_confirm_frames', 6))
-    LEAVE_CONFIRM_FRAMES = int(getattr(shared_settings, 'leave_confirm_frames', 12))
+    ENTER_CONFIRM_FRAMES = int(getattr(shared_settings, 'enter_confirm_frames', 1))
+    LEAVE_CONFIRM_FRAMES = int(getattr(shared_settings, 'leave_confirm_frames', 4))
     presence_streak = 0
     absence_streak = 0
     # 新增：玻璃进入后的最大持续时间（秒），超时强制退出
