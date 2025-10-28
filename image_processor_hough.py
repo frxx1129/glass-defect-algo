@@ -461,9 +461,38 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float):
     merged_lines_with_scores = []
     for group in final_line_groups:
         points = np.array([pt for line in group for pt in (line[0:2], line[2:4])], dtype=np.float32)
-        if len(points) < 2: continue
-        line_params = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
-        vx, vy, x0, y0 = line_params.flatten()
+        if len(points) < 2: 
+            continue
+        # 方向估计：长度加权的单位方向平均（对齐符号），回退 fitLine
+        try:
+            # 选择参考方向：组内最长线段
+            segs = [np.array([g[0], g[1], g[2], g[3]], dtype=float) for g in group]
+            lengths = [float(np.linalg.norm(s[2:4] - s[0:2])) for s in segs]
+            if not lengths or max(lengths) <= 1e-6:
+                raise ValueError("degenerate group")
+            ref_idx = int(np.argmax(lengths))
+            ref_vec = segs[ref_idx][2:4] - segs[ref_idx][0:2]
+            ref_u = ref_vec / float(np.linalg.norm(ref_vec))
+            acc = np.zeros(2, dtype=float)
+            for s, L in zip(segs, lengths):
+                if L <= 1e-6:
+                    continue
+                v = s[2:4] - s[0:2]
+                u = v / L
+                # 对齐符号，避免相反方向相互抵消
+                if np.dot(u, ref_u) < 0:
+                    u = -u
+                acc += (L * u)
+            norm_acc = float(np.linalg.norm(acc))
+            if norm_acc <= 1e-6:
+                raise ValueError("acc zero")
+            vx, vy = (acc / norm_acc).tolist()
+            # 基点用端点均值
+            x0 = float(np.mean(points[:, 0])); y0 = float(np.mean(points[:, 1]))
+        except Exception:
+            # 回退：使用 fitLine 结果
+            line_params = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
+            vx, vy, x0, y0 = line_params.flatten()
         projected = (points[:, 0] - x0) * vx + (points[:, 1] - y0) * vy
         pt1, pt2 = points[np.argmin(projected)], points[np.argmax(projected)]
         final_merged_line = np.array([pt1[0], pt1[1], pt2[0], pt2[1]])
