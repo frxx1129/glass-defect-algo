@@ -1071,7 +1071,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         try:
                             q_min_diff = float(params.get('DEFECT_DETECTION', {}).get('Q_BRIGHTNESS_MIN_DIFF', 10.0))
                         except Exception:
-                            q_min_diff = 5.0
+                            q_min_diff = 8.0
                         if brightness_diff >= q_min_diff:
                             corner_defects.append({
                                 "type": "Q",
