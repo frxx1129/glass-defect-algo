@@ -244,25 +244,20 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 collection_id = int(raw_cid)
         except Exception:
             collection_id = -1
-        # 报告中标识剃废模式：手动/自动
-        is_manual_mode = False
+        # 仅调整 rejection_type 的标记方法与位置：
+        # - 若当前处于“手动剔废模式窗口”（manual_reject_active_mode=True），则本帧报告的 rejection_type 直接标记为 '2'
+        # - 否则沿用传入的临时值（若无则为 '0'）
         try:
-            # 优先依据当前片是否处于手动模式窗口
-            if manual_reject_active_mode:
-                is_manual_mode = True
-            # 其次兼容已有的 rejection_type=2
-            elif str(rejection_details_to_save.get('rejection_type', '')) == '2':
-                is_manual_mode = True
+            final_rej_type = '2' if manual_reject_active_mode else str(rejection_details_to_save.get('rejection_type', '0'))
         except Exception:
-            pass
-        user_id = shared_user_id_manual.value if is_manual_mode else shared_user_id_auto.value
+            final_rej_type = '0'
+        # userId 仍按最终 rejection_type 决定
+        user_id = shared_user_id_manual.value if str(final_rej_type) == '2' else shared_user_id_auto.value
         return {
             'collection_id': int(collection_id),
-            'rejection_type': rejection_details_to_save.get('rejection_type', 'unknown'),
+            'rejection_type': final_rej_type,
             'rejection_time': rejection_details_to_save.get('rejection_time', datetime.now()).strftime('%Y-%m-%d %H:%M:%S'),
             'userId': user_id,
-            'rejection_mode': ('manual' if is_manual_mode else 'auto'),
-            'rejection_mode_label': ('手动' if is_manual_mode else '自动'),
             'size_label': final_size_label,
             'image_status': result_obj['image_status'],
             'defects': defects,
