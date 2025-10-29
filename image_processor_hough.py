@@ -1788,9 +1788,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         type_str = defect_type_map.get(defect_report['type'], '未知')
         
         if defect_report['type'] == 'X':
-            # 若为曲边，展示曲率角；否则展示与垂直参考的夹角
+            # 若为曲边，展示曲度（曲率角）；否则展示与垂直参考的夹角
             if loc.get('subtype') == 'curved' or (defect.get('skew_subtype', '') == 'curved'):
-                text = f"{type_str}：曲边: ({loc['x']}, {loc['y']}), 角度: {loc.get('angle', 0.0):.1f}°"
+                text = f"{type_str}：曲边: ({loc['x']}, {loc['y']}), 曲度: {loc.get('angle', 0.0):.1f}°"
             else:
                 text = f"{type_str}: ({loc['x']}, {loc['y']}), 角度: {loc.get('angle', 0.0):.1f}°"
         elif defect_report['type'] == 'Q' and 'pixel_area' in loc:
