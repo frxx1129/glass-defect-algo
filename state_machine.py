@@ -37,6 +37,12 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     
     max_complexity_snapshot = np.zeros(num_cameras, dtype=np.int32)
     is_current_event_rejected = False
+    # 手动剔废“模式标记”开关：
+    # - 当在等待或检测过程中触发手动剔废时置为 True；
+    # - 该标记对“当前这片玻璃”的所有 NG 报告生效（报告中标明剔废模式=手动）；
+    # - 若在等待阶段触发手动剔废，则对“下一片玻璃”生效，直到该片离开为止；
+    # - 在玻璃离开/超时强退时重置为 False。
+    manual_reject_active_mode = False
     # 黄灯策略：每出现一帧新的 NG 图像就刷新黄灯持续时间，直到剔废(红灯)或玻璃离开
     # 不再使用单次触发标志
     rejection_details = {}
@@ -158,44 +164,58 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         return 0
 
     def _decide_reject_marks_by_vertical_counts(line_name: str, cam_vertical_counts: dict, expected_cams: int) -> list[int] | None:
-        """根据每相机近竖直主边数量估计切割（0=一整块，2=一切二，3=一切三），并返回要触发的剔废mark列表；
-        不同产线以配置中的 lineName 区分（"Line1" / "Line2" / "Line3"）。
-        - 若所有相机竖直到1条或更少：认为一整块（0），若需要剔废则触发 mark 0（通道映射由配置决定）。
-        - 若恰有单个相机竖直=2条：认为一切二，按该相机索引划分左右，触发左右两侧的 mark（line1/3：左1右3；line2：左1右3 或 左2右4 视现场接线习惯，这里提供两组供配置映射）。
-        - 若恰有两个相机竖直=2条：认为一切三，按位置取中间相机为中线，两边划分三路；
-          line1/3 -> 触发 1 或 2 或 3； line2 -> 触发 1 或 2 或 3 或 4（根据映射组成列表）。
-        具体 mark->通道由 shared_settings.rejection_mark_to_channel 决定。
+        """根据“各相机的近竖直主边数量”估计切割形态并返回要触发的通道列表（与底层触发保持兼容）。
+
+        改动要点：
+        1) 若判断为“未切割”，则直接全部撤清 -> 返回 [4]（route=4，对应 ALL）。
+        2) 若出现“不平均切分，仅两块”的场景：当“双竖直线”集中出现在同一侧相机上，认为是边缘+大块两段：
+           - 边缘侧只触发单个撤清（左侧 -> 1，右侧 -> 3）；
+           - 大块（偏中间）触发“其余撤清” -> 4（ALL）。
+        3) 其它情况沿用原逻辑（1切割 -> 返回 [1,3]；2切割 -> 返回 [1,2,3]）。
         """
-        # 收集两条竖直的相机索引
-        two_line_cams = sorted([ci for ci, cnt in cam_vertical_counts.items() if cnt >= 2])
-        max_cnt = max(cam_vertical_counts.values()) if cam_vertical_counts else 0
+        if not cam_vertical_counts:
+            return [4]
 
-        # 一整块：所有相机 0或1条
+        # 收集“两条竖直”的相机索引
+        two_line_cams = sorted([ci for ci, cnt in cam_vertical_counts.items() if int(cnt or 0) >= 2])
+        max_cnt = max(int(v or 0) for v in cam_vertical_counts.values())
+
+        # 1) 未切割：所有相机≤1条竖直主边 -> 全部撤清（route=4）
         if max_cnt <= 1:
-            return [0]
+            return [4]
 
-        # 一切二：恰好一个相机两条
+        # 定义左右侧辅助判断
+        try:
+            n = int(expected_cams or 0)
+        except Exception:
+            n = 0
+        center = (n - 1) / 2.0 if n > 0 else 1.5  # 4相机->1.5，5相机->2.0
+        def _is_left(ci: int) -> bool:
+            return ci < center
+        def _is_right(ci: int) -> bool:
+            return ci > center
+
+        # 2) 一切二：恰好一个相机两条
         if len(two_line_cams) == 1:
-            mid_cam = two_line_cams[0]
-            # 左右划分：以中间索引为分界（小于mid为右，大于mid为左，与相机坐标系一致）
-            # 最终触发由服务器配置映射到具体通道
-            if str(line_name).strip() == "Line2":
-                # 产线2支持双侧两通道，使用 1/2 表示左侧组合，3/4 表示右侧组合（实际映射由 config 决定）
-                return [1, 3]  # 由调用处按左右拆分具体触发
-            else:
-                return [1, 3]
+            # 保持双侧触发（与原有现场习惯一致）：左+右 -> [1,3]
+            return [1, 3]
 
-        # 一切三：恰好两个相机两条（取较小/较大为两次切割位置，形成三段）
+        # 3) 两个相机两条
         if len(two_line_cams) == 2:
-            left_idx, right_idx = two_line_cams[0], two_line_cams[1]
-            # 触发三路，具体通道映射交由配置
-            if str(line_name).strip() == "Line2":
-                return [1, 2, 3, 4]  # line2 可用四路，实际触发时按位置选择其中三路
-            else:
-                return [1, 2, 3]
+            a, b = two_line_cams[0], two_line_cams[1]
+            same_side_left = _is_left(a) and _is_left(b)
+            same_side_right = _is_right(a) and _is_right(b)
+            if same_side_left:
+                # 不平均切分 -> 左侧是小边缘块：先 1，再 4 清余下大块
+                return [1, 4]
+            if same_side_right:
+                # 不平均切分 -> 右侧是小边缘块：先 3，再 4 清余下大块
+                return [3, 4]
+            # 常规两切 -> 三段：左/中/右
+            return [1, 2, 3]
 
-        # 其它复杂情况：兜底全部
-        return [0]
+        # 4) 其它复杂或不确定情况：兜底全部撤清
+        return [4]
 
     def build_report_for_frame(result_obj, rejection_details_to_save):
         defects = result_obj.get('defects', [])
@@ -224,12 +244,25 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 collection_id = int(raw_cid)
         except Exception:
             collection_id = -1
-        user_id = shared_user_id_manual.value if rejection_details_to_save.get('rejection_type') == '2' else shared_user_id_auto.value
+        # 报告中标识剃废模式：手动/自动
+        is_manual_mode = False
+        try:
+            # 优先依据当前片是否处于手动模式窗口
+            if manual_reject_active_mode:
+                is_manual_mode = True
+            # 其次兼容已有的 rejection_type=2
+            elif str(rejection_details_to_save.get('rejection_type', '')) == '2':
+                is_manual_mode = True
+        except Exception:
+            pass
+        user_id = shared_user_id_manual.value if is_manual_mode else shared_user_id_auto.value
         return {
             'collection_id': int(collection_id),
             'rejection_type': rejection_details_to_save.get('rejection_type', 'unknown'),
             'rejection_time': rejection_details_to_save.get('rejection_time', datetime.now()).strftime('%Y-%m-%d %H:%M:%S'),
             'userId': user_id,
+            'rejection_mode': ('manual' if is_manual_mode else 'auto'),
+            'rejection_mode_label': ('手动' if is_manual_mode else '自动'),
             'size_label': final_size_label,
             'image_status': result_obj['image_status'],
             'defects': defects,
@@ -286,6 +319,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         # 手动剔废（等待新玻璃状态下也可随时触发）：始终进行剔废控制；仅在既可滞后且确有NG时才上传
         if machine_state == "WAITING_FOR_PANE" and manual_reject_flag.value:
             manual_reject_flag.value = False
+            # 手动剔废“模式标记”自本次触发起生效，直到下一次玻璃离开为止
+            manual_reject_active_mode = True
             # 硬件剔废始终执行
             try:
                 route = getattr(shared_settings, 'manual_reject_route', None)
@@ -394,6 +429,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             pass
                         absence_streak = 0
                         presence_streak = 0
+                        # 玻璃离开时，重置手动剔废模式标记
+                        manual_reject_active_mode = False
 
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                             try:
@@ -445,6 +482,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             pass
                         absence_streak = 0
                         presence_streak = 0
+                        # 超时强退也视作一次“离开”——重置手动模式标记
+                        manual_reject_active_mode = False
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                             try:
                                 if is_current_event_rejected:
@@ -601,6 +640,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     elif manual_reject_flag.value:
                         is_current_event_rejected = True
                         manual_reject_flag.value = False
+                        # 触发后，自当前时刻起，直到该片离开，均标记为“手动剔废模式”
+                        manual_reject_active_mode = True
                         rejection_details = {"rejection_time": datetime.now(), "rejection_type": "2"}
                         try:
                             route = getattr(shared_settings, 'manual_reject_route', None)
