@@ -799,9 +799,9 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             contours, _ = cv2.findContours(edges_wo, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             if contours:
                 try:
-                    min_arc_len_px = float(params.get('DEFECT_DETECTION', {}).get('SKEW_CURVED_MIN_ARC_LEN_PX', 320.0))
+                    min_arc_len_px = float(params.get('DEFECT_DETECTION', {}).get('SKEW_CURVED_MIN_ARC_LEN_PX', 700.0))
                 except Exception:
-                    min_arc_len_px = 320.0
+                    min_arc_len_px = 700.0
                 try:
                     max_dev_ratio = float(params.get('DEFECT_DETECTION', {}).get('SKEW_CURVED_MAX_DEV_RATIO', 0.08))
                 except Exception:
@@ -866,16 +866,64 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     except Exception:
         pass
 
-    # 计算某条主边缘“线段像素”的均值亮度（厚度=1px），用于缺角亮度门控
-    def _edge_line_mean(edge_line):
-        p1 = tuple(map(int, edge_line[:2]))
-        p2 = tuple(map(int, edge_line[2:]))
-        mask = np.zeros(roi_gray.shape, dtype=np.uint8)
-        cv2.line(mask, p1, p2, 255, 1)
-        cnt = cv2.countNonZero(mask)
-        if cnt == 0:
+    # 计算某条主边“平行四边形扫描带”的平均亮度，选择相对于缺角三角形质心的内侧（与三角形相反侧）半带，剔除边线与端点
+    # 用作缺角(Q)亮度门控的对比基准
+    def _edge_baseline_parallelogram_mean(edge_line, tri_centroid):
+        try:
+            p = params["DEFECT_DETECTION"]
+            p1 = np.array(edge_line[:2], dtype=float)
+            p2 = np.array(edge_line[2:], dtype=float)
+            line_vec = p2 - p1
+            line_len = float(np.linalg.norm(line_vec))
+            if line_len <= 1e-6:
+                return float(cv2.mean(roi_gray)[0])
+
+            # 扫描带宽（mm 配置 → px）
+            scan_width = _get_dist_px(p, "LUMINOSITY_SCAN_WIDTH_MM", "LUMINOSITY_SCAN_WIDTH", None, pixels_per_mm)
+            scan_width = max(1, int(round(float(scan_width))))
+
+            unit_vec = line_vec / line_len
+            normal_vec = np.array([-unit_vec[1], unit_vec[0]], dtype=float)
+            half_width_vec = (scan_width / 2.0) * normal_vec
+
+            # 两侧半带四点（按 scan_edge_for_luminosity_defects 的构造方式）
+            c1 = p1 + half_width_vec; c2 = p2 + half_width_vec
+            c3 = p2 - half_width_vec; c4 = p1 - half_width_vec
+
+            mask_plus = np.zeros(roi_gray.shape, dtype=np.uint8)
+            poly_plus = np.array([c1, c2, p2, p1], dtype=np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(mask_plus, [poly_plus], 255)
+
+            mask_minus = np.zeros(roi_gray.shape, dtype=np.uint8)
+            poly_minus = np.array([p1, p2, c3, c4], dtype=np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(mask_minus, [poly_minus], 255)
+
+            # 根据三角形质心在边线哪一侧，选择与其相反侧作为“玻璃内侧”基准
+            # 侧性判定：法向量指向为 plus 侧，点到边线的有符号距离 s = dot((tri - p1), normal_vec)
+            # 若 s > 0，质心在 plus 侧，则取 minus 侧；反之取 plus 侧
+            s = float(np.dot((np.array(tri_centroid, dtype=float) - p1), normal_vec))
+            scan_mask = mask_minus if s > 0 else mask_plus
+
+            # 剔除边线本体与两端点圆形区域，以匹配崩边检测的有效区域
+            edge_ignore_px = _get_dist_px(p, "LUMINOSITY_EDGE_IGNORE_WIDTH_MM", "LUMINOSITY_EDGE_IGNORE_WIDTH", 0.0, pixels_per_mm)
+            endpoint_exclude_r = _get_dist_px(p, "LUMINOSITY_ENDPOINT_EXCLUDE_RADIUS_MM", None, None, pixels_per_mm, default_px=0.0)
+            if endpoint_exclude_r is None or endpoint_exclude_r <= 0:
+                endpoint_exclude_r = max(3, int(min(0.3 * scan_width, 15)))
+
+            ignore_mask = np.zeros(roi_gray.shape, dtype=np.uint8)
+            if edge_ignore_px and edge_ignore_px > 0:
+                cv2.line(ignore_mask, tuple(map(int, p1)), tuple(map(int, p2)), 255, thickness=int(round(edge_ignore_px)))
+            cv2.circle(ignore_mask, tuple(map(int, p1)), int(round(endpoint_exclude_r)), 255, thickness=-1)
+            cv2.circle(ignore_mask, tuple(map(int, p2)), int(round(endpoint_exclude_r)), 255, thickness=-1)
+
+            eff_mask = cv2.subtract(scan_mask, ignore_mask)
+            if cv2.countNonZero(eff_mask) <= 0:
+                # 回退：用未剔除边线/端点的扫描带
+                eff_mask = scan_mask
+
+            return float(cv2.mean(roi_gray, mask=eff_mask)[0])
+        except Exception:
             return float(cv2.mean(roi_gray)[0])
-        return float(cv2.mean(roi_gray, mask=mask)[0])
 
     def sort_key_func(pair_indices):
         i, j = pair_indices
@@ -1006,13 +1054,44 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 )
 
                 if (new_p1 is not None) and (new_p2 is not None):
-                    corner_defects.append({
-                        "type": "Q",
-                        "center": tuple(map(int, intersection)),
-                        "endpoints": (new_p1, new_p2),
-                        "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])
-                    })
-                    q_created = True
+                    # 亮度门控：三角形区域均值 vs. 两条主边“内侧平行四边形扫描带”均值 的平均值 之间的差异
+                    try:
+                        # 三角形区域（交点+两端点）
+                        tri_pts = np.array([intersection, new_p1, new_p2], dtype=np.int32).reshape(-1, 1, 2)
+                        tri_mask = np.zeros(roi_gray.shape, dtype=np.uint8)
+                        cv2.fillPoly(tri_mask, [tri_pts], 255)
+                        tri_mean = float(cv2.mean(roi_gray, mask=tri_mask)[0])
+                        # 三角形质心（用于确定边线的内/外侧）
+                        tri_centroid = np.mean(np.array([intersection, new_p1, new_p2], dtype=float), axis=0)
+                        # 基准亮度：两条主边的“内侧平行四边形扫描带（剔除边线与端点）”的均值
+                        edge_mean1 = float(_edge_baseline_parallelogram_mean(line1, tri_centroid))
+                        edge_mean2 = float(_edge_baseline_parallelogram_mean(line2, tri_centroid))
+                        base_mean = (edge_mean1 + edge_mean2) / 2.0
+                        brightness_diff = abs(base_mean - tri_mean)
+                        try:
+                            q_min_diff = float(params.get('DEFECT_DETECTION', {}).get('Q_BRIGHTNESS_MIN_DIFF', 10.0))
+                        except Exception:
+                            q_min_diff = 5.0
+                        if brightness_diff >= q_min_diff:
+                            corner_defects.append({
+                                "type": "Q",
+                                "center": tuple(map(int, intersection)),
+                                "endpoints": (new_p1, new_p2),
+                                "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])
+                            })
+                            q_created = True
+                        else:
+                            # 亮度差不足：不视为缺角
+                            q_created = False
+                    except Exception:
+                        # 计算失败则保守创建 Q（避免误删真实缺角）
+                        corner_defects.append({
+                            "type": "Q",
+                            "center": tuple(map(int, intersection)),
+                            "endpoints": (new_p1, new_p2),
+                            "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])
+                        })
+                        q_created = True
                 else:
                     _handle_as_x_defect()
             else:

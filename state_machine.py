@@ -61,8 +61,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         pass
     
     # 进入/离开 去抖（帧）——避免算法偶发抖动导致反复进入/离开
-    ENTER_CONFIRM_FRAMES = int(getattr(shared_settings, 'enter_confirm_frames', 1))
-    LEAVE_CONFIRM_FRAMES = int(getattr(shared_settings, 'leave_confirm_frames', 4))
+    ENTER_CONFIRM_FRAMES = int(getattr(shared_settings, 'enter_confirm_frames', 5))
+    LEAVE_CONFIRM_FRAMES = int(getattr(shared_settings, 'leave_confirm_frames', 5))
     presence_streak = 0
     absence_streak = 0
     # 新增：玻璃进入后的最大持续时间（秒），超时强制退出
@@ -311,7 +311,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         print("[状态机]: 未能从服务器获取状态，保持当前运行状态。")
     
     while not stop_event.is_set():
-        # 手动剔废（等待新玻璃状态下也可随时触发）：始终进行剔废控制；仅在既可滞后且确有NG时才上传
+        # 手动剔废（等待新玻璃状态下也可随时触发）：始终进行剔废控制；不再支持滞后剔废
         if machine_state == "WAITING_FOR_PANE" and manual_reject_flag.value:
             manual_reject_flag.value = False
             # 手动剔废“模式标记”自本次触发起生效，直到下一次玻璃离开为止
@@ -333,27 +333,6 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 shared_rejection_counter.value = total_rejections
                 yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
             broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-            # 仅当处于可滞后窗口且确有上一片NG缓存时执行上传与回滚，其余情况不上传
-            if can_late_reject.value and current_pane_ng_buffer and not is_current_event_rejected:
-                can_late_reject.value = False
-                rejection_details = {"rejection_time": datetime.now(), "rejection_type": "2"}
-                for rpt in current_pane_reports:
-                    rpt['rejection_type'] = '2'
-                    rpt['rejection_time'] = rejection_details['rejection_time'].strftime('%Y-%m-%d %H:%M:%S')
-                send_reports_batch_to_server(current_pane_reports, [r.get('annotated_image_buffer') for r in current_pane_ng_buffer], shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
-                # 回滚上一片产量（若已计）
-                with stats_lock:
-                    if total_yield > 0:
-                        total_yield -= 1
-                        shared_yield_counter.value = total_yield
-                        yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
-                broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                print(f"    [状态机]: 手动剔废完成并上传。本片NG帧数量: {len(current_pane_ng_buffer)}")
-                # 上传后清空，为下一片做准备
-                current_pane_ng_buffer.clear()
-                current_pane_reports.clear()
-                current_pane_folder = None
-                pane_ng_frame_counter = 0
             continue
 
         try:
@@ -436,29 +415,24 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             except Exception:
                                 pass
 
-                        # 离开时：若为模式2且未剔废，允许滞后剔废 -> 不立即上传
-                        if shared_rejection_mode.value == 2 and not is_current_event_rejected and current_pane_ng_buffer:
-                            can_late_reject.value = True
-                            print("    [状态机]: 等待可能的滞后剔废（模式2），暂不上传。")
-                        else:
-                            # 立即上传策略：该调用占位以便未来恢复批量上传
-                            upload_current_pane_if_needed()
-                            # 上传后清理
-                            current_pane_ng_buffer.clear()
-                            current_pane_reports.clear()
-                            current_pane_folder = None
-                            pane_ng_frame_counter = 0
-                            can_late_reject.value = False
-                            # 若没有被剔废（包括未触发滞后），计入产量
-                            if not is_current_event_rejected:
-                                with stats_lock:
-                                    total_yield += 1
-                                    shared_yield_counter.value = total_yield
-                                    yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
-                                broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                            is_current_event_rejected = False
-                            # 重置自动分路聚合状态
-                            auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
+                        # 立即上传并结算；不支持滞后剔废
+                        upload_current_pane_if_needed()
+                        # 上传后清理
+                        current_pane_ng_buffer.clear()
+                        current_pane_reports.clear()
+                        current_pane_folder = None
+                        pane_ng_frame_counter = 0
+                        can_late_reject.value = False
+                        # 若没有被剔废，计入产量
+                        if not is_current_event_rejected:
+                            with stats_lock:
+                                total_yield += 1
+                                shared_yield_counter.value = total_yield
+                                yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                            broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                        is_current_event_rejected = False
+                        # 重置自动分路聚合状态
+                        auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
                         pane_enter_time_s = None
                         continue
                 else:
@@ -487,25 +461,21 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                     alarm_light_controller.set_normal_state()
                             except Exception:
                                 pass
-                        # 超时强退时，与“离开事件”一致的上传/计数策略
-                        if shared_rejection_mode.value == 2 and not is_current_event_rejected and current_pane_ng_buffer:
-                            can_late_reject.value = True
-                            print("    [状态机]: 等待可能的滞后剔废（模式2），暂不上传。")
-                        else:
-                            upload_current_pane_if_needed()
-                            current_pane_ng_buffer.clear()
-                            current_pane_reports.clear()
-                            current_pane_folder = None
-                            pane_ng_frame_counter = 0
-                            can_late_reject.value = False
-                            if not is_current_event_rejected:
-                                with stats_lock:
-                                    total_yield += 1
-                                    shared_yield_counter.value = total_yield
-                                    yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
-                                broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                            is_current_event_rejected = False
-                            auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
+                        # 超时强退时也立即上传并结算；不支持滞后剔废
+                        upload_current_pane_if_needed()
+                        current_pane_ng_buffer.clear()
+                        current_pane_reports.clear()
+                        current_pane_folder = None
+                        pane_ng_frame_counter = 0
+                        can_late_reject.value = False
+                        if not is_current_event_rejected:
+                            with stats_lock:
+                                total_yield += 1
+                                shared_yield_counter.value = total_yield
+                                yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                            broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                        is_current_event_rejected = False
+                        auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
                         pane_enter_time_s = None
                         continue
                 except Exception:
@@ -662,21 +632,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 if current_total_panes > 0:
                     presence_streak += 1
                     if presence_streak >= ENTER_CONFIRM_FRAMES:
-                        # 若上一片玻璃存在 NG 但处于滞后等待且最终未被剔废，应当此时补记产量并上传（不再等待滞后剔废）。
-                        if can_late_reject.value and not is_current_event_rejected and current_pane_ng_buffer:
-                            # 立即上传策略：该调用占位以便未来恢复批量上传
-                            upload_current_pane_if_needed()
-                            current_pane_ng_buffer.clear()
-                            current_pane_reports.clear()
-                            current_pane_folder = None
-                            pane_ng_frame_counter = 0
-                            with stats_lock:
-                                total_yield += 1
-                                shared_yield_counter.value = total_yield
-                                yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
-                            broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                            can_late_reject.value = False
-                            print("    [状态机]: 上一片未滞后剔废，已自动计入产量并上传。")
+                        # 不再支持滞后剔废：无需处理上一片的延迟上传
                         machine_state = "PANE_DETECTED"
                         machine_state_shared.value = 1
                         # 采集模式下：进入时统一递增 pane 序号并置为激活
