@@ -736,6 +736,136 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         except Exception:
             continue
 
+    # 新增：在移除直线后的 Canny 图像上寻找“曲边”并作为斜边（曲边）标注
+    skew_curved_defects = []
+    try:
+        if binary_edges is not None and roi_gray is not None and len(true_edges) > 0:
+            edges_wo = binary_edges.copy()
+            # 去掉主边：用适度厚度涂黑（将主边延长到与 ROI 边界相交后再涂抹）
+            try:
+                remove_thickness = int(params.get('DEFECT_DETECTION', {}).get('SKEW_CURVED_REMOVE_LINE_THICKNESS_PX', 5))
+            except Exception:
+                remove_thickness = 5
+            def _extend_line_to_roi(seg, w, h):
+                # 将线段所在直线延长，与 ROI 边界(x=0,x=w-1,y=0,y=h-1)求交，得到两交点
+                x1, y1, x2, y2 = map(float, seg)
+                dx = x2 - x1; dy = y2 - y1
+                candidates = []
+                eps = 1e-9
+                # 与 x = 0, x = w-1 相交
+                if abs(dx) > eps:
+                    t0 = (0.0 - x1) / dx
+                    y_at_0 = y1 + t0 * dy
+                    if 0.0 <= y_at_0 <= (h - 1):
+                        candidates.append((0.0, y_at_0))
+                    tW = ((w - 1.0) - x1) / dx
+                    y_at_W = y1 + tW * dy
+                    if 0.0 <= y_at_W <= (h - 1):
+                        candidates.append((w - 1.0, y_at_W))
+                # 与 y = 0, y = h-1 相交
+                if abs(dy) > eps:
+                    tT = (0.0 - y1) / dy
+                    x_at_T = x1 + tT * dx
+                    if 0.0 <= x_at_T <= (w - 1):
+                        candidates.append((x_at_T, 0.0))
+                    tB = ((h - 1.0) - y1) / dy
+                    x_at_B = x1 + tB * dx
+                    if 0.0 <= x_at_B <= (w - 1):
+                        candidates.append((x_at_B, (h - 1.0)))
+                # 去重并取两个最远的点作为端点
+                if len(candidates) < 2:
+                    return (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2)))
+                # 去重（四舍五入到整数像素坐标以稳健）
+                uniq = []
+                for px, py in candidates:
+                    pt = (int(round(px)), int(round(py)))
+                    if pt not in uniq:
+                        uniq.append(pt)
+                if len(uniq) < 2:
+                    return (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2)))
+                # 选择距离和最大的两点
+                max_d = -1.0; best = (uniq[0], uniq[1])
+                for a in range(len(uniq)):
+                    for b in range(a+1, len(uniq)):
+                        d = (uniq[a][0]-uniq[b][0])**2 + (uniq[a][1]-uniq[b][1])**2
+                        if d > max_d:
+                            max_d = d; best = (uniq[a], uniq[b])
+                return best
+            for e in true_edges:
+                P1, P2 = _extend_line_to_roi(e, roi_w, roi_h)
+                cv2.line(edges_wo, P1, P2, 0, thickness=max(1, remove_thickness))
+
+            # 轮廓提取
+            contours, _ = cv2.findContours(edges_wo, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            if contours:
+                try:
+                    min_arc_len_px = float(params.get('DEFECT_DETECTION', {}).get('SKEW_CURVED_MIN_ARC_LEN_PX', 320.0))
+                except Exception:
+                    min_arc_len_px = 320.0
+                try:
+                    max_dev_ratio = float(params.get('DEFECT_DETECTION', {}).get('SKEW_CURVED_MAX_DEV_RATIO', 0.08))
+                except Exception:
+                    max_dev_ratio = 0.08
+                for cnt in contours:
+                    if cnt is None or len(cnt) < 10:
+                        continue
+                    arc = float(cv2.arcLength(cnt, False))
+                    if arc < min_arc_len_px:
+                        continue
+                    pts = cnt.reshape(-1, 2).astype(np.float32)
+                    # 拟合直线评估线性偏离
+                    try:
+                        line_params = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
+                        vx, vy, x0, y0 = [float(v) for v in line_params.flatten()]
+                    except Exception:
+                        continue
+                    if abs(vx) < 1e-6 and abs(vy) < 1e-6:
+                        continue
+                    # 计算最大垂直偏离 / 参考长度（外接框长边）
+                    diffs = pts - np.array([x0, y0], dtype=np.float32)
+                    # 垂直距离：|(-vy, vx) · diff|
+                    max_dev = float(np.max(np.abs((-vy) * diffs[:, 0] + (vx) * diffs[:, 1]))) / (vx*vx + vy*vy) ** 0.5
+                    x, y, w, h = cv2.boundingRect(pts.astype(np.int32))
+                    L_ref = float(max(w, h)) if max(w, h) > 0 else float(arc)
+                    if L_ref <= 1.0:
+                        continue
+                    ratio = max_dev / L_ref
+                    if ratio >= max_dev_ratio:
+                        # 计算曲率角：用轮廓起始段与末端段的切线夹角作为近似（取[0,90]）
+                        try:
+                            n_pts = pts.shape[0]
+                            win = max(5, int(0.1 * n_pts))
+                            if n_pts >= 2 * win:
+                                seg1 = pts[:win]
+                                seg2 = pts[-win:]
+                                l1 = cv2.fitLine(seg1, cv2.DIST_L2, 0, 0.01, 0.01)
+                                l2 = cv2.fitLine(seg2, cv2.DIST_L2, 0, 0.01, 0.01)
+                                vx1, vy1 = float(l1[0]), float(l1[1])
+                                vx2, vy2 = float(l2[0]), float(l2[1])
+                                u1 = np.array([vx1, vy1], dtype=float); u2 = np.array([vx2, vy2], dtype=float)
+                                n1 = float(np.linalg.norm(u1)); n2 = float(np.linalg.norm(u2))
+                                if n1 > 1e-9 and n2 > 1e-9:
+                                    u1 /= n1; u2 /= n2
+                                    cosv = abs(float(np.dot(u1, u2)))
+                                    cosv = max(0.0, min(1.0, cosv))
+                                    curv_angle_deg = float(np.degrees(np.arccos(cosv)))
+                                else:
+                                    curv_angle_deg = 0.0
+                            else:
+                                curv_angle_deg = 0.0
+                        except Exception:
+                            curv_angle_deg = 0.0
+                        # 作为“斜边：曲边”输出，并在报告中写入曲率角
+                        box = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.int32)
+                        skew_curved_defects.append({
+                            'type': 'X',
+                            'box_points': box,
+                            'skew_subtype': 'curved',
+                            'skew_angle_deg': float(curv_angle_deg)
+                        })
+    except Exception:
+        pass
+
     # 计算某条主边缘“线段像素”的均值亮度（厚度=1px），用于缺角亮度门控
     def _edge_line_mean(edge_line):
         p1 = tuple(map(int, edge_line[:2]))
@@ -1215,8 +1345,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         # 合并结果 = 其他类型 + 不参与合并的小 B + 合并后的 B
         surviving_chipping_defects = others + b_small_list + fused_b_list
             
-    # 合并输出缺陷：角点/崩边/斜边
-    return edges_for_drawing, corner_defects + surviving_chipping_defects + skew_line_defects
+    # 合并输出缺陷：角点/崩边/斜边（直线）/斜边（曲边）
+    return edges_for_drawing, corner_defects + surviving_chipping_defects + skew_line_defects + skew_curved_defects
 
 
 def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm):
@@ -1291,15 +1421,26 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     center = np.mean(box_np, axis=0)
                     location['x'] = int(center[0] + x)
                     location['y'] = int(center[1] + y)
-                    # 角度记录为与竖直边夹角
-                    try:
-                        location['angle'] = float(round(defect.get('skew_angle_deg', 0.0), 2))
-                    except Exception:
-                        location['angle'] = float(round(defect.get('angle', 0.0), 2))
+                    # 记录角度：曲边则为“曲率角”，其余为与垂直参考的夹角
+                    if str(defect.get('skew_subtype', '')) == 'curved':
+                        location['subtype'] = 'curved'
+                        try:
+                            location['angle'] = float(round(defect.get('skew_angle_deg', 0.0), 2))
+                        except Exception:
+                            location['angle'] = 0.0
+                    else:
+                        try:
+                            location['angle'] = float(round(defect.get('skew_angle_deg', 0.0), 2))
+                        except Exception:
+                            location['angle'] = float(round(defect.get('angle', 0.0), 2))
                 else:
                     location['x'] = x
                     location['y'] = y
-                    location['angle'] = float(round(defect.get('skew_angle_deg', 0.0), 2))
+                    if str(defect.get('skew_subtype', '')) == 'curved':
+                        location['subtype'] = 'curved'
+                        location['angle'] = float(round(defect.get('skew_angle_deg', 0.0), 2))
+                    else:
+                        location['angle'] = float(round(defect.get('skew_angle_deg', 0.0), 2))
             else:
                 center = defect.get('center', (0, 0))
                 location['x'] = int(center[0] + x)
@@ -1647,7 +1788,11 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         type_str = defect_type_map.get(defect_report['type'], '未知')
         
         if defect_report['type'] == 'X':
-            text = f"{type_str}: ({loc['x']}, {loc['y']}), 角度: {loc['angle']:.1f}°"
+            # 若为曲边，展示曲率角；否则展示与垂直参考的夹角
+            if loc.get('subtype') == 'curved' or (defect.get('skew_subtype', '') == 'curved'):
+                text = f"{type_str}：曲边: ({loc['x']}, {loc['y']}), 角度: {loc.get('angle', 0.0):.1f}°"
+            else:
+                text = f"{type_str}: ({loc['x']}, {loc['y']}), 角度: {loc.get('angle', 0.0):.1f}°"
         elif defect_report['type'] == 'Q' and 'pixel_area' in loc:
             text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm"
         else:

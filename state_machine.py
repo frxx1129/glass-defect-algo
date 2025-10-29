@@ -61,9 +61,9 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     absence_streak = 0
     # 新增：玻璃进入后的最大持续时间（秒），超时强制退出
     try:
-        pane_max_duration_s = float(getattr(shared_settings, 'pane_max_duration_s', 5.0) or 5.0)
+        pane_max_duration_s = float(getattr(shared_settings, 'pane_max_duration_s', 10.0) or 10.0)
     except Exception:
-        pane_max_duration_s = 5.0
+        pane_max_duration_s = 10.0
     pane_enter_time_s = None
 
     # 自动分路：每片玻璃内的 NG 汇聚与一次性触发
