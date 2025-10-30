@@ -446,91 +446,23 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float):
                 ref_line = group[0]; p1, p2 = ref_line[0:2], ref_line[2:4]
                 vec_line = p2 - p1; line_length = np.linalg.norm(vec_line)
                 if line_length > 1e-6:
-                    # 以毫米配置的横向距离容差（换算为像素）
+                    # 使用统一的“点到直线的垂直距离”作为聚类准则，阈值仅依赖 MAX_LATERAL_DISTANCE[_MM]
                     max_lat_dist_px = _get_dist_px(p, "MAX_LATERAL_DISTANCE_MM", "MAX_LATERAL_DISTANCE", None, pixels_per_mm)
-                    # 轴向判断阈值（度），近水平用“垂直(y)距离”，近垂直用“横向(x)距离”，否则用一般的垂线距离
-                    try:
-                        axis_tol_deg = float(p.get("AXIS_ORIENTATION_TOL_DEG", p.get("ANGLE_TOLERANCE", 1.5)))
-                    except Exception:
-                        axis_tol_deg = 1.5
-                    dx, dy = float(vec_line[0]), float(vec_line[1])
-                    ang = abs(np.degrees(np.arctan2(dy, dx)))
-                    if ang > 90.0:
-                        ang = 180.0 - ang  # 归一到 [0,90]
-
-                    dist_val = None
-                    # 近水平：比较垂直距离（y 轴方向差）
-                    if ang <= axis_tol_deg and abs(dx) > 1e-6:
-                        y_on_line = p1[1] + (dy / dx) * (mid_point[0] - p1[0])
-                        dist_val = abs(mid_point[1] - y_on_line)
-                    # 近垂直：比较横向距离（x 轴方向差）
-                    elif abs(ang - 90.0) <= axis_tol_deg and abs(dy) > 1e-6:
-                        x_on_line = p1[0] + (dx / dy) * (mid_point[1] - p1[1])
-                        dist_val = abs(mid_point[0] - x_on_line)
-                    else:
-                        # 通用：点到直线的垂直距离
-                        vec2 = p1 - mid_point
-                        cross_product_2d = vec_line[0] * vec2[1] - vec_line[1] * vec2[0]
-                        dist_val = abs(cross_product_2d) / line_length
-
+                    vec2 = p1 - mid_point
+                    cross_product_2d = vec_line[0] * vec2[1] - vec_line[1] * vec2[0]
+                    dist_val = abs(cross_product_2d) / line_length
                     if dist_val < max_lat_dist_px:
-                        # 追加轴向分离阈值：防止同角度但沿轴向相距过远的线段被合并
-                        try:
-                            max_long_sep_px = _get_dist_px(p, "MAX_LONGITUDINAL_SEPARATION_MM", "MAX_LONGITUDINAL_SEPARATION", None, pixels_per_mm)
-                        except Exception:
-                            max_long_sep_px = None
-                        if max_long_sep_px is None:
-                            max_long_sep_px = 20.0  # 默认 20px
-                        ref_mid = np.array([(p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0], dtype=float)
-                        if ang <= axis_tol_deg:
-                            long_sep = abs(float(mid_point[0] - ref_mid[0]))
-                        elif abs(ang - 90.0) <= axis_tol_deg:
-                            long_sep = abs(float(mid_point[1] - ref_mid[1]))
-                        else:
-                            u = vec_line / line_length
-                            t_mid = float(np.dot(mid_point - p1, u))
-                            t_ref = float(np.dot(ref_mid - p1, u))
-                            long_sep = abs(t_mid - t_ref)
-
-                        if long_sep <= float(max_long_sep_px):
-                            group.append(segment); placed = True; break
+                        group.append(segment); placed = True; break
             if not placed: proximity_groups.append([segment])
         final_line_groups.extend(proximity_groups)
     merged_lines_with_scores = []
     for group in final_line_groups:
         points = np.array([pt for line in group for pt in (line[0:2], line[2:4])], dtype=np.float32)
-        if len(points) < 2: 
+        if len(points) < 2:
             continue
-        # 方向估计：长度加权的单位方向平均（对齐符号），回退 fitLine
-        try:
-            # 选择参考方向：组内最长线段
-            segs = [np.array([g[0], g[1], g[2], g[3]], dtype=float) for g in group]
-            lengths = [float(np.linalg.norm(s[2:4] - s[0:2])) for s in segs]
-            if not lengths or max(lengths) <= 1e-6:
-                raise ValueError("degenerate group")
-            ref_idx = int(np.argmax(lengths))
-            ref_vec = segs[ref_idx][2:4] - segs[ref_idx][0:2]
-            ref_u = ref_vec / float(np.linalg.norm(ref_vec))
-            acc = np.zeros(2, dtype=float)
-            for s, L in zip(segs, lengths):
-                if L <= 1e-6:
-                    continue
-                v = s[2:4] - s[0:2]
-                u = v / L
-                # 对齐符号，避免相反方向相互抵消
-                if np.dot(u, ref_u) < 0:
-                    u = -u
-                acc += (L * u)
-            norm_acc = float(np.linalg.norm(acc))
-            if norm_acc <= 1e-6:
-                raise ValueError("acc zero")
-            vx, vy = (acc / norm_acc).tolist()
-            # 基点用端点均值
-            x0 = float(np.mean(points[:, 0])); y0 = float(np.mean(points[:, 1]))
-        except Exception:
-            # 回退：使用 fitLine 结果
-            line_params = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
-            vx, vy, x0, y0 = line_params.flatten()
+        # 简化：直接使用 fitLine 估计方向与基点
+        line_params = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
+        vx, vy, x0, y0 = line_params.flatten()
         projected = (points[:, 0] - x0) * vx + (points[:, 1] - y0) * vy
         pt1, pt2 = points[np.argmin(projected)], points[np.argmax(projected)]
         final_merged_line = np.array([pt1[0], pt1[1], pt2[0], pt2[1]])
