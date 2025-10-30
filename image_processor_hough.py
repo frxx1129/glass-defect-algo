@@ -421,7 +421,7 @@ def preprocess_for_hough_enhanced(roi_gray, params):
     enhanced_contrast = clahe.apply(blurred)
     return cv2.Canny(enhanced_contrast, p["CANNY_THRESHOLD_LOW"], p["CANNY_THRESHOLD_HIGH"])
 
-def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float):
+def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img=None):
     if lines is None or len(lines) < 1: return []
     p = params["LINE_MERGING"]
     lines_np = np.array(lines).reshape(-int(len(lines)), 4)
@@ -452,7 +452,49 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float):
                     cross_product_2d = vec_line[0] * vec2[1] - vec_line[1] * vec2[0]
                     dist_val = abs(cross_product_2d) / line_length
                     if dist_val < max_lat_dist_px:
-                        group.append(segment); placed = True; break
+                        # 基于 Canny 的“缝隙”检查：若沿法线方向存在足够长的无边缘像素区间，则不合并
+                        allowed_merge = True
+                        if edge_img is not None:
+                                # 参考线单位方向 u 及其法线方向 w（从垂足到候选中点）
+                                u = (vec_line / line_length).astype(float)
+                                # 候选中点在参考线上的垂足 p_perp
+                                t_proj = float(np.dot(mid_point - p1, u))
+                                p_perp = p1 + t_proj * u
+                                d_vec = mid_point - p_perp
+                                gap_len = float(np.linalg.norm(d_vec))
+                                if gap_len > 1.0:
+                                    steps = int(np.ceil(gap_len))
+                                    step_vec = d_vec / steps
+                                    # 通道半宽复用现有参数（像素）
+                                    stripe_half = int(max(1, int(params.get('DEFECT_DETECTION', {}).get('Q_CANNY_STRIPE_HALF_WIDTH_PX', 2))))
+                                    GAP_NO_EDGE_PX = 30  # 硬编码：最大连续无边缘长度阈值
+                                    max_run = 0
+                                    run = 0
+                                    h, w_img = edge_img.shape[:2]
+                                    for i in range(steps + 1):
+                                        c = p_perp + step_vec * i
+                                        cx = int(round(float(c[0])))
+                                        cy = int(round(float(c[1])))
+                                        hit = False
+                                        x0 = max(0, cx - stripe_half); x1 = min(w_img - 1, cx + stripe_half)
+                                        y0 = max(0, cy - stripe_half); y1 = min(h - 1, cy + stripe_half)
+                                        if x0 <= x1 and y0 <= y1:
+                                            roi = edge_img[y0:y1+1, x0:x1+1]
+                                            # 任一像素有边缘即视为命中
+                                            if np.any(roi > 0):
+                                                hit = True
+                                        if hit:
+                                            run = 0
+                                        else:
+                                            run += 1
+                                            if run > max_run:
+                                                max_run = run
+                                                if max_run >= GAP_NO_EDGE_PX:
+                                                    allowed_merge = False
+                                                    break
+                        # 若过程中任何异常，保持 allowed_merge 默认值（True）
+                        if allowed_merge:
+                            group.append(segment); placed = True; break
             if not placed: proximity_groups.append([segment])
         final_line_groups.extend(proximity_groups)
     merged_lines_with_scores = []
@@ -1415,7 +1457,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     max_line_gap_px = _get_dist_px(p_hough, "MAX_LINE_GAP_MM", "MAX_LINE_GAP", None, pixels_per_mm)
     raw_lines = cv2.HoughLinesP(binary_edges, 1, np.pi / 180, p_hough["THRESHOLD"], minLineLength=min_len_pixels, maxLineGap=max_line_gap_px)
     
-    main_edges = merge_lines_and_get_main_edges(raw_lines, params, pixels_per_mm)
+    main_edges = merge_lines_and_get_main_edges(raw_lines, params, pixels_per_mm, edge_img=binary_edges)
     edges_for_drawing, all_defects = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, params, pixels_per_mm, binary_edges)
 
     # 构建“主边端点扫描带”掩膜：长度默认20mm（可通过 DEFECT_DETECTION.L_ENDPOINT_BELT_LENGTH_MM 配置），
