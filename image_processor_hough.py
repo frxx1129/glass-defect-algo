@@ -367,9 +367,7 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm: floa
                 if cv2.contourArea(cnt) > min_area_px2:
                     contour_mask = np.zeros_like(roi_gray)
                     cv2.drawContours(contour_mask, [cnt], -1, 255, -1)
-                    
                     mean_grad_val = cv2.mean(grad_mag, mask=contour_mask)[0]
-
                     if mean_grad_val > min_gradient_threshold:
                         initial_contours.append(cnt)
     
@@ -382,7 +380,6 @@ def find_gradient_endpoint(start_point, line_vec_normalized, roi_gray_blurred, m
     half_width = (search_width - 1) // 2
 
     last_avg_intensity = -1.0
-
     for i in range(3, int(max_search_dist)):
         current_center = start_point + i * line_vec_normalized
         
@@ -397,8 +394,7 @@ def find_gradient_endpoint(start_point, line_vec_normalized, roi_gray_blurred, m
             px, py = int(p[0]), int(p[1])
             if 0 <= px < w and 0 <= py < h:
                 intensities.append(roi_gray_blurred[py, px])
-                valid_coords.append(p)
-
+        
         if not intensities:
             continue
 
@@ -450,12 +446,54 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float):
                 ref_line = group[0]; p1, p2 = ref_line[0:2], ref_line[2:4]
                 vec_line = p2 - p1; line_length = np.linalg.norm(vec_line)
                 if line_length > 1e-6:
-                    vec2 = p1 - mid_point
-                    cross_product_2d = vec_line[0] * vec2[1] - vec_line[1] * vec2[0]
-                    # 以毫米配置的横向距离容差
+                    # 以毫米配置的横向距离容差（换算为像素）
                     max_lat_dist_px = _get_dist_px(p, "MAX_LATERAL_DISTANCE_MM", "MAX_LATERAL_DISTANCE", None, pixels_per_mm)
-                    if np.abs(cross_product_2d) / line_length < max_lat_dist_px:
-                        group.append(segment); placed = True; break
+                    # 轴向判断阈值（度），近水平用“垂直(y)距离”，近垂直用“横向(x)距离”，否则用一般的垂线距离
+                    try:
+                        axis_tol_deg = float(p.get("AXIS_ORIENTATION_TOL_DEG", p.get("ANGLE_TOLERANCE", 1.5)))
+                    except Exception:
+                        axis_tol_deg = 1.5
+                    dx, dy = float(vec_line[0]), float(vec_line[1])
+                    ang = abs(np.degrees(np.arctan2(dy, dx)))
+                    if ang > 90.0:
+                        ang = 180.0 - ang  # 归一到 [0,90]
+
+                    dist_val = None
+                    # 近水平：比较垂直距离（y 轴方向差）
+                    if ang <= axis_tol_deg and abs(dx) > 1e-6:
+                        y_on_line = p1[1] + (dy / dx) * (mid_point[0] - p1[0])
+                        dist_val = abs(mid_point[1] - y_on_line)
+                    # 近垂直：比较横向距离（x 轴方向差）
+                    elif abs(ang - 90.0) <= axis_tol_deg and abs(dy) > 1e-6:
+                        x_on_line = p1[0] + (dx / dy) * (mid_point[1] - p1[1])
+                        dist_val = abs(mid_point[0] - x_on_line)
+                    else:
+                        # 通用：点到直线的垂直距离
+                        vec2 = p1 - mid_point
+                        cross_product_2d = vec_line[0] * vec2[1] - vec_line[1] * vec2[0]
+                        dist_val = abs(cross_product_2d) / line_length
+
+                    if dist_val < max_lat_dist_px:
+                        # 追加轴向分离阈值：防止同角度但沿轴向相距过远的线段被合并
+                        try:
+                            max_long_sep_px = _get_dist_px(p, "MAX_LONGITUDINAL_SEPARATION_MM", "MAX_LONGITUDINAL_SEPARATION", None, pixels_per_mm)
+                        except Exception:
+                            max_long_sep_px = None
+                        if max_long_sep_px is None:
+                            max_long_sep_px = 20.0  # 默认 20px
+                        ref_mid = np.array([(p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0], dtype=float)
+                        if ang <= axis_tol_deg:
+                            long_sep = abs(float(mid_point[0] - ref_mid[0]))
+                        elif abs(ang - 90.0) <= axis_tol_deg:
+                            long_sep = abs(float(mid_point[1] - ref_mid[1]))
+                        else:
+                            u = vec_line / line_length
+                            t_mid = float(np.dot(mid_point - p1, u))
+                            t_ref = float(np.dot(ref_mid - p1, u))
+                            long_sep = abs(t_mid - t_ref)
+
+                        if long_sep <= float(max_long_sep_px):
+                            group.append(segment); placed = True; break
             if not placed: proximity_groups.append([segment])
         final_line_groups.extend(proximity_groups)
     merged_lines_with_scores = []
@@ -806,6 +844,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     max_dev_ratio = float(params.get('DEFECT_DETECTION', {}).get('SKEW_CURVED_MAX_DEV_RATIO', 0.08))
                 except Exception:
                     max_dev_ratio = 0.08
+                # 新增：曲率角最小阈值（度），小于该阈值的曲边不输出
+                try:
+                    min_curv_angle_deg = float(params.get('DEFECT_DETECTION', {}).get('SKEW_CURVED_MIN_CURV_ANGLE_DEG', 10.0))
+                except Exception:
+                    min_curv_angle_deg = 10.0
                 for cnt in contours:
                     if cnt is None or len(cnt) < 10:
                         continue
@@ -855,14 +898,16 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                 curv_angle_deg = 0.0
                         except Exception:
                             curv_angle_deg = 0.0
-                        # 作为“斜边：曲边”输出，并在报告中写入曲率角
-                        box = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.int32)
-                        skew_curved_defects.append({
-                            'type': 'X',
-                            'box_points': box,
-                            'skew_subtype': 'curved',
-                            'skew_angle_deg': float(curv_angle_deg)
-                        })
+                        # 过滤曲率角过小的曲边（< min_curv_angle_deg）
+                        if curv_angle_deg >= min_curv_angle_deg:
+                            # 作为“斜边：曲边”输出，并在报告中写入曲率角
+                            box = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.int32)
+                            skew_curved_defects.append({
+                                'type': 'X',
+                                'box_points': box,
+                                'skew_subtype': 'curved',
+                                'skew_angle_deg': float(curv_angle_deg)
+                            })
     except Exception:
         pass
 
@@ -1852,10 +1897,10 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
     
-    #for edge in edges_for_drawing:
-    #    pt1 = tuple(map(int, edge[:2]))
-    #    pt2 = tuple(map(int, edge[2:]))
-    #    cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
+    for edge in edges_for_drawing:
+        pt1 = tuple(map(int, edge[:2]))
+        pt2 = tuple(map(int, edge[2:]))
+        cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
     annotations_to_draw = []
     
     for defect_report in final_defects_for_report:
