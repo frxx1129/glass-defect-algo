@@ -743,7 +743,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             edges_wo = binary_edges.copy()
             # 去掉主边：用适度厚度涂黑（将主边延长到与 ROI 边界相交后再涂抹）
             try:
-                remove_thickness = int(params.get('DEFECT_DETECTION', {}).get('SKEW_CURVED_REMOVE_LINE_THICKNESS_PX', 5))
+                remove_thickness = int(params.get('DEFECT_DETECTION', {}).get('SKEW_CURVED_REMOVE_LINE_THICKNESS_PX', 10))
             except Exception:
                 remove_thickness = 5
             def _extend_line_to_roi(seg, w, h):
@@ -799,9 +799,9 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             contours, _ = cv2.findContours(edges_wo, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             if contours:
                 try:
-                    min_arc_len_px = float(params.get('DEFECT_DETECTION', {}).get('SKEW_CURVED_MIN_ARC_LEN_PX', 700.0))
+                    min_arc_len_px = float(params.get('DEFECT_DETECTION', {}).get('SKEW_CURVED_MIN_ARC_LEN_PX', 800.0))
                 except Exception:
-                    min_arc_len_px = 700.0
+                    min_arc_len_px = 800.0
                 try:
                     max_dev_ratio = float(params.get('DEFECT_DETECTION', {}).get('SKEW_CURVED_MAX_DEV_RATIO', 0.08))
                 except Exception:
@@ -1069,9 +1069,9 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         base_mean = (edge_mean1 + edge_mean2) / 2.0
                         brightness_diff = abs(base_mean - tri_mean)
                         try:
-                            q_min_diff = float(params.get('DEFECT_DETECTION', {}).get('Q_BRIGHTNESS_MIN_DIFF', 10.0))
+                            q_min_diff = float(params.get('DEFECT_DETECTION', {}).get('Q_BRIGHTNESS_MIN_DIFF', 15.0))
                         except Exception:
-                            q_min_diff = 8.0
+                            q_min_diff = 15.0
                         if brightness_diff >= q_min_diff:
                             corner_defects.append({
                                 "type": "Q",

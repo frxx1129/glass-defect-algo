@@ -77,40 +77,71 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     last_result_by_cam = {}        # 最近一帧NG结果（含缺陷坐标）的引用
     auto_first_ng_ts_ms = None     # 第一次检测到NG的时间（毫秒）
 
-    def _decide_route_for_auto(expected_cams: int, ng_cams: set) -> str | None:
-        """依据规则决定路由：返回 'left' | 'mid' | 'right' | 'all' 或 None(尚未能决定)。
-        - 公共：len(ng_cams) >= 3 -> 'all'
-        - 4相机：{1,2} -> 'mid'；包含{2,3} -> 'left'；包含{0,1} -> 'right'；单相机2/3->left，0/1->right
-        - 5相机：{1,2}或{2,3} -> 'mid'；{3,4} -> 'left'；{0,1} -> 'right'；仅{2} -> None（坐标判定）；单相机3/4->left，0/1->right
+    def _get_line_mark_info(shared_settings):
+        """获取当前产线的标记映射信息：
+        - return (max_mark, line_map) 其中 max_mark 为该 line 下的最大标记（int），line_map 为 {str(mark): channel}
+        - 若未配置，则回退为 max_mark=3 且 line_map={}（实际触发层将按 mark+1 映射）
+        """
+        try:
+            line_name = str(getattr(shared_settings, 'lineName', 'Line1'))
+        except Exception:
+            line_name = 'Line1'
+        try:
+            all_map = getattr(shared_settings, 'rejection_mark_to_channel', {})
+        except Exception:
+            all_map = {}
+        line_map = {}
+        if isinstance(all_map, dict):
+            line_map = all_map.get(line_name) or {}
+        max_mark = 3
+        try:
+            keys = [int(k) for k in line_map.keys()] if isinstance(line_map, dict) else []
+            if keys:
+                max_mark = max(keys)
+        except Exception:
+            pass
+        return max_mark, line_map
+
+    def _decide_route_marks_for_auto(expected_cams: int, ng_cams: set, shared_settings) -> list[int] | None:
+        """依据规则决定'标记'(0..max_mark) 列表，用于剔废触发；不再返回语义字符串。
+        约定：
+        - 0 表示“整片撤清”；
+        - 1 表示偏左端；2 表示中间；最大标记(max_mark，通常3或4)表示偏右端；
+        - 实际通道由 rejection_control 中按 lineName 映射决定。
         """
         cams = set(ng_cams)
+        max_mark, _ = _get_line_mark_info(shared_settings)
+        center = (expected_cams - 1) / 2.0 if expected_cams > 0 else 1.5
         if len(cams) >= 3:
-            return 'all'
+            return [0]
         if expected_cams == 4:
+            # 0,1,2,3 索引；对称两切常见于 cam1 或 cam2 出现双竖直
+            # 由外部“竖直线统计”逻辑优先判断，这里仅按 NG 分布兜底
             if {1, 2}.issubset(cams):
-                return 'mid'
+                return [2]
             if {2, 3}.issubset(cams):
-                return 'left'
+                return [1]
             if {0, 1}.issubset(cams):
-                return 'right'
+                return [max_mark]
             if cams.issubset({2, 3}) and len(cams) >= 1:
-                return 'left'
+                return [1]
             if cams.issubset({0, 1}) and len(cams) >= 1:
-                return 'right'
+                return [max_mark]
             return None
         if expected_cams == 5:
             if {1, 2}.issubset(cams) or {2, 3}.issubset(cams):
-                return 'mid'
+                return [2]
             if {3, 4}.issubset(cams):
-                return 'left'
+                return [1]
             if {0, 1}.issubset(cams):
-                return 'right'
+                return [max_mark]
             if cams == {2}:
+                # 中间单相机，需用坐标另判左右，外层已处理；此处返回 None 等待坐标判定
                 return None
             if cams.issubset({3, 4}) and len(cams) >= 1:
-                return 'left'
+                return [1]
             if cams.issubset({0, 1}) and len(cams) >= 1:
-                return 'right'
+                return [max_mark]
             return None
         return None
 
@@ -163,59 +194,113 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             pass
         return 0
 
-    def _decide_reject_marks_by_vertical_counts(line_name: str, cam_vertical_counts: dict, expected_cams: int) -> list[int] | None:
-        """根据“各相机的近竖直主边数量”估计切割形态并返回要触发的通道列表（与底层触发保持兼容）。
-
-        改动要点：
-        1) 若判断为“未切割”，则直接全部撤清 -> 返回 [4]（route=4，对应 ALL）。
-        2) 若出现“不平均切分，仅两块”的场景：当“双竖直线”集中出现在同一侧相机上，认为是边缘+大块两段：
-           - 边缘侧只触发单个撤清（左侧 -> 1，右侧 -> 3）；
-           - 大块（偏中间）触发“其余撤清” -> 4（ALL）。
-        3) 其它情况沿用原逻辑（1切割 -> 返回 [1,3]；2切割 -> 返回 [1,2,3]）。
+    def _estimate_piece_count(cam_vertical_counts: dict) -> int:
+        """根据每相机的近竖直线数量估计切割片数（1~4）。
+        粗略规则：cut_count = min( len([ci for cnt>=2]), 3 ); piece_count = cut_count + 1。
         """
-        if not cam_vertical_counts:
-            return [4]
-
-        # 收集“两条竖直”的相机索引
-        two_line_cams = sorted([ci for ci, cnt in cam_vertical_counts.items() if int(cnt or 0) >= 2])
-        max_cnt = max(int(v or 0) for v in cam_vertical_counts.values())
-
-        # 1) 未切割：所有相机≤1条竖直主边 -> 全部撤清（route=4）
-        if max_cnt <= 1:
-            return [4]
-
-        # 定义左右侧辅助判断
         try:
-            n = int(expected_cams or 0)
+            indicators = [ci for ci, cnt in cam_vertical_counts.items() if int(cnt or 0) >= 2]
+            cut_count = min(len(indicators), 3)
+            return cut_count + 1 if cut_count >= 1 else 1
         except Exception:
-            n = 0
-        center = (n - 1) / 2.0 if n > 0 else 1.5  # 4相机->1.5，5相机->2.0
-        def _is_left(ci: int) -> bool:
-            return ci < center
-        def _is_right(ci: int) -> bool:
-            return ci > center
+            return 1
 
-        # 2) 一切二：恰好一个相机两条
-        if len(two_line_cams) == 1:
-            # 保持双侧触发（与原有现场习惯一致）：左+右 -> [1,3]
-            return [1, 3]
+    def _gather_defect_centers_for_cam(result_obj: dict) -> list[float]:
+        """提取单相机内缺陷的 x 中心（像素）。优先 location(x,width)，否则 center[0]；无法得到返回空。"""
+        xs = []
+        try:
+            for d in result_obj.get('defects', []):
+                loc = d.get('location', {}) if isinstance(d.get('location'), dict) else {}
+                if 'x' in loc and 'width' in loc:
+                    try:
+                        xs.append(float(loc.get('x', 0) or 0) + float(loc.get('width', 0) or 0) / 2.0)
+                        continue
+                    except Exception:
+                        pass
+                c = d.get('center')
+                if isinstance(c, (list, tuple)) and len(c) >= 2:
+                    try:
+                        xs.append(float(c[0]))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return xs
 
-        # 3) 两个相机两条
-        if len(two_line_cams) == 2:
-            a, b = two_line_cams[0], two_line_cams[1]
-            same_side_left = _is_left(a) and _is_left(b)
-            same_side_right = _is_right(a) and _is_right(b)
-            if same_side_left:
-                # 不平均切分 -> 左侧是小边缘块：先 1，再 4 清余下大块
-                return [1, 4]
-            if same_side_right:
-                # 不平均切分 -> 右侧是小边缘块：先 3，再 4 清余下大块
-                return [3, 4]
-            # 常规两切 -> 三段：左/中/右
-            return [1, 2, 3]
+    def _decide_marks_by_pieces_and_positions(cam_vertical_counts: dict, last_result_by_cam: dict, expected_cams: int, shared_settings) -> list[int] | None:
+        """依据估计的切片数（1~4）以及缺陷位置，返回需要触发的'标记'集合：
+        - 1 切 2 块 -> 允许 {0,1,2}，优先给出属于缺陷所在块的标记（1 或 2）；
+          中间相机(5路的cam2)用相机内 X 坐标区分左右（小->1，大->2）。
+        - 2 切 3 块 -> 允许 {0,1,2,3}，按全局位置映射至 1/2/3；
+        - 3 切 4 块 -> 允许 {0,1,2,3,4}，按全局位置映射至 1..4；
+        - 若无法判定，兜底 [0]。
+        """
+        piece_count = _estimate_piece_count(cam_vertical_counts)
+        if piece_count <= 1:
+            return [0]
 
-        # 4) 其它复杂或不确定情况：兜底全部撤清
-        return [4]
+        # 计算全局中心索引（相机序号）
+        n = int(expected_cams or 0)
+        center = (n - 1) / 2.0 if n > 0 else 1.5
+
+        # 收集“每个缺陷”的全局位置参数，简化为 (cam_index, x_center_px or None)
+        samples: list[tuple[int, float | None]] = []
+        for ci, res in last_result_by_cam.items():
+            try:
+                xs = _gather_defect_centers_for_cam(res)
+                if xs:
+                    for x in xs:
+                        samples.append((int(ci), float(x)))
+            except Exception:
+                continue
+
+        if not samples:
+            return [0]
+
+        # 获取相机宽度（用于中间相机的细分；若无则仅用相机序号粗分）
+        try:
+            cam_w = float(getattr(shared_settings, 'cam_width', 0) or 0)
+        except Exception:
+            cam_w = 0.0
+
+        marks: set[int] = set()
+        max_mark, _ = _get_line_mark_info(shared_settings)
+
+        # 将全局范围 [0,1] 均分为 piece_count 份；边界位于 i/piece_count
+        def _global_piece_index(ci: int, x_px: float | None) -> int:
+            # 计算全局位置 g ∈ [0,1]：g ≈ (ci + local_u)/n
+            if n <= 0:
+                return 1
+            if x_px is not None and cam_w > 1e-6:
+                local_u = min(1.0, max(0.0, x_px / cam_w))
+            else:
+                # 无 x 或无 cam_width：只按相机索引粗分
+                local_u = 0.5
+            g = (float(ci) + local_u) / float(n)
+            idx = int(np.floor(g * piece_count)) + 1
+            idx = min(max(1, idx), piece_count)
+            return idx
+
+        for ci, x in samples:
+            if piece_count == 2:
+                if ci < center:
+                    marks.add(1)
+                elif ci > center:
+                    marks.add(2)
+                else:
+                    # 中间相机：按 x 分左右
+                    if x is not None and cam_w > 1e-6:
+                        marks.add(1 if x < (cam_w / 2.0) else 2)
+                    else:
+                        marks.add(1)
+            elif piece_count in (3, 4):
+                marks.add(_global_piece_index(ci, x))
+            else:
+                marks.add(1)
+
+        # 将标记限制在 [1..max_mark] 范围内（0 保留为整片撤清，非此处产生）
+        final_marks = sorted({m for m in marks if 1 <= m <= max_mark})
+        return final_marks if final_marks else [0]
 
     def build_report_for_frame(result_obj, rejection_details_to_save):
         defects = result_obj.get('defects', [])
@@ -546,7 +631,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         now_ms = int(time.time() * 1000)
                         can_decide_time = (auto_first_ng_ts_ms is not None) and (now_ms - auto_first_ng_ts_ms >= hold_ms)
                         expected = int(getattr(shared_settings, 'expected_cameras', num_cameras) or num_cameras)
-                        route = _decide_route_for_auto(expected, auto_ng_cams)
+                        # 新：基于竖直线统计的'标记'决策（0 起始）
                         # 新增：基于竖直线统计的多路剔废逻辑
                         try:
                             # 汇总每个相机的“近竖直主边”数量
@@ -554,13 +639,13 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             for ci, res in last_result_by_cam.items():
                                 vertical_counts[ci] = _count_near_vertical_per_cam(res)
                             if vertical_counts:
-                                line_name = str(getattr(shared_settings, 'lineName', 'UNKNOWN')).strip()
-                                marks = _decide_reject_marks_by_vertical_counts(line_name, vertical_counts, expected)
+                                # 新规则：先估计切片数(由竖直线数量推断)，再结合缺陷位置计算应触发的标记集合
+                                marks = _decide_marks_by_pieces_and_positions(vertical_counts, last_result_by_cam, expected, shared_settings)
                                 if marks:
                                     is_current_event_rejected = True
                                     saved_for_this_pane = True
                                     rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
-                                    # 将 marks 列表直接作为 route 传入，由 rejection_control 逐一触发
+                                    # 将 '标记' 列表直接作为 route 传入，由剔废线程按 lineName 映射后“同步触发”
                                     rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index, marks))
                                     if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                                         try:
@@ -576,20 +661,28 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                     continue
                         except Exception as e:
                             print(f"[状态机]: 竖直线分路逻辑异常: {e}")
-                        if route is None and can_decide_time:
-                            # 特例：5路且仅cam2，根据坐标判定
+                        # 若未得到 marks，则按 NG 分布兜底生成 '标记' 路由
+                        marks_fallback = None
+                        if can_decide_time:
                             if expected == 5 and auto_ng_cams == {2}:
+                                # 用坐标决定左右 -> 1 或 max_mark
                                 base_res = last_result_by_cam.get(2)
                                 if base_res:
-                                    route = _decide_left_right_by_coord_for_cam2(base_res)
-                        # 仍未能决定，但已到达hold窗口，避免漏剔的兜底
-                        if route is None and can_decide_time and len(auto_ng_cams) >= 1:
-                            route = 'all' if len(auto_ng_cams) >= 3 else None
-                        if route is not None:
+                                    side = _decide_left_right_by_coord_for_cam2(base_res)
+                                    max_mark, _ = _get_line_mark_info(shared_settings)
+                                    if side == 'right':
+                                        marks_fallback = [1]
+                                    elif side == 'left':
+                                        marks_fallback = [max_mark]
+                            if marks_fallback is None and len(auto_ng_cams) >= 1:
+                                marks_fallback = _decide_route_marks_for_auto(expected, auto_ng_cams, shared_settings)
+                                if marks_fallback is None and len(auto_ng_cams) >= 3:
+                                    marks_fallback = [0]
+                        if marks_fallback is not None:
                             is_current_event_rejected = True
                             saved_for_this_pane = True
                             rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
-                            rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index, route))
+                            rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index, marks_fallback))
                             if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                                 try:
                                     alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
@@ -600,7 +693,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                 shared_rejection_counter.value = total_rejections
                                 yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
                             broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                            print(f"    [状态机]: 自动剔废触发，路由={route}，NG相机={sorted(list(auto_ng_cams))}")
+                            print(f"    [状态机]: 自动剔废触发，marks={marks_fallback}，NG相机={sorted(list(auto_ng_cams))}")
                     # 即时手动剔废：任何时候都可触发。始终执行硬件动作；仅在有NG缓存时才追加上传
                     elif manual_reject_flag.value:
                         is_current_event_rejected = True
