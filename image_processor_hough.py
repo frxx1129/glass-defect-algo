@@ -1073,44 +1073,69 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 )
 
                 if (new_p1 is not None) and (new_p2 is not None):
-                    # 亮度门控：三角形区域均值 vs. 两条主边“内侧平行四边形扫描带”均值 的平均值 之间的差异
+                    # 形态学门控（不依赖角点或条带跟踪）：基于距离变换的“扇形空洞”检测
+                    q_created = False
                     try:
-                        # 三角形区域（交点+两端点）
-                        tri_pts = np.array([intersection, new_p1, new_p2], dtype=np.int32).reshape(-1, 1, 2)
-                        tri_mask = np.zeros(roi_gray.shape, dtype=np.uint8)
-                        cv2.fillPoly(tri_mask, [tri_pts], 255)
-                        tri_mean = float(cv2.mean(roi_gray, mask=tri_mask)[0])
-                        # 三角形质心（用于确定边线的内/外侧）
-                        tri_centroid = np.mean(np.array([intersection, new_p1, new_p2], dtype=float), axis=0)
-                        # 基准亮度：两条主边的“内侧平行四边形扫描带（剔除边线与端点）”的均值
-                        edge_mean1 = float(_edge_baseline_parallelogram_mean(line1, tri_centroid))
-                        edge_mean2 = float(_edge_baseline_parallelogram_mean(line2, tri_centroid))
-                        base_mean = (edge_mean1 + edge_mean2) / 2.0
-                        brightness_diff = abs(base_mean - tri_mean)
-                        try:
-                            q_min_diff = float(params.get('DEFECT_DETECTION', {}).get('Q_BRIGHTNESS_MIN_DIFF', 15.0))
-                        except Exception:
-                            q_min_diff = 15.0
-                        if brightness_diff >= q_min_diff:
-                            corner_defects.append({
-                                "type": "Q",
-                                "center": tuple(map(int, intersection)),
-                                "endpoints": (new_p1, new_p2),
-                                "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])
-                            })
-                            q_created = True
-                        else:
-                            # 亮度差不足：不视为缺角
-                            q_created = False
+                        if binary_edges is not None:
+                            inter_pt = np.array(intersection, dtype=float)
+                            v1 = np.array(new_p1, dtype=float) - inter_pt
+                            v2 = np.array(new_p2, dtype=float) - inter_pt
+                            n1 = float(np.linalg.norm(v1)); n2 = float(np.linalg.norm(v2))
+                            if n1 > 1e-6 and n2 > 1e-6:
+                                u1 = v1 / n1; u2 = v2 / n2
+                                # 扇形朝向：直接采用两条直角边的方向（intersection -> new_p1/new_p2）
+
+                                # 构造“扇形三角形掩膜”：顶点 inter_pt，另外两点分别沿 u1/u2 半径 R
+                                R = float(min(50.0, n1, n2))
+                                A = inter_pt + u1 * R
+                                B = inter_pt + u2 * R
+                                tri = np.array([inter_pt, A, B], dtype=np.int32).reshape(-1, 1, 2)
+
+                                # 扇形内部“连续内边缘”证据：在扇形中部寻找足够长的连通边
+                                # 1) 扇形掩膜与内缩掩膜
+                                mask = np.zeros(roi_gray.shape, dtype=np.uint8)
+                                cv2.fillPoly(mask, [tri], 255)
+                                kernel3 = np.ones((3,3), np.uint8)
+                                mask_inner = cv2.erode(mask, kernel3, iterations=1)
+
+                                # 2) 连接 Canny 边缘并裁剪到扇形内侧
+                                try:
+                                    edges_thick = cv2.dilate(binary_edges, kernel3, iterations=1)
+                                except Exception:
+                                    edges_thick = binary_edges
+                                edges_in = cv2.bitwise_and(edges_thick, mask_inner)
+
+                                # 3) 连通域分析：寻找“足够长且远离扇形两边”的连通边
+                                contours, _ = cv2.findContours(edges_in, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                                if contours:
+                                    # 阈值：长度下限与中部性下限（像素）
+                                    Lmin = max(12.0, 0.3 * R)
+                                    Dmin = 3.0
+                                    line1 = [float(inter_pt[0]), float(inter_pt[1]), float(A[0]), float(A[1])]
+                                    line2 = [float(inter_pt[0]), float(inter_pt[1]), float(B[0]), float(B[1])]
+                                    for cnt in contours:
+                                        if cnt is None or len(cnt) < 5:
+                                            continue
+                                        pts = cnt.reshape(-1, 2).astype(float)
+                                        length_px = float(len(pts))
+                                        if length_px < Lmin:
+                                            continue
+                                        # 中部性：到扇形两边最小距离的中位数
+                                        dists1 = [get_point_line_perpendicular_distance((p[0], p[1]), line1) for p in pts]
+                                        dists2 = [get_point_line_perpendicular_distance((p[0], p[1]), line2) for p in pts]
+                                        dmin = np.minimum(np.array(dists1, dtype=float), np.array(dists2, dtype=float))
+                                        medDist = float(np.median(dmin)) if dmin.size > 0 else 0.0
+                                        if medDist >= Dmin:
+                                            corner_defects.append({
+                                                "type": "Q",
+                                                "center": tuple(map(int, intersection)),
+                                                "endpoints": (new_p1, new_p2),
+                                                "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])
+                                            })
+                                            q_created = True
+                                            break
                     except Exception:
-                        # 计算失败则保守创建 Q（避免误删真实缺角）
-                        corner_defects.append({
-                            "type": "Q",
-                            "center": tuple(map(int, intersection)),
-                            "endpoints": (new_p1, new_p2),
-                            "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])
-                        })
-                        q_created = True
+                        q_created = False
                 else:
                     _handle_as_x_defect()
             else:
@@ -1871,10 +1896,10 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
     
-    for edge in edges_for_drawing:
-        pt1 = tuple(map(int, edge[:2]))
-        pt2 = tuple(map(int, edge[2:]))
-        cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
+    #for edge in edges_for_drawing:
+    #    pt1 = tuple(map(int, edge[:2]))
+    #    pt2 = tuple(map(int, edge[2:]))
+    #    cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
     annotations_to_draw = []
     
     for defect_report in final_defects_for_report:
