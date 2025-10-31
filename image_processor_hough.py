@@ -1745,49 +1745,6 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         if not should_be_filtered:
             final_defects_for_report.append(new_defect)
         # --- MODIFICATION END ---
-        
-    # 调试输出：对通过所有过滤的 L 缺陷，打印中心点到每个主边的垂直距离（mm）
-    try:
-        if len(main_edges) > 0 and final_defects_for_report:
-            for _df in final_defects_for_report:
-                if _df.get('type') != 'L':
-                    continue
-                raw = _df.get('raw_defect', {})
-                # 中心点（ROI 坐标）：优先用 minAreaRect 的中心；否则用 location 减去 ROI 偏移
-                center_pt = None
-                rect = raw.get('min_area_rect') if isinstance(raw, dict) else None
-                if rect is not None and isinstance(rect, tuple) and len(rect) >= 2:
-                    try:
-                        cx, cy = rect[0]
-                        center_pt = np.array([float(cx), float(cy)], dtype=float)
-                    except Exception:
-                        center_pt = None
-                if center_pt is None:
-                    loc = _df.get('location', {})
-                    try:
-                        gx = float(loc.get('x', 0.0) or 0.0)
-                        gy = float(loc.get('y', 0.0) or 0.0)
-                        center_pt = np.array([gx - float(x), gy - float(y)], dtype=float)
-                    except Exception:
-                        continue
-
-                distances_mm = []
-                for ei, e in enumerate(main_edges):
-                    a = np.array(e[:2], dtype=float); b = np.array(e[2:], dtype=float)
-                    d_px = get_point_line_perpendicular_distance(center_pt, [a[0], a[1], b[0], b[1]])
-                    d_mm = d_px / float(pixels_per_mm if pixels_per_mm else 1.0)
-                    distances_mm.append((ei, d_mm))
-
-                gloc = _df.get('location', {})
-                try:
-                    gx_i = int(gloc.get('x', 0))
-                    gy_i = int(gloc.get('y', 0))
-                except Exception:
-                    gx_i = gloc.get('x'); gy_i = gloc.get('y')
-                msg = ", ".join([f"e{ei}:{dm:.2f}" for ei, dm in distances_mm])
-                print(f"[ROI {roi_idx}] L defect at ({gx_i}, {gy_i}) -> distances to main edges (mm): {msg}")
-    except Exception:
-        pass
 
     # 统计“近竖直”的主边数量（0~2 常见）：基于主边段方向角(相对x轴 0~90°)，角度>=90°-tol 视为近竖直
     try:
