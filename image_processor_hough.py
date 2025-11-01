@@ -970,35 +970,110 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                     edges_thick = binary_edges
                                 edges_in = cv2.bitwise_and(edges_thick, mask_inner)
 
-                                # 3) 连通域分析：寻找“足够长且远离扇形两边”的连通边
+                                # 3) 轻量鲁棒三约束：边清晰度 + 扇形中带多射线投票 + 方向一致性
+                                h_img, w_img = roi_gray.shape[:2]
+
+                                # 边清晰度（在交点附近沿两主边方向的窄条带命中率）
+                                try:
+                                    stripe_half = int(max(1, int(params.get('DEFECT_DETECTION', {}).get('Q_CANNY_STRIPE_HALF_WIDTH_PX', 2))))
+                                except Exception:
+                                    stripe_half = 2
+                                Lc = float(min(20.0, 0.4 * R))
+
+                                def _edge_clarity(start_pt: np.ndarray, u_vec: np.ndarray, L: float, half_w: int) -> float:
+                                    if L <= 1.0:
+                                        return 0.0
+                                    steps = int(max(1, int(round(L))))
+                                    perp = np.array([-u_vec[1], u_vec[0]], dtype=float)
+                                    hits = 0
+                                    for s in range(1, steps + 1):
+                                        p = start_pt + u_vec * s
+                                        x, y = int(round(p[0])), int(round(p[1]))
+                                        if not (0 <= x < w_img and 0 <= y < h_img):
+                                            continue
+                                        hit = False
+                                        for off in range(-half_w, half_w + 1):
+                                            q = p + perp * off
+                                            qx, qy = int(round(q[0])), int(round(q[1]))
+                                            if 0 <= qx < w_img and 0 <= qy < h_img and edges_thick[qy, qx] != 0:
+                                                hit = True; break
+                                        if hit:
+                                            hits += 1
+                                    return float(hits) / float(steps)
+
+                                inter_shift = 3.0  # 避开交点处的不稳定像素
+                                clarity1 = _edge_clarity(inter_pt + u1 * inter_shift, u1, Lc, stripe_half)
+                                clarity2 = _edge_clarity(inter_pt + u2 * inter_shift, u2, Lc, stripe_half)
+                                if not (clarity1 >= 0.25 and clarity2 >= 0.25):
+                                    raise RuntimeError('Corner clarity insufficient')
+
+                                # 扇形中带多射线投票（中带 r∈[0.4R,0.8R]；在每条射线上取少量采样点命中即记 1 票）
+                                def _ray_vote(u_left: np.ndarray, u_right: np.ndarray, R: float) -> bool:
+                                    N = 7
+                                    hits = 0
+                                    r_samples = [0.50 * R, 0.65 * R, 0.80 * R]
+                                    for k in range(N):
+                                        t = (k + 1) / float(N + 1)
+                                        d = (1 - t) * u_left + t * u_right
+                                        dn = float(np.linalg.norm(d))
+                                        if dn < 1e-6:
+                                            continue
+                                        d = d / dn
+                                        ray_hit = False
+                                        for rr in r_samples:
+                                            pt = inter_pt + d * rr
+                                            px, py = int(round(pt[0])), int(round(pt[1]))
+                                            if 0 <= px < w_img and 0 <= py < h_img:
+                                                # 3x3 命中
+                                                x0 = max(0, px - 1); x1 = min(w_img - 1, px + 1)
+                                                y0 = max(0, py - 1); y1 = min(h_img - 1, py + 1)
+                                                if np.any(edges_thick[y0:y1+1, x0:x1+1] != 0):
+                                                    ray_hit = True; break
+                                        if ray_hit:
+                                            hits += 1
+                                    return hits >= 4  # 降低投票门槛
+
+                                if not _ray_vote(u1, u2, R):
+                                    raise RuntimeError('Corner midband rays insufficient')
+
+                                # 连通域分析 + 方向一致性：找到一条足够长且不与任一直角边平行的内边缘
                                 contours, _ = cv2.findContours(edges_in, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
                                 if contours:
-                                    # 阈值：长度下限与中部性下限（像素）
-                                    Lmin = max(12.0, 0.3 * R)
-                                    Dmin = 3.0
-                                    line1 = [float(inter_pt[0]), float(inter_pt[1]), float(A[0]), float(A[1])]
-                                    line2 = [float(inter_pt[0]), float(inter_pt[1]), float(B[0]), float(B[1])]
+                                    Lmin = max(10.0, 0.25 * R)
                                     for cnt in contours:
                                         if cnt is None or len(cnt) < 5:
                                             continue
-                                        pts = cnt.reshape(-1, 2).astype(float)
-                                        length_px = float(len(pts))
-                                        if length_px < Lmin:
+                                        pts = cnt.reshape(-1, 2).astype(np.float32)
+                                        if float(len(pts)) < Lmin:
                                             continue
-                                        # 中部性：到扇形两边最小距离的中位数
-                                        dists1 = [get_point_line_perpendicular_distance((p[0], p[1]), line1) for p in pts]
-                                        dists2 = [get_point_line_perpendicular_distance((p[0], p[1]), line2) for p in pts]
-                                        dmin = np.minimum(np.array(dists1, dtype=float), np.array(dists2, dtype=float))
-                                        medDist = float(np.median(dmin)) if dmin.size > 0 else 0.0
-                                        if medDist >= Dmin:
-                                            corner_defects.append({
-                                                "type": "Q",
-                                                "center": tuple(map(int, intersection)),
-                                                "endpoints": (new_p1, new_p2),
-                                                "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])
-                                            })
-                                            q_created = True
-                                            break
+                                        # 方向一致性：连通域主方向不得与两条直角边近似平行
+                                        try:
+                                            vx, vy, x0f, y0f = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+                                            d_vec = np.array([float(vx), float(vy)], dtype=float)
+                                            dn = float(np.linalg.norm(d_vec))
+                                            if dn < 1e-6:
+                                                continue
+                                            d_vec /= dn
+                                            def _angle_deg(a: np.ndarray, b: np.ndarray) -> float:
+                                                ca = float(np.clip(np.dot(a, b), -1.0, 1.0))
+                                                return float(np.degrees(np.arccos(abs(ca))))
+                                            ang1 = _angle_deg(d_vec, u1)
+                                            ang2 = _angle_deg(d_vec, u2)
+                                            if min(ang1, ang2) < 15.0:
+                                                # 与某条主边过于平行，视为噪声
+                                                continue
+                                        except Exception:
+                                            # fitLine 失败则跳过该连通域
+                                            continue
+
+                                        corner_defects.append({
+                                            "type": "Q",
+                                            "center": tuple(map(int, intersection)),
+                                            "endpoints": (new_p1, new_p2),
+                                            "distances": (dists_i[endpoint_idx_i], dists_j[endpoint_idx_j])
+                                        })
+                                        q_created = True
+                                        break
                     except Exception:
                         q_created = False
                 else:

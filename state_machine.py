@@ -61,15 +61,22 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         pass
     
     # 进入/离开 去抖（帧）——避免算法偶发抖动导致反复进入/离开
-    ENTER_CONFIRM_FRAMES = int(getattr(shared_settings, 'enter_confirm_frames', 5))
-    LEAVE_CONFIRM_FRAMES = int(getattr(shared_settings, 'leave_confirm_frames', 5))
+    # 默认帧数略降到3，在引入“进入最短时间”门槛后整体更稳且响应更快
+    ENTER_CONFIRM_FRAMES = int(getattr(shared_settings, 'enter_confirm_frames', 3))
+    LEAVE_CONFIRM_FRAMES = int(getattr(shared_settings, 'leave_confirm_frames', 3))
     presence_streak = 0
     absence_streak = 0
+    presence_start_time_s = None  # 新增：统计“持续有玻璃”起始时间，用于进入最短时间门槛
     # 新增：玻璃进入后的最大持续时间（秒），超时强制退出
     try:
         pane_max_duration_s = float(getattr(shared_settings, 'pane_max_duration_s', 10.0) or 10.0)
     except Exception:
         pane_max_duration_s = 10.0
+    # 新增：玻璃进入事件的最短时间（秒）——即使帧数去抖满足，也需累计时长≥该值才算进入
+    try:
+        enter_min_time_s = float(getattr(shared_settings, 'enter_min_time_s', 1.5) or 1.5)
+    except Exception:
+        enter_min_time_s = 1.5
     pane_enter_time_s = None
 
     # 自动分路：每片玻璃内的 NG 汇聚与一次性触发
@@ -723,8 +730,13 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
 
             elif machine_state == "WAITING_FOR_PANE":
                 if current_total_panes > 0:
+                    # 第一次检测到“有玻璃”时记录起始时间
+                    if presence_streak == 0:
+                        presence_start_time_s = time.time()
                     presence_streak += 1
-                    if presence_streak >= ENTER_CONFIRM_FRAMES:
+                    # 需要同时满足：帧数去抖 AND 持续时间达到 enter_min_time_s
+                    elapsed_s = (time.time() - presence_start_time_s) if presence_start_time_s else 0.0
+                    if presence_streak >= ENTER_CONFIRM_FRAMES and elapsed_s >= enter_min_time_s:
                         # 不再支持滞后剔废：无需处理上一片的延迟上传
                         machine_state = "PANE_DETECTED"
                         machine_state_shared.value = 1
@@ -751,6 +763,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         saved_for_this_pane = False
                         can_late_reject.value = False
                         presence_streak = 0
+                        presence_start_time_s = None
                         absence_streak = 0
                         # 重置自动分路聚合状态
                         auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
@@ -762,6 +775,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         pane_enter_time_s = time.time()
                         print("--- [状态机]: 玻璃进入事件 ---")
                 else:
+                    # 连续无玻璃：重置帧计数与起始时间
                     presence_streak = 0
+                    presence_start_time_s = None
         except Exception as e:
             print(f"[状态机]: 处理结果时出错: {e}")
