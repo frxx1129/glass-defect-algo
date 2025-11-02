@@ -1004,7 +1004,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                 inter_shift = 3.0  # 避开交点处的不稳定像素
                                 clarity1 = _edge_clarity(inter_pt + u1 * inter_shift, u1, Lc, stripe_half)
                                 clarity2 = _edge_clarity(inter_pt + u2 * inter_shift, u2, Lc, stripe_half)
-                                if not (clarity1 >= 0.25 and clarity2 >= 0.25):
+                                if not (clarity1 >= 0.33 and clarity2 >= 0.33):
                                     raise RuntimeError('Corner clarity insufficient')
 
                                 # 扇形中带多射线投票（中带 r∈[0.4R,0.8R]；在每条射线上取少量采样点命中即记 1 票）
@@ -1031,7 +1031,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                                     ray_hit = True; break
                                         if ray_hit:
                                             hits += 1
-                                    return hits >= 4  # 降低投票门槛
+                                    return hits >= 5  # 提高投票门槛以减少误检
 
                                 if not _ray_vote(u1, u2, R):
                                     raise RuntimeError('Corner midband rays insufficient')
@@ -1039,7 +1039,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                 # 连通域分析 + 方向一致性：找到一条足够长且不与任一直角边平行的内边缘
                                 contours, _ = cv2.findContours(edges_in, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
                                 if contours:
-                                    Lmin = max(10.0, 0.25 * R)
+                                    Lmin = max(12.0, 0.3 * R)
                                     for cnt in contours:
                                         if cnt is None or len(cnt) < 5:
                                             continue
@@ -1059,12 +1059,29 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                                 return float(np.degrees(np.arccos(abs(ca))))
                                             ang1 = _angle_deg(d_vec, u1)
                                             ang2 = _angle_deg(d_vec, u2)
-                                            if min(ang1, ang2) < 15.0:
+                                            if min(ang1, ang2) < 20.0:
                                                 # 与某条主边过于平行，视为噪声
                                                 continue
                                         except Exception:
                                             # fitLine 失败则跳过该连通域
                                             continue
+                                        # 二次亮度检测：三角形区域均值需高于主边“内侧平行四边形”均值至少 10
+                                        try:
+                                            tri_pts = np.array([inter_pt, np.array(new_p1, dtype=float), np.array(new_p2, dtype=float)], dtype=np.float32)
+                                            tri_mask = np.zeros(roi_gray.shape, dtype=np.uint8)
+                                            cv2.fillPoly(tri_mask, [np.int32(tri_pts)], 255)
+                                            tri_mean = float(cv2.mean(roi_gray, mask=tri_mask)[0])
+                                            tri_centroid = tuple(np.mean(tri_pts, axis=0))
+                                            # 基线取两条主边的“内侧扫描带”均值的较大者（更严格）
+                                            base1 = float(_edge_baseline_parallelogram_mean(line1, tri_centroid))
+                                            base2 = float(_edge_baseline_parallelogram_mean(line2, tri_centroid))
+                                            baseline = max(base1, base2)
+                                            if (tri_mean - baseline) < 10.0:
+                                                # 亮度差不足，视为误检，继续尝试其它连通域
+                                                continue
+                                        except Exception:
+                                            # 亮度门控异常时，不强行否定，继续按其他证据处理
+                                            pass
 
                                         corner_defects.append({
                                             "type": "Q",
