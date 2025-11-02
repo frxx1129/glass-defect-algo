@@ -483,6 +483,16 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 # 检测离开
                 if current_total_panes == 0:
                     absence_streak += 1
+                    # 在达到“进入后的最短持续时间”之前，禁止离开（强制保持检测状态）
+                    try:
+                        dwell_s = (time.time() - pane_enter_time_s) if pane_enter_time_s is not None else 0.0
+                    except Exception:
+                        dwell_s = 0.0
+                    if dwell_s < enter_min_time_s:
+                        # 仍在最短持续时间窗口内：不允许离开，重置离开去抖
+                        absence_streak = 0
+                        continue
+
                     if absence_streak >= LEAVE_CONFIRM_FRAMES:
                         print("--- [状态机]: 玻璃离开事件 ---")
                         machine_state = "WAITING_FOR_PANE"
@@ -506,27 +516,6 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                     alarm_light_controller.set_normal_state()
                             except Exception:
                                 pass
-
-                        # 判断“进入最短持续时间”是否满足：若未达到 enter_min_time_s，则忽略本次事件（不上传、不计产量）
-                        try:
-                            dwell_s = (time.time() - pane_enter_time_s) if pane_enter_time_s is not None else 0.0
-                        except Exception:
-                            dwell_s = 0.0
-                        min_time_met = dwell_s >= enter_min_time_s
-
-                        if not min_time_met:
-                            # 进入后很快离开：视为无效事件，直接清理，不上传、不计产量
-                            # 同时重置当前事件标记，避免对后续产生影响
-                            current_pane_ng_buffer.clear()
-                            current_pane_reports.clear()
-                            current_pane_folder = None
-                            pane_ng_frame_counter = 0
-                            can_late_reject.value = False
-                            is_current_event_rejected = False
-                            # 重置自动分路聚合状态
-                            auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
-                            pane_enter_time_s = None
-                            continue
 
                         # 立即上传并结算；不支持滞后剔废
                         upload_current_pane_if_needed()
