@@ -72,7 +72,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         pane_max_duration_s = float(getattr(shared_settings, 'pane_max_duration_s', 10.0) or 10.0)
     except Exception:
         pane_max_duration_s = 10.0
-    # 新增：玻璃进入事件的最短时间（秒）——即使帧数去抖满足，也需累计时长≥该值才算进入
+    # 进入后的最短停留时间（秒）：进入判定不等待此时长；仅用于在离开与自动剔废前校验最小驻留
     try:
         enter_min_time_s = float(getattr(shared_settings, 'enter_min_time_s', 1.5) or 1.5)
     except Exception:
