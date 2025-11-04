@@ -1496,7 +1496,36 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
 
 
 def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm):
-    x, y, w, h = int(roi_template['x']), int(roi_template['y']), int(roi_template['width']), int(roi_template['height'])
+    # 兼容多种 ROI 表达：dict/list/tuple
+    def _parse_roi(rt):
+        if isinstance(rt, (list, tuple)) and len(rt) >= 4:
+            return int(rt[0]), int(rt[1]), int(rt[2]), int(rt[3])
+        if isinstance(rt, dict):
+            if 'x' in rt or 'y' in rt or 'width' in rt or 'height' in rt:
+                x0 = int(rt.get('x', 0)); y0 = int(rt.get('y', 0))
+                w0 = int(rt.get('width', rt.get('w', 0)) or 0)
+                h0 = int(rt.get('height', rt.get('h', 0)) or 0)
+                return x0, y0, w0, h0
+            if all(k in rt for k in ('left','top','right','bottom')):
+                left = int(rt.get('left', 0)); top = int(rt.get('top', 0))
+                right = int(rt.get('right', left)); bottom = int(rt.get('bottom', top))
+                return left, top, max(0, right - left), max(0, bottom - top)
+        return 0, 0, 0, 0
+    x, y, w, h = _parse_roi(roi_template)
+    # 基本越界裁剪
+    H, W = image_gray.shape[:2]
+    if w < 0: w = 0
+    if h < 0: h = 0
+    if x < 0:
+        w = max(0, w + x)
+        x = 0
+    if y < 0:
+        h = max(0, h + y)
+        y = 0
+    if x + w > W:
+        w = max(0, W - x)
+    if y + h > H:
+        h = max(0, H - y)
     roi_gray = image_gray[y:y+h, x:x+w]
     
     p_hough = params["HOUGH_TRANSFORM"]
@@ -1555,8 +1584,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         # --- MODIFICATION START: Introduce a flag to mark defects for filtering ---
         should_be_filtered = False
         # --- MODIFICATION END ---
-
-        if defect['type'] == 'X':
+        if defect['type'] in ('X', 'E'):
             # 支持两种 X：
             # 1) 交点型（有 center + angle）
             # 2) 斜边型（有 box_points + skew_angle_deg）
@@ -1921,8 +1949,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
         elif defect["type"] == "X" and "center" in defect:
             cv2.circle(roi_color, defect["center"], 15, color_bgr, THICKNESS)
-            
-        elif defect_report["type"] in ["L", "B", "X"] and "box_points" in defect:
+        elif defect_report["type"] in ["L", "B", "X", "E"] and "box_points" in defect:
             box_points = defect["box_points"]
             overlay = roi_color.copy()
             cv2.fillPoly(overlay, [box_points], color_bgr)
@@ -1977,14 +2004,32 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
             return process_roi_hough_based(i, r, image_gray, hough_params, pixels_per_mm)
         except Exception as e:
             print(f"Error processing ROI {i}: {e}")
-            x, y, w, h = int(r.get('x',0)), int(r.get('y',0)), int(r.get('width',0)), int(r.get('height',0))
+            # 兼容多种 ROI 表达，尽可能返回一个安全的占位 ROI
+            try:
+                if isinstance(r, (list, tuple)) and len(r) >= 4:
+                    x, y, w, h = int(r[0]), int(r[1]), int(r[2]), int(r[3])
+                elif isinstance(r, dict):
+                    if 'x' in r or 'y' in r or 'width' in r or 'height' in r:
+                        x = int(r.get('x', 0)); y = int(r.get('y', 0))
+                        w = int(r.get('width', r.get('w', 0)) or 0)
+                        h = int(r.get('height', r.get('h', 0)) or 0)
+                    elif all(k in r for k in ('left','top','right','bottom')):
+                        left = int(r.get('left', 0)); top = int(r.get('top', 0))
+                        right = int(r.get('right', left)); bottom = int(r.get('bottom', top))
+                        x, y, w, h = left, top, max(0, right-left), max(0, bottom-top)
+                    else:
+                        x, y, w, h = 0, 0, 0, 0
+                else:
+                    x, y, w, h = 0, 0, 0, 0
+            except Exception:
+                x, y, w, h = 0, 0, 0, 0
             roi_bgr = np.zeros((h, w, 3), dtype=np.uint8)
             try:
                 roi_gray_crop = image_gray[y:y+h, x:x+w]
                 roi_bgr = cv2.cvtColor(roi_gray_crop, cv2.COLOR_GRAY2BGR)
             except Exception:
-                 pass
-            return ({"roi_idx": i, "x": x, "y": y, "w": w, "h": h, "defects": [], "edges_found": 0}, roi_bgr)
+                pass
+            return ({"roi_idx": i, "x": x, "y": y, "w": w, "h": h, "defects": [], "edges_found": 0, "near_vertical_line_count": 0}, roi_bgr)
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(_safe_roi_hough, i, r) for i, r in enumerate(template_rois)]
