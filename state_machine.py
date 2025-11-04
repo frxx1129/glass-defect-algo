@@ -407,7 +407,63 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     else:
         print("[状态机]: 未能从服务器获取状态，保持当前运行状态。")
     
+    def _soft_reset_state_machine():
+        nonlocal machine_state, last_camera_states, current_pane_ng_buffer, current_pane_reports, current_pane_folder
+        nonlocal pane_ng_frame_counter, max_complexity_snapshot, is_current_event_rejected, manual_reject_active_mode
+        nonlocal rejection_details, saved_for_this_pane, presence_streak, absence_streak, pane_enter_time_s
+        nonlocal auto_ng_cams, last_result_by_cam, auto_first_ng_ts_ms
+        try:
+            machine_state = "WAITING_FOR_PANE"
+            machine_state_shared.value = 0
+        except Exception:
+            pass
+        try:
+            last_camera_states[:] = 0
+        except Exception:
+            pass
+        try:
+            current_pane_ng_buffer.clear(); current_pane_reports.clear()
+        except Exception:
+            pass
+        current_pane_folder = None
+        pane_ng_frame_counter = 0
+        try:
+            max_complexity_snapshot.fill(0)
+        except Exception:
+            pass
+        is_current_event_rejected = False
+        manual_reject_active_mode = False
+        rejection_details = {}
+        saved_for_this_pane = False
+        presence_streak = 0
+        absence_streak = 0
+        pane_enter_time_s = None
+        try:
+            auto_ng_cams.clear(); last_result_by_cam.clear()
+        except Exception:
+            pass
+        auto_first_ng_ts_ms = None
+        # 灯光恢复为正常状态
+        if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+            try:
+                alarm_light_controller.set_normal_state()
+            except Exception:
+                pass
+        # 采集模式：重置跨相机 pane 激活标记
+        try:
+            if getattr(shared_settings, 'data_collection_mode', False):
+                shared_settings.collection_pane_active = False
+        except Exception:
+            pass
+
     while not stop_event.is_set():
+        # 主进程请求软重置：清空状态、回到等待状态
+        try:
+            if bool(getattr(shared_settings, 'request_state_machine_reset', False)):
+                _soft_reset_state_machine()
+                setattr(shared_settings, 'request_state_machine_reset', False)
+        except Exception:
+            pass
         # 手动剔废（等待新玻璃状态下也可随时触发）：始终进行剔废控制；不再支持滞后剔废
         if machine_state == "WAITING_FOR_PANE" and manual_reject_flag.value:
             manual_reject_flag.value = False

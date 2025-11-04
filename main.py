@@ -184,6 +184,10 @@ def main():
                 except Exception:
                     f.seek(0)
                     config = json.load(f)
+        try:
+            print(f"[主进程]: 加载配置文件: {cfg_path}")
+        except Exception:
+            pass
     except Exception as e:
         sys.exit(f"错误: 无法加载 {cfg_path}: {e}")
 
@@ -344,7 +348,6 @@ def main():
     shared_settings.collection_output_root = config.get('collection_output_root', 'collected_dataset')
     if getattr(shared_settings, 'data_collection_mode', False):
         try:
-            import time
             day_dir = time.strftime('%Y%m%d')
             base_dir = os.path.join(shared_settings.collection_output_root, day_dir)
             for sub in ['original', 'ng']:
@@ -534,6 +537,17 @@ def main():
         global processes, child_stop_event
         try:
             print("\n[主进程]: 周期维护：开始重启相机与计算进程...")
+            # 暂停检测：清除运行事件，防止计算进程在相机未就绪时开始处理
+            try:
+                if run_event.is_set():
+                    run_event.clear()
+            except Exception:
+                pass
+            # 通知状态机执行软重置
+            try:
+                setattr(shared_settings, 'request_state_machine_reset', True)
+            except Exception:
+                pass
             # 请求子进程退出
             try:
                 child_stop_event.set()
@@ -564,7 +578,19 @@ def main():
             child_stop_event = multiprocessing.Event()
             # 重新启动子进程
             _start_children()
-            print("[主进程]: 周期维护：子进程重启完成。\n")
+            # 等待相机再次就绪后，才恢复检测
+            try:
+                ready = cameras_ready_event.wait(timeout=60)
+            except Exception:
+                ready = False
+            if ready:
+                try:
+                    run_event.set()
+                except Exception:
+                    pass
+                print("[主进程]: 周期维护：相机就绪，已恢复检测。\n")
+            else:
+                print("[主进程]: 周期维护：等待相机就绪超时（继续保持暂停状态）。\n")
         except Exception as e:
             print(f"[主进程]: 周期维护重启失败: {e}")
 
@@ -613,6 +639,12 @@ def main():
         restart_minutes = float(system_params.get('restart_interval_minutes', 1440) or 1440)
     except Exception:
         restart_minutes = 1440.0
+    # 启动时打印周期重启配置（最小间隔为60秒；维护线程轮询步长为5秒；重启前等待10秒释放资源）
+    try:
+        effective_interval_s = max(60.0, restart_minutes * 60.0)
+        print(f"[主进程]: 周期维护配置：每 {restart_minutes:g} 分钟重启子进程（实际间隔约 {int(effective_interval_s)} 秒，包含5秒轮询粒度与10秒重启缓冲）")
+    except Exception:
+        pass
 
     def _maintenance_loop():
         interval_s = max(60.0, restart_minutes * 60.0)  # 最小 60s 保护
