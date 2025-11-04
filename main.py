@@ -22,7 +22,10 @@ from alarm_light_controller import AlarmLightController, _AlarmLightService
 
 # 全局变量，用于在信号处理器中访问
 stop_event = None
+# 子进程控制事件（用于周期性重启），与最终退出事件分离
+child_stop_event = None
 processes = []
+_maintenance_thread = None
 rejection_controller = None
 http_client = None
 alarm_light_controller = None  # 这将是代理对象
@@ -151,7 +154,7 @@ def main():
     _ensure_single_instance_and_job()
     
     # 全局变量，用于信号处理
-    global stop_event, processes, rejection_controller, http_client, alarm_light_controller, alarm_light_service_thread, alarm_light_service_instance
+    global stop_event, child_stop_event, processes, rejection_controller, http_client, alarm_light_controller, alarm_light_service_thread, alarm_light_service_instance, _maintenance_thread
     
     # 设置信号处理器，优雅处理CTRL+C和Windows关闭事件
     def signal_handler(sig, frame):
@@ -428,7 +431,8 @@ def main():
     shared_user_id_manual = manager.Value('i', config.get('user_id_manual', 9999))
 
     # Process control events
-    stop_event = multiprocessing.Event()
+    stop_event = multiprocessing.Event()          # 最终退出事件
+    child_stop_event = multiprocessing.Event()    # 子进程代际退出事件（用于周期性重启）
     run_event = multiprocessing.Event()
     cameras_ready_event = multiprocessing.Event()
 
@@ -492,26 +496,80 @@ def main():
 
     http_client = NonBlockingHttpClient(max_workers=int(system_params.get('http_client_max_workers', 4) or 4))
 
-    # --- Create and Start Child Processes ---
-    processes = []
-    
-    pool_proc = multiprocessing.Process(
-        target=camera_pool_process,
-        args=(task_queue, stop_event, run_event, cameras_ready_event, config, shared_camera_states),
-        daemon=False
-    )
-    processes.append(pool_proc)
-    
-    for i in range(NUM_WORKERS):
-        worker_proc = multiprocessing.Process(
-            target=calculation_worker, 
-            args=(i, task_queue, results_queue, stop_event, run_event, config, shared_settings, data_sessions),
-            daemon=True
+    # --- Create and Start Child Processes (封装为函数，便于重启) ---
+    def _start_children():
+        """启动相机池进程与计算进程，使用 child_stop_event 控制其生命周期。"""
+        global processes, child_stop_event
+        nonlocal cameras_ready_event
+        # 重置相机就绪事件
+        # 启动前，重置相机就绪事件
+        try:
+            cameras_ready_event = multiprocessing.Event()
+        except Exception:
+            pass
+        processes = []
+        pool_proc = multiprocessing.Process(
+            target=camera_pool_process,
+            args=(task_queue, child_stop_event, run_event, cameras_ready_event, config, shared_camera_states),
+            daemon=False
         )
-        processes.append(worker_proc)
-        
-    for p in processes:
-        p.start()
+        processes.append(pool_proc)
+        for i in range(NUM_WORKERS):
+            worker_proc = multiprocessing.Process(
+                target=calculation_worker,
+                args=(i, task_queue, results_queue, child_stop_event, run_event, config, shared_settings, data_sessions),
+                daemon=True
+            )
+            processes.append(worker_proc)
+        for p in processes:
+            p.start()
+        print(f"[主进程]: 已启动子进程：相机池1 + 计算{NUM_WORKERS}。")
+
+    def _restart_children(grace_seconds: float = 10.0):
+        """优雅重启子进程：
+        - 置位 child_stop_event -> 等待退出 -> 超时则强制 terminate；
+        - 等待 grace_seconds；
+        - 清理列表并重建 child_stop_event -> 重新启动子进程。
+        """
+        global processes, child_stop_event
+        try:
+            print("\n[主进程]: 周期维护：开始重启相机与计算进程...")
+            # 请求子进程退出
+            try:
+                child_stop_event.set()
+            except Exception:
+                pass
+            # 等待退出
+            for p in processes:
+                try:
+                    p.join(timeout=5.0)
+                except Exception:
+                    pass
+            # 强制终止仍存活者
+            for p in processes:
+                try:
+                    if p.is_alive():
+                        p.terminate()
+                except Exception:
+                    pass
+            # 等待硬件资源释放
+            time.sleep(max(0.0, float(grace_seconds)))
+            # 清空状态快照（相机状态保留字典引用，清键）
+            try:
+                for k in list(shared_camera_states.keys()):
+                    shared_camera_states.pop(k, None)
+            except Exception:
+                pass
+            # 新一代事件
+            child_stop_event = multiprocessing.Event()
+            # 重新启动子进程
+            _start_children()
+            print("[主进程]: 周期维护：子进程重启完成。\n")
+        except Exception as e:
+            print(f"[主进程]: 周期维护重启失败: {e}")
+
+    # 启动首代子进程
+    _start_children()
 
     # --- Prepare Shared Objects for FastAPI ---
     shared_objects = {
@@ -542,14 +600,33 @@ def main():
     except Exception:
         shared_settings.cors_origins = ["*"]
 
-    # --- Wait for cameras ---
+    # --- Wait for cameras (首启动) ---
     print("[主进程]: 等待相机初始化...")
     camera_ready = cameras_ready_event.wait(timeout=60)
-    
     if camera_ready:
         print("✅ [主进程]: 相机就绪")
     else:
         print("⚠️ [主进程]: 等待相机初始化超时")
+
+    # --- 周期性重启维护线程 ---
+    try:
+        restart_minutes = float(system_params.get('restart_interval_minutes', 1440) or 1440)
+    except Exception:
+        restart_minutes = 1440.0
+
+    def _maintenance_loop():
+        interval_s = max(60.0, restart_minutes * 60.0)  # 最小 60s 保护
+        next_ts = time.monotonic() + interval_s
+        while not stop_event.is_set():
+            # 粗粒度休眠，避免忙等
+            time.sleep(5.0)
+            now = time.monotonic()
+            if now >= next_ts and not stop_event.is_set():
+                _restart_children(grace_seconds=10.0)
+                next_ts = time.monotonic() + interval_s
+
+    _maintenance_thread = threading.Thread(target=_maintenance_loop, daemon=True)
+    _maintenance_thread.start()
     
     # 根据DEBUG_MODE_ON控制前台/后台行为
     debug_mode = bool(config.get('DEBUG_MODE_ON', True))
@@ -593,6 +670,11 @@ def main():
     finally:
         print("\n[主进程]: 正在终止所有子进程...")
         stop_event.set()
+        # 确保当前代子进程收到退出信号
+        try:
+            child_stop_event.set()
+        except Exception:
+            pass
         
         for i, p in enumerate(processes):
             try:

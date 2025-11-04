@@ -687,9 +687,10 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     # 新增：按角度将主边分类为 平行 / 垂直 / 斜边，并为斜边生成基于 boundingRect 的缺陷
     skew_line_defects = []
     try:
-        vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 15.0))
+        # 默认容忍角度由 15° 调整为 17°（可通过 DEFECT_DETECTION.VERTICAL_ANGLE_TOL_DEG 覆盖）
+        vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 17.0))
     except Exception:
-        vertical_tol_deg = 15.0
+        vertical_tol_deg = 17.0
 
     def _angle_to_x_axis_deg(line):
         x1, y1, x2, y2 = map(float, line)
@@ -731,7 +732,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     except Exception:
         vertical_ref_deg = 90.0
 
-    # 分类并收集斜边（非平行且非垂直）
+    # 分类并收集边缘异常（非平行且非垂直）
     for e in true_edges:
         try:
             a_deg = _angle_to_x_axis_deg(e)
@@ -741,7 +742,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 angle_to_vertical = float(abs(a_deg - vertical_ref_deg))
                 box_pts = _axis_aligned_box_points_for_line(e, pad=3)
                 skew_line_defects.append({
-                    'type': 'X',
+                    'type': 'E',
                     'box_points': box_pts,
                     'skew_angle_deg': angle_to_vertical
                 })
@@ -1869,7 +1870,8 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         d.pop('raw_defect', None)
 
     roi_color = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
-    DEFECT_COLORS_BGR = {'Q': (0, 0, 255), 'X': (255, 0, 0), 'L': (255, 0, 255), 'B': (0, 165, 255)}
+    # 可视化颜色：'E'（边缘异常）使用红色；注意为 BGR 通道顺序
+    DEFECT_COLORS_BGR = {'Q': (0, 0, 255), 'E': (0, 0, 255), 'X': (255, 0, 0), 'L': (255, 0, 255), 'B': (0, 165, 255)}
     p_vis = params["VISUALIZATION"]
     THICKNESS = 1
     
@@ -1886,10 +1888,11 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         color_bgr = DEFECT_COLORS_BGR.get(defect_report["type"], (255, 255, 255))
         
         loc = defect_report['location']
-        defect_type_map = {'Q': '缺角', 'B': '崩边', 'X': '斜边', 'L': '裂纹'}
+        # 类型名称映射：新增 'E' -> 边缘异常；保留 'X' 兼容为“斜边（历史）”
+        defect_type_map = {'Q': '缺角', 'B': '崩边', 'E': '边缘异常', 'X': '斜边', 'L': '裂纹'}
         type_str = defect_type_map.get(defect_report['type'], '未知')
         
-        if defect_report['type'] == 'X':
+        if defect_report['type'] in ('E', 'X'):
             # 若为曲边，展示曲度（曲率角）；否则展示与垂直参考的夹角
             if loc.get('subtype') == 'curved' or (defect.get('skew_subtype', '') == 'curved'):
                 text = f"{type_str}：曲边: ({loc['x']}, {loc['y']}), 曲度: {loc.get('angle', 0.0):.1f}°"

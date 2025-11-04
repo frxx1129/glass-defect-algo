@@ -321,12 +321,17 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             return min(length, width)
         # 汇总：取所有缺陷“最短边”的最大值，作为 size_label 的数值
         max_defect_size = max([primary_size(d) for d in defects] or [0])
-        has_x_defect = any(d.get('type') == 'X' for d in defects)
+        # 支持新标签 'E'（边缘异常）；兼容历史 'X'
+        has_edge_anomaly = any(d.get('type') in ('E', 'X') for d in defects)
         size_label_parts = []
         if max_defect_size > 0:
             size_label_parts.append(f"{int(round(max_defect_size))}mm")
-        if has_x_defect:
-            size_label_parts.append('X')
+        if has_edge_anomaly:
+            # 若存在新标签 'E' 则标注 'E'，否则保留 'X'
+            if any(d.get('type') == 'E' for d in defects):
+                size_label_parts.append('E')
+            else:
+                size_label_parts.append('X')
         final_size_label = ','.join(size_label_parts) if size_label_parts else ''
         raw_cid = shared_collection_id.value
         try:
