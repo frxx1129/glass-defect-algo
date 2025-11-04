@@ -1841,9 +1841,10 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
     # 统计“近竖直”的主边数量（0~2 常见）：基于主边段方向角(相对x轴 0~90°)，角度>=90°-tol 视为近竖直
     try:
-        vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 5.0))
+        # 默认容忍角度与主流程保持一致：17°（可通过 DEFECT_DETECTION.VERTICAL_ANGLE_TOL_DEG 覆盖）
+        vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 17.0))
     except Exception:
-        vertical_tol_deg = 5.0
+        vertical_tol_deg = 17.0
     def _line_angle_deg(line):
         x1, y1, x2, y2 = map(float, line)
         dx, dy = (x2 - x1), (y2 - y1)

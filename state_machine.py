@@ -83,6 +83,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     auto_ng_cams = set()           # 出现NG的相机集合（逻辑索引）
     last_result_by_cam = {}        # 最近一帧NG结果（含缺陷坐标）的引用
     auto_first_ng_ts_ms = None     # 第一次检测到NG的时间（毫秒）
+    # 新增：按整片玻璃周期统计的“竖直边总数”的最大值（跨相机求和，跨时刻取最大）
+    pane_max_total_vertical_count = 0
 
     def _get_line_mark_info(shared_settings):
         """获取当前产线的标记映射信息：
@@ -234,15 +236,16 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             pass
         return xs
 
-    def _decide_marks_by_pieces_and_positions(cam_vertical_counts: dict, last_result_by_cam: dict, expected_cams: int, shared_settings) -> list[int] | None:
-        """依据估计的切片数（1~4）以及缺陷位置，返回需要触发的'标记'集合：
+    def _decide_marks_by_pieces_and_positions(cam_vertical_counts: dict, last_result_by_cam: dict, expected_cams: int, shared_settings, piece_count_override: int | None = None) -> list[int] | None:
+        """
+        依据估计的切片数（1~4）以及缺陷位置，返回需要触发的'标记'集合：
         - 1 切 2 块 -> 允许 {0,1,2}，优先给出属于缺陷所在块的标记（1 或 2）；
           中间相机(5路的cam2)用相机内 X 坐标区分左右（小->1，大->2）。
         - 2 切 3 块 -> 允许 {0,1,2,3}，按全局位置映射至 1/2/3；
         - 3 切 4 块 -> 允许 {0,1,2,3,4}，按全局位置映射至 1..4；
         - 若无法判定，兜底 [0]。
         """
-        piece_count = _estimate_piece_count(cam_vertical_counts)
+        piece_count = piece_count_override if isinstance(piece_count_override, int) and piece_count_override >= 1 else _estimate_piece_count(cam_vertical_counts)
         if piece_count <= 1:
             return [0]
 
@@ -411,7 +414,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         nonlocal machine_state, last_camera_states, current_pane_ng_buffer, current_pane_reports, current_pane_folder
         nonlocal pane_ng_frame_counter, max_complexity_snapshot, is_current_event_rejected, manual_reject_active_mode
         nonlocal rejection_details, saved_for_this_pane, presence_streak, absence_streak, pane_enter_time_s
-        nonlocal auto_ng_cams, last_result_by_cam, auto_first_ng_ts_ms
+        nonlocal auto_ng_cams, last_result_by_cam, auto_first_ng_ts_ms, pane_max_total_vertical_count
         try:
             machine_state = "WAITING_FOR_PANE"
             machine_state_shared.value = 0
@@ -443,6 +446,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         except Exception:
             pass
         auto_first_ng_ts_ms = None
+        pane_max_total_vertical_count = 0
         # 灯光恢复为正常状态
         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
             try:
@@ -596,6 +600,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         is_current_event_rejected = False
                         # 重置自动分路聚合状态
                         auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
+                        pane_max_total_vertical_count = 0
                         pane_enter_time_s = None
                         continue
                 else:
@@ -639,6 +644,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
                         is_current_event_rejected = False
                         auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
+                        pane_max_total_vertical_count = 0
                         pane_enter_time_s = None
                         continue
                 except Exception:
@@ -719,8 +725,20 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             for ci, res in last_result_by_cam.items():
                                 vertical_counts[ci] = _count_near_vertical_per_cam(res)
                             if vertical_counts:
-                                # 新规则：先估计切片数(由竖直线数量推断)，再结合缺陷位置计算应触发的标记集合
-                                marks = _decide_marks_by_pieces_and_positions(vertical_counts, last_result_by_cam, expected, shared_settings)
+                                # 新规则：跨相机求和，并在整个玻璃周期内取最大值
+                                current_total_vertical = int(sum(int(v or 0) for v in vertical_counts.values()))
+                                if current_total_vertical > pane_max_total_vertical_count:
+                                    pane_max_total_vertical_count = current_total_vertical
+                                # 将“最大竖直边总数”换算为切片数：2->1片，4->2片，6->3片，最大4片
+                                try:
+                                    piece_count_override = max(1, min(4, int(round(pane_max_total_vertical_count / 2.0))))
+                                except Exception:
+                                    piece_count_override = 1
+                                # 结合缺陷位置计算应触发的标记集合
+                                marks = _decide_marks_by_pieces_and_positions(
+                                    vertical_counts, last_result_by_cam, expected, shared_settings,
+                                    piece_count_override=piece_count_override
+                                )
                                 if marks:
                                     is_current_event_rejected = True
                                     saved_for_this_pane = True
@@ -835,6 +853,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         absence_streak = 0
                         # 重置自动分路聚合状态
                         auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
+                        pane_max_total_vertical_count = 0
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                             try:
                                 alarm_light_controller.set_normal_state()
