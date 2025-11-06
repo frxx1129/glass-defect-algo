@@ -416,6 +416,7 @@ def find_gradient_endpoint(start_point, line_vec_normalized, roi_gray_blurred, m
 def preprocess_for_hough_enhanced(roi_gray, params):
     p = params["PREPROCESSING"]
     grid_size = tuple(p.get("CLAHE_GRID_SIZE", [8, 8]))
+    # 取消 Otsu：直接对原始灰度进行中值滤波 + CLAHE，再做 Canny
     blurred = cv2.medianBlur(roi_gray, p["MEDIAN_BLUR_KSIZE"])
     clahe = cv2.createCLAHE(clipLimit=p["CLAHE_CLIP_LIMIT"], tileGridSize=grid_size)
     enhanced_contrast = clahe.apply(blurred)
@@ -749,7 +750,94 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         except Exception:
             continue
 
-    # 曲边检测已移除：当前阶段不输出“斜边（曲边）”
+
+    # 新增：基于“最小外接矩形与玻璃边缘轮廓差”的缺角(Q)检测
+    def _detect_q_by_rect_diff(roi_gray_img, ppm, param_all):
+        try:
+            h, w = roi_gray_img.shape[:2]
+            # 使用与主流程一致的预处理（Canny）获取边缘
+            edges = preprocess_for_hough_enhanced(roi_gray_img, param_all)
+            # 适度膨胀，便于形成封闭轮廓
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            edges_dil = cv2.dilate(edges, kernel, iterations=1)
+            # 取外轮廓
+            contours, _ = cv2.findContours(edges_dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return []
+            # 选择面积最大的轮廓，视作玻璃边缘所在的主体轮廓
+            main_cnt = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(main_cnt) < 1.0:
+                return []
+            # 面积阈值（mm^2）：对轮廓包围的最小面积做要求（默认 1600 mm^2）
+            try:
+                min_glass_area_mm2 = float(param_all.get('DEFECT_DETECTION', {}).get('GLASS_MIN_CONTOUR_AREA_MM2', 1600.0))
+            except Exception:
+                min_glass_area_mm2 = 1600.0
+            if ppm and ppm > 0:
+                main_area_mm2 = cv2.contourArea(main_cnt) / float(ppm * ppm)
+                if main_area_mm2 < min_glass_area_mm2:
+                    return []
+            # 最小外接矩形（允许倾斜）
+            rect = cv2.minAreaRect(main_cnt)
+            rect_box = cv2.boxPoints(rect).astype(np.int32)
+            # 生成掩膜：矩形掩膜与主体轮廓掩膜
+            mask_rect = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(mask_rect, [rect_box], 255)
+            mask_cnt = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(mask_cnt, [main_cnt], -1, 255, thickness=-1)
+            # 差分：矩形中但不在主体轮廓内的区域，候选“缺角”区域
+            diff = cv2.subtract(mask_rect, mask_cnt)
+            # 形状修约：移除过细的“须状/细长”区域，得到更合理的块状形状
+            try:
+                p_def = param_all.get('DEFECT_DETECTION', {})
+                min_thick_px = _get_dist_px(p_def, 'Q_REGION_MIN_THICKNESS_MM', 'Q_REGION_MIN_THICKNESS', 1.5, ppm)
+                k = max(3, int(round(float(min_thick_px))))
+                if k % 2 == 0:
+                    k += 1  # 保证奇数核
+                kernel_smooth = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                # 开运算：先腐蚀后膨胀，去掉比核更细的突出物
+                diff = cv2.morphologyEx(diff, cv2.MORPH_OPEN, kernel_smooth, iterations=1)
+                # 轻微闭运算：平滑边界并填补小凹陷
+                kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                diff = cv2.morphologyEx(diff, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+            except Exception:
+                # 回退最小方案：小核开运算
+                diff = cv2.morphologyEx(diff, cv2.MORPH_OPEN, kernel, iterations=1)
+            # 连通域/轮廓分析
+            cand_cnts, _ = cv2.findContours(diff, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            results = []
+            for c in cand_cnts:
+                area_px = cv2.contourArea(c)
+                if area_px <= 1.0:
+                    continue
+                # 计算候选区域的最小外接矩形，得到长宽
+                r2 = cv2.minAreaRect(c)
+                (cx, cy), (rw, rh), ang = r2
+                # 换算尺寸到 mm
+                width_mm = (min(rw, rh) / float(ppm)) if ppm else 0.0
+                length_mm = (max(rw, rh) / float(ppm)) if ppm else 0.0
+                area_mm2 = (rw * rh) / float(ppm * ppm) if ppm else 0.0
+                # 过滤规则：块状且尺寸大于 5mm x 5mm（保守起见：最短边>=5mm 且面积>=25mm^2）
+                if width_mm >= 5.0 and area_mm2 >= 25.0:
+                    box2 = cv2.boxPoints(r2).astype(np.int32)
+                    # 生成用于高亮的像素块轮廓（而不是画 minAreaRect）：简化原始连通域轮廓
+                    eps = max(2.0, 0.02 * float(cv2.arcLength(c, True)))
+                    approx = cv2.approxPolyDP(c, eps, True)
+                    if approx is None or len(approx) < 3:
+                        approx = c  # 退回原始轮廓
+                    results.append({
+                        'type': 'Q',
+                        'min_area_rect': r2,
+                        'box_points': box2,
+                        'region_contour': approx.astype(np.int32),
+                        'center': (int(round(cx)), int(round(cy))),
+                        'origin': 'rect_diff'
+                    })
+            return results
+        except Exception:
+            return []
+
+    rect_q_defects = _detect_q_by_rect_diff(roi_gray, pixels_per_mm, params)
 
     # 计算某条主边“平行四边形扫描带”的平均亮度，选择相对于缺角三角形质心的内侧（与三角形相反侧）半带，剔除边线与端点
     # 用作缺角(Q)亮度门控的对比基准
@@ -1427,7 +1515,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         surviving_chipping_defects = others + b_small_list + fused_b_list
             
     # 合并输出缺陷：角点/崩边/斜边（直线）
-    combined_defects = corner_defects + surviving_chipping_defects + skew_line_defects
+    combined_defects = corner_defects + surviving_chipping_defects + skew_line_defects + rect_q_defects
 
     # Q/B/L 最短边（宽度）过滤：过滤掉宽度 < 5mm 的缺陷
     def _measure_width_mm_for_defect(d: dict, ppm: float) -> float:
@@ -1645,7 +1733,20 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     length_px = max(dist_leg1_px, dist_leg2_px)
                     width_px  = min(dist_leg1_px, dist_leg2_px)
                 else:
-                    length_px, width_px = 0.0, 0.0
+                    # 新增：支持基于矩形差法产生的 Q（携带 min_area_rect 或 box_points）
+                    r = defect.get('min_area_rect')
+                    if r is not None and isinstance(r, tuple) and len(r) >= 2:
+                        rw, rh = float(r[1][0] or 0.0), float(r[1][1] or 0.0)
+                        length_px, width_px = max(rw, rh), min(rw, rh)
+                    else:
+                        box = defect.get('box_points')
+                        if box is not None and len(box) >= 4:
+                            box_np = np.array(box, dtype=np.float32).reshape(-1, 2)
+                            rect2 = cv2.minAreaRect(box_np)
+                            w_px2 = float(rect2[1][0] or 0.0); h_px2 = float(rect2[1][1] or 0.0)
+                            length_px, width_px = max(w_px2, h_px2), min(w_px2, h_px2)
+                        else:
+                            length_px, width_px = 0.0, 0.0
             
             elif defect['type'] in ['B']:
                 box = defect.get('box_points', [])
@@ -1906,10 +2007,10 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
     
-    #for edge in edges_for_drawing:
-    #    pt1 = tuple(map(int, edge[:2]))
-    #    pt2 = tuple(map(int, edge[2:]))
-    #    cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
+    for edge in edges_for_drawing:
+        pt1 = tuple(map(int, edge[:2]))
+        pt2 = tuple(map(int, edge[2:]))
+        cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
     annotations_to_draw = []
     
     for defect_report in final_defects_for_report:
@@ -1949,12 +2050,174 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
         elif defect["type"] == "X" and "center" in defect:
             cv2.circle(roi_color, defect["center"], 15, color_bgr, THICKNESS)
+        elif defect_report["type"] == "Q" and "region_contour" in defect:
+            # 使用像素块的真实轮廓高亮（不使用 minAreaRect 来圈出）
+            region = defect["region_contour"]
+            overlay = roi_color.copy()
+            cv2.fillPoly(overlay, [region], color_bgr)
+            cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
+            # 可选：画细边框帮助观察（维持同色细线）——如完全不需要可去掉下一行
+            cv2.drawContours(roi_color, [region], 0, color_bgr, THICKNESS)
         elif defect_report["type"] in ["L", "B", "X", "E"] and "box_points" in defect:
+            # 其它缺陷继续使用自身 box_points 可视化
             box_points = defect["box_points"]
             overlay = roi_color.copy()
             cv2.fillPoly(overlay, [box_points], color_bgr)
             cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
             cv2.drawContours(roi_color, [box_points], 0, color_bgr, THICKNESS)
+
+    # 在最终标注图上叠加“玻璃最大轮廓 + 最小外接矩形”，便于在结果视频中观察
+    try:
+        kernel_viz = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        edges_dil_viz = cv2.dilate(binary_edges, kernel_viz, iterations=1)
+        cnts_viz, _ = cv2.findContours(edges_dil_viz, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts_viz:
+            main_viz = max(cnts_viz, key=cv2.contourArea)
+            area_px = cv2.contourArea(main_viz)
+            if area_px > 10.0:
+                ok_area = True  # 不再按轮廓面积门控，统一进入外接形状计算
+                if ok_area:
+                    # 绘制玻璃原始主体轮廓（红色）
+                    try:
+                        cv2.drawContours(roi_color, [main_viz], -1, (0, 0, 255), 1)
+                    except Exception:
+                        pass
+
+                    # 结合“主边缘直线 + 玻璃主体轮廓”计算一个“最小包裹轮廓且与主边平行”的平行四边形（最小外接平行包络）
+                    try:
+                        # 1) 计算主方向：优先使用 Hough 主边缘方向；若不可用，退回最小外接矩形方向
+                        u_dir = None; v_dir = None; angle_deg = None
+                        if main_edges and len(main_edges) > 0:
+                            # 统计每条线的方向向量并做主方向聚合
+                            dirs = []
+                            for e in main_edges:
+                                x1, y1, x2, y2 = map(float, e)
+                                v = np.array([x2 - x1, y2 - y1], dtype=np.float32)
+                                L = float(np.hypot(v[0], v[1]))
+                                if L > 1e-6:
+                                    v /= L
+                                    # 方向无符号：把朝向统一到半圆
+                                    if v[0] < 0:
+                                        v = -v
+                                    dirs.append(v)
+                            if dirs:
+                                mean_dir = np.mean(np.stack(dirs, axis=0), axis=0)
+                                L = float(np.hypot(mean_dir[0], mean_dir[1]))
+                                if L > 1e-6:
+                                    u_dir = (mean_dir / L).astype(np.float32)
+                                    v_dir = np.array([-u_dir[1], u_dir[0]], dtype=np.float32)
+                                    angle_deg = float(np.degrees(np.arctan2(u_dir[1], u_dir[0])))
+                        if u_dir is None:
+                            rect_local = cv2.minAreaRect(main_viz)
+                            box_local = cv2.boxPoints(rect_local).astype(np.float32)
+                            e0 = box_local[1] - box_local[0]
+                            L0 = float(np.hypot(e0[0], e0[1]))
+                            if L0 < 1e-6:
+                                raise RuntimeError('degenerate rect for envelope')
+                            u_dir = (e0 / L0).astype(np.float32)
+                            v_dir = np.array([-u_dir[1], u_dir[0]], dtype=np.float32)
+                            angle_deg = float(np.degrees(np.arctan2(u_dir[1], u_dir[0])))
+
+                        # 2) 在 (u,v) 坐标系中：用主体轮廓确定范围，用主边缘直线“对齐”四条边的位置
+                        pts = main_viz.reshape(-1, 2).astype(np.float32)
+                        center = np.mean(pts, axis=0).astype(np.float32)
+                        rel = pts - center
+                        u = rel @ u_dir
+                        v = rel @ v_dir
+                        u_min, u_max = float(np.min(u)), float(np.max(u))
+                        v_min, v_max = float(np.min(v)), float(np.max(v))
+                        if v_max - v_min < 1e-6 or u_max - u_min < 1e-6:
+                            raise RuntimeError('degenerate glass contour in uv range')
+
+                        # 最小包裹：直接以轮廓在 (u,v) 的极值作为四边偏移（保证完全包裹且面积最小）
+                        u_left = u_min; u_right = u_max
+                        v_top = v_min; v_bottom = v_max
+
+                        # 构建四条“无限长”边线以求交点，确保边与主边方向平行
+                        T_local = float(max(roi_gray.shape) * 20)
+                        def _line_from_v(v0):
+                            c = center + v0 * v_dir
+                            return np.array([c[0] - T_local*u_dir[0], c[1] - T_local*u_dir[1], c[0] + T_local*u_dir[0], c[1] + T_local*u_dir[1]])
+                        def _line_from_u(u0):
+                            c = center + u0 * u_dir
+                            return np.array([c[0] - T_local*v_dir[0], c[1] - T_local*v_dir[1], c[0] + T_local*v_dir[0], c[1] + T_local*v_dir[1]])
+                        lt = find_line_intersection(_line_from_u(u_left), _line_from_v(v_top))
+                        rt = find_line_intersection(_line_from_u(u_right), _line_from_v(v_top))
+                        rb = find_line_intersection(_line_from_u(u_right), _line_from_v(v_bottom))
+                        lb = find_line_intersection(_line_from_u(u_left), _line_from_v(v_bottom))
+                        if any(pt is None for pt in (lt, rt, rb, lb)):
+                            raise RuntimeError('failed to intersect snapped lines')
+                        quad_pts = np.array([
+                            [int(round(lt[0])), int(round(lt[1]))],
+                            [int(round(rt[0])), int(round(rt[1]))],
+                            [int(round(rb[0])), int(round(rb[1]))],
+                            [int(round(lb[0])), int(round(lb[1]))]
+                        ], dtype=np.int32)
+
+                        # 5) 结果模式：与主边方向平行的“最小包裹”平行四边形（不强制与某一条主线重合）
+                        mode = 'parallel-min-envelope'
+
+                        # 面积计算（px² 与 mm²）
+                        width_px = float(u_right - u_left)
+                        height_px = float(v_bottom - v_top)
+                        area_px2 = max(0.0, width_px) * max(0.0, height_px)
+                        area_mm2 = float(area_px2) / float(pixels_per_mm * pixels_per_mm) if pixels_per_mm else 0.0
+
+                        # 允许检测的最小面积（mm²）
+                        try:
+                            min_detect_area_mm2 = float(params.get('DEFECT_DETECTION', {}).get('ENVELOPE_MIN_DETECT_AREA_MM2', 10000.0))
+                        except Exception:
+                            min_detect_area_mm2 = 10000.0
+
+                        # 写入报告（不影响现有消费者）
+                        try:
+                            roi_report['envelope'] = {
+                                'mode': mode,
+                                'angle_deg': angle_deg,
+                                'points': quad_pts.tolist(),
+                                'area_mm2': float(area_mm2),
+                                'min_detect_area_mm2': float(min_detect_area_mm2)
+                            }
+                            # 仅在面积达标时提供全图绘制点；否则标记 too-small-for-detection
+                            gx, gy = int(x), int(y)
+                            if area_mm2 >= min_detect_area_mm2:
+                                quad_global = (quad_pts + np.array([gx, gy], dtype=np.int32)).tolist()
+                                roi_report['envelope']['points_global'] = quad_global
+                                roi_report['envelope']['status'] = 'ok'
+                            else:
+                                roi_report['envelope']['status'] = 'too-small-for-detection'
+                        except Exception:
+                            pass
+
+                        # 可视化绘制我们外接四边形（青色）
+                        try:
+                            # 仅当面积达标才在 ROI 内叠加绘制
+                            if area_mm2 >= min_detect_area_mm2:
+                                cv2.polylines(roi_color, [quad_pts], True, (0, 255, 255), 1)
+                        except Exception:
+                            pass
+
+                        # 若面积不足以允许检测，则在此阶段对 Q 缺陷进行过滤（不输出），以满足“面积达标才允许进行检测”的约束
+                        try:
+                            if area_mm2 < min_detect_area_mm2 and isinstance(roi_report.get('defects'), list):
+                                roi_report['defects'] = [d for d in roi_report['defects'] if d.get('type') != 'Q']
+                        except Exception:
+                            pass
+                    except Exception:
+                        # 回退：绘制最小外接矩形（青色），并写入报告
+                        try:
+                            rect_fallback = cv2.minAreaRect(main_viz)
+                            box_fb = cv2.boxPoints(rect_fallback).astype(np.int32)
+                            cv2.polylines(roi_color, [box_fb], True, (0, 255, 255), 1)
+                            roi_report['envelope'] = {
+                                'mode': 'rectangle-fallback',
+                                'angle_deg': float(rect_fallback[2]) if isinstance(rect_fallback[2], (int, float)) else 0.0,
+                                'points': box_fb.tolist()
+                            }
+                        except Exception:
+                            pass
+    except Exception:
+        pass
 
     if annotations_to_draw and PIL_AVAILABLE and ANNOTATION_FONT:
         pil_img = Image.fromarray(cv2.cvtColor(roi_color, cv2.COLOR_BGR2RGB))
@@ -2040,6 +2303,18 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
         if "x" not in roi_report: continue
         x, y, w, h = roi_report["x"], roi_report["y"], roi_report["w"], roi_report["h"]
         if w > 0 and h > 0: final_image[y:y+h, x:x+w] = roi_color
+
+        # 在整幅原图上绘制缺角检测的外接四边形（仅当面积达标），避免仅在 ROI 内导致残缺
+        try:
+            env = roi_report.get('envelope') if isinstance(roi_report, dict) else None
+            if isinstance(env, dict):
+                if env.get('status') == 'ok':
+                    pts_g = env.get('points_global')
+                    if pts_g and len(pts_g) >= 4:
+                        quad_g = np.array(pts_g, dtype=np.int32)
+                        cv2.polylines(final_image, [quad_g], True, (0, 255, 255), 1)
+        except Exception:
+            pass
         
         max_edges_found = max(max_edges_found, roi_report.get("edges_found", 0))
         

@@ -75,52 +75,7 @@ def process_frame_task(frame_data_gray, cam_index, config, shared_settings, roi_
     # --- FIX: 返回原始标注图像 (numpy array) 和结果字典 ---
     return result, annotated_image
 
-# --- 只对 ROI 区域执行 Canny，并返回整幅图的 Canny 可视化（BGR） ---
-def _parse_roi(rt):
-    try:
-        if isinstance(rt, (list, tuple)) and len(rt) >= 4:
-            return int(rt[0]), int(rt[1]), int(rt[2]), int(rt[3])
-        if isinstance(rt, dict):
-            if 'x' in rt or 'y' in rt or 'width' in rt or 'height' in rt:
-                x0 = int(rt.get('x', 0)); y0 = int(rt.get('y', 0))
-                w0 = int(rt.get('width', rt.get('w', 0)) or 0)
-                h0 = int(rt.get('height', rt.get('h', 0)) or 0)
-                return x0, y0, w0, h0
-            if all(k in rt for k in ('left','top','right','bottom')):
-                left = int(rt.get('left', 0)); top = int(rt.get('top', 0))
-                right = int(rt.get('right', left)); bottom = int(rt.get('bottom', top))
-                return left, top, max(0, right-left), max(0, bottom-top)
-    except Exception:
-        pass
-    return 0, 0, 0, 0
-
-def generate_canny_roi_image(gray_frame, rois, hough_params):
-    H, W = gray_frame.shape[:2]
-    edges_full = np.zeros((H, W), dtype=np.uint8)
-    for r in (rois or []):
-        x, y, w, h = _parse_roi(r)
-        # 边界裁剪
-        if w < 0: w = 0
-        if h < 0: h = 0
-        if x < 0:
-            w = max(0, w + x)
-            x = 0
-        if y < 0:
-            h = max(0, h + y)
-            y = 0
-        if x + w > W:
-            w = max(0, W - x)
-        if y + h > H:
-            h = max(0, H - y)
-        if w <= 0 or h <= 0:
-            continue
-        roi = gray_frame[y:y+h, x:x+w]
-        edges = image_processor.preprocess_for_hough_enhanced(roi, hough_params)
-        # 只在 ROI 区域赋值（若重叠，取最大）
-        sub = edges_full[y:y+h, x:x+w]
-        np.maximum(sub, edges, out=sub)
-        edges_full[y:y+h, x:x+w] = sub
-    return cv2.cvtColor(edges_full, cv2.COLOR_GRAY2BGR)
+# （已移除 Canny 图片导出逻辑）
 
 def main():
     # --- 使用 argparse 处理命令行参数 ---
@@ -193,16 +148,7 @@ def main():
             # 注意：此处返回的 annotated_image 是用于保存的，不是用于视频流
             result, annotated_image = process_frame_task(gray_frame, cam_index, config, shared_settings, roi_cache)
 
-            # 依据配置生成“仅 ROI 的 Canny 图像”，保存为文件
-            try:
-                hough_params = config.get('hough_inspector_params')
-                if hough_params is None:
-                    raise ValueError("配置缺少 'hough_inspector_params'")
-                canny_bgr = generate_canny_roi_image(gray_frame, roi_cache.get(cam_index, []), hough_params)
-                canny_image_path = os.path.join(args.output, f"{base_filename}_canny.jpg")
-                cv2.imwrite(canny_image_path, canny_bgr)
-            except Exception as e:
-                print(f"  生成/保存 Canny 图片失败: {e}")
+            # 不再输出 Canny 图片
             
             print(f"  报告: 状态={result['image_status']}, state_code={result['state_code']}, 缺陷数={len(result['defects'])}")
             
@@ -252,16 +198,7 @@ def main():
             # --- FIX: 将处理后的帧写入输出视频 ---
             out_video.write(annotated_image)
 
-            # 依据配置生成“仅 ROI 的 Canny 图像”，并保存
-            try:
-                hough_params = config.get('hough_inspector_params')
-                if hough_params is None:
-                    raise ValueError("配置缺少 'hough_inspector_params'")
-                canny_bgr = generate_canny_roi_image(gray_frame, roi_cache.get(cam_index, []), hough_params)
-                canny_frame_path = os.path.join(args.output, f"frame_{frame_count:05d}_canny.jpg")
-                cv2.imwrite(canny_frame_path, canny_bgr)
-            except Exception as e:
-                print(f"  保存 Canny 图片失败: {e}")
+            # 不再输出 Canny 图片
             
             print(f"  报告: 状态={result['image_status']}, state_code={result['state_code']}, 缺陷数={len(result['defects'])}")
             
