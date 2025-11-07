@@ -817,8 +817,16 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 width_mm = (min(rw, rh) / float(ppm)) if ppm else 0.0
                 length_mm = (max(rw, rh) / float(ppm)) if ppm else 0.0
                 area_mm2 = (rw * rh) / float(ppm * ppm) if ppm else 0.0
-                # 过滤规则：块状且尺寸大于 5mm x 5mm（保守起见：最短边>=5mm 且面积>=25mm^2）
-                if width_mm >= 5.0 and area_mm2 >= 25.0:
+                # 过滤规则：块状且尺寸通过门槛（最短边>=5mm，面积>=25mm^2；可选最大边上限 Q_MAX_SIDE_MM）
+                try:
+                    p_def_local = param_all.get('DEFECT_DETECTION', {})
+                    q_cfg = float(p_def_local.get('Q_MAX_SIDE_MM', 0.0))
+                except Exception:
+                    q_cfg = 0.0
+                # 硬性上限：>50mm 的 Q 一律过滤；若配置更严（<=50），按配置取更小者
+                q_max_side_mm = 50.0 if (q_cfg is None or q_cfg <= 0.0 or q_cfg > 50.0) else q_cfg
+                max_side_ok = (length_mm <= q_max_side_mm and width_mm <= q_max_side_mm)
+                if width_mm >= 5.0 and area_mm2 >= 25.0 and max_side_ok:
                     box2 = cv2.boxPoints(r2).astype(np.int32)
                     # 生成用于高亮的像素块轮廓（而不是画 minAreaRect）：简化原始连通域轮廓
                     eps = max(2.0, 0.02 * float(cv2.arcLength(c, True)))
@@ -838,6 +846,276 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             return []
 
     rect_q_defects = _detect_q_by_rect_diff(roi_gray, pixels_per_mm, params)
+
+    # 新逻辑：利用已获得角部交点与两条主边，与玻璃轮廓求最近交点生成三角形缺角区域
+    # 收集玻璃主体轮廓（与矩形差法重复一次，后续可优化成复用）
+    corner_contour_q_defects = []
+    try:
+        kernel_qc = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+        edges_qc = preprocess_for_hough_enhanced(roi_gray, params)
+        edges_qc_dil = cv2.dilate(edges_qc, kernel_qc, iterations=1)
+        cnts_qc, _ = cv2.findContours(edges_qc_dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts_qc:
+            main_cnt_qc = max(cnts_qc, key=cv2.contourArea)
+            if cv2.contourArea(main_cnt_qc) > 10.0 and cv2.arcLength(main_cnt_qc, True) >= 1200.0:
+                mask_cnt_qc = np.zeros(roi_gray.shape, dtype=np.uint8)
+                cv2.drawContours(mask_cnt_qc, [main_cnt_qc], -1, 255, thickness=-1)
+
+                # 角部交点来源：之前在处理交点时已将交点写入 edges_for_drawing （端点替换）
+                # 从已调整后的 edges_for_drawing 中重建潜在角点：相同坐标出现 >=2 次即视为角部交点
+                pts_all = []
+                for e in edges_for_drawing:
+                    pts_all.append(tuple(map(int, e[:2])))
+                    pts_all.append(tuple(map(int, e[2:])))
+                from collections import Counter
+                cnt_freq = Counter(pts_all)
+                corner_points = [np.array(p, dtype=float) for p,f in cnt_freq.items() if f >= 2]
+
+                # 轮廓点数组（便于几何计算）
+                cnt_pts = main_cnt_qc.reshape(-1,2).astype(float)
+
+                def _ray_intersect_contour(origin: np.ndarray, dir_vec: np.ndarray, contour_points: np.ndarray, t_min: float = 2.0):
+                    # 与多边形每条边求交，返回 t 最小的交点与所在边索引
+                    d = dir_vec.astype(float)
+                    n = len(contour_points)
+                    if n < 2:
+                        return None
+                    d_norm = np.linalg.norm(d)
+                    if d_norm < 1e-9:
+                        return None
+                    d = d / d_norm
+                    best = None
+                    for k in range(n):
+                        a = contour_points[k]
+                        b = contour_points[(k+1) % n]
+                        e = b - a
+                        M = np.array([[d[0], -e[0]],[d[1], -e[1]]], dtype=float)
+                        det = M[0,0]*M[1,1] - M[0,1]*M[1,0]
+                        if abs(det) < 1e-9:
+                            continue
+                        rhs = (a - origin).astype(float)
+                        t = ( rhs[0]*M[1,1] - rhs[1]*M[0,1]) / det
+                        u = ( M[0,0]*rhs[1] - M[1,0]*rhs[0]) / det
+                        if t >= t_min and 0.0 <= u <= 1.0:
+                            P = origin + d * t
+                            if (best is None) or (t < best[0]):
+                                best = (t, P, k)
+                    return best  # (t_min, point, edge_index)
+
+                def _build_contour_path(i1_idx: int, i1_pt: np.ndarray, i2_idx: int, i2_pt: np.ndarray, contour_points: np.ndarray):
+                    n = len(contour_points)
+                    # forward: from i1_idx+1 ... to i2_idx (inclusive)
+                    path_f = [i1_pt]
+                    k = (i1_idx + 1) % n
+                    while k != ((i2_idx + 1) % n):
+                        path_f.append(contour_points[k])
+                        k = (k + 1) % n
+                    path_f.append(i2_pt)
+                    # backward: from i1_idx down to i2_idx+1
+                    path_b = [i1_pt]
+                    k = i1_idx
+                    while k != i2_idx:
+                        path_b.append(contour_points[k])
+                        k = (k - 1 + n) % n
+                    path_b.append(i2_pt)
+                    def _path_len(path):
+                        return float(sum(np.linalg.norm(np.array(path[m+1],dtype=float) - np.array(path[m],dtype=float)) for m in range(len(path)-1)))
+                    return (path_f, _path_len(path_f)), (path_b, _path_len(path_b))
+
+                # 遍历角点；对每个角点，找两条最靠近该点的线段（端点相距最小）
+                for cp in corner_points:
+                    # 选取与角点距离 < 3px 的线端点所属线段
+                    candidates = []
+                    for idx, e in enumerate(edges_for_drawing):
+                        p1 = np.array(e[:2], dtype=float); p2 = np.array(e[2:], dtype=float)
+                        if np.linalg.norm(cp - p1) < 3.0 or np.linalg.norm(cp - p2) < 3.0:
+                            candidates.append((idx, e))
+                    if len(candidates) < 2:
+                        continue
+                    # 选取距离角点端点距离最小的两条
+                    candidates.sort(key=lambda it: min(np.linalg.norm(cp - np.array(it[1][:2],dtype=float)), np.linalg.norm(cp - np.array(it[1][2:],dtype=float))))
+                    chosen = candidates[:2]
+                    # 两条线分别求与玻璃轮廓的射线-轮廓交点
+                    inter_hits = []  # (point, edge_index)
+                    for _, seg in chosen:
+                        p1 = np.array(seg[:2], dtype=float); p2 = np.array(seg[2:], dtype=float)
+                        d1 = np.linalg.norm(cp - p1); d2 = np.linalg.norm(cp - p2)
+                        far_pt = p1 if d1 > d2 else p2
+                        away_dir = far_pt - cp
+                        hit = _ray_intersect_contour(cp, away_dir, cnt_pts, t_min=2.0)
+                        if hit is not None:
+                            inter_hits.append( (hit[1], hit[2]) )
+                    if len(inter_hits) != 2:
+                        continue
+                    (i1_pt, i1_idx), (i2_pt, i2_idx) = inter_hits[0], inter_hits[1]
+
+                    # 任一交点与角点距离 < 5mm 则跳过此角的Q检测（避免微小切角被误判）
+                    try:
+                        th_px = float(5.0 * pixels_per_mm) if pixels_per_mm else None
+                    except Exception:
+                        th_px = None
+                    if th_px is not None and th_px > 0:
+                        d1 = float(np.linalg.norm(np.array(i1_pt, dtype=float) - cp))
+                        d2 = float(np.linalg.norm(np.array(i2_pt, dtype=float) - cp))
+                        if d1 < th_px or d2 < th_px:
+                            continue
+
+                    # 基于“角点 + 两条主边 + 玻璃轮廓”为边界做受限泛洪填充：得到完整封闭连通域
+                    # 1) 构造边界屏障：玻璃轮廓线 + 两条主边（无限延长，较粗），禁止跨越
+                    barrier = np.zeros(roi_gray.shape, dtype=np.uint8)
+                    try:
+                        cv2.polylines(barrier, [main_cnt_qc], isClosed=True, color=255, thickness=2)
+                    except Exception:
+                        pass
+                    # 两条主边方向（从角点出发，沿远离角点方向）
+                    def _norm(v):
+                        n = float(np.linalg.norm(v));
+                        return (v / n) if n > 1e-9 else v
+                    # 选取两条线的“远离角点”的方向
+                    dirs = []
+                    for _, seg in chosen:
+                        p1 = np.array(seg[:2], dtype=float); p2 = np.array(seg[2:], dtype=float)
+                        d1 = np.linalg.norm(cp - p1); d2 = np.linalg.norm(cp - p2)
+                        far_pt = p1 if d1 > d2 else p2
+                        dirs.append(_norm(far_pt - cp))
+                    if len(dirs) != 2:
+                        continue
+                    u1, u2 = dirs[0], dirs[1]
+                    # 仅画到与玻璃轮廓的交点，避免越界延伸导致误闭合
+                    try:
+                        cp_i = (int(round(cp[0])), int(round(cp[1])))
+                        i1_i = (int(round(i1_pt[0])), int(round(i1_pt[1])))
+                        i2_i = (int(round(i2_pt[0])), int(round(i2_pt[1])))
+                        cv2.line(barrier, cp_i, i1_i, 255, thickness=3)
+                        cv2.line(barrier, cp_i, i2_i, 255, thickness=3)
+                    except Exception:
+                        pass
+
+                    # 2) 基于“直线+轮廓”确定外侧方向：以两交点向量的反向作为外侧双角平分线
+                    dir_in1 = _norm(np.array(i1_pt, dtype=float) - cp)
+                    dir_in2 = _norm(np.array(i2_pt, dtype=float) - cp)
+                    seed_dir = -(dir_in1 + dir_in2)
+                    if np.linalg.norm(seed_dir) < 1e-9:
+                        # 退化情形：回退到 (u1+u2) 并在后续做正反两向探测
+                        seed_dir = _norm(u1 + u2)
+                        if np.linalg.norm(seed_dir) < 1e-9:
+                            # 再退化：u1 旋转 45°
+                            R = np.array([[np.cos(np.deg2rad(45)), -np.sin(np.deg2rad(45))],
+                                          [np.sin(np.deg2rad(45)),  np.cos(np.deg2rad(45))]], dtype=float)
+                            seed_dir = _norm(R @ u1)
+                    seed_dist = float(max(2.0, min(8.0, 0.02 * max(roi_gray.shape))))
+
+                    # 在正反两个方向、若干倍距离上试探，选取第一个“越出玻璃且不落在屏障上”的像素作为种子
+                    H, W = roi_gray.shape
+                    def _pick_seed(along_dir):
+                        al = _norm(along_dir)
+                        if np.linalg.norm(al) < 1e-9:
+                            return None
+                        for mul in (1.0, 1.5, 2.0, 3.0):
+                            sp = (cp + al * (seed_dist * mul)).astype(float)
+                            sx_, sy_ = int(round(sp[0])), int(round(sp[1]))
+                            if 0 <= sx_ < W and 0 <= sy_ < H and barrier[sy_, sx_] == 0 and mask_cnt_qc[sy_, sx_] == 0:
+                                return sp, sx_, sy_
+                        return None
+
+                    picked = _pick_seed(seed_dir)
+                    if picked is None:
+                        picked = _pick_seed(-seed_dir)
+                    if picked is None:
+                        continue
+                    seed_pt, sx, sy = picked
+
+                    # 3) 受限泛洪：在“非边界且未访问”的像素上扩张
+                    Hh, Ww = roi_gray.shape
+                    visited = np.zeros((Hh, Ww), dtype=np.uint8)
+                    from collections import deque
+                    q = deque()
+                    q.append((sx, sy))
+                    visited[sy, sx] = 1
+                    diff = np.zeros((Hh, Ww), dtype=np.uint8)
+                    diff[sy, sx] = 255
+                    while q:
+                        x0, y0 = q.popleft()
+                        for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                            xn, yn = x0+dx, y0+dy
+                            if 0 <= xn < Ww and 0 <= yn < Hh and not visited[yn, xn] and barrier[yn, xn] == 0:
+                                visited[yn, xn] = 1
+                                diff[yn, xn] = 255
+                                q.append((xn, yn))
+                    if cv2.countNonZero(diff) <= 0:
+                        continue
+                    # 轻量形态学平滑
+                    try:
+                        p_def = params.get('DEFECT_DETECTION', {})
+                        min_thick_px = _get_dist_px(p_def, 'Q_REGION_MIN_THICKNESS_MM', 'Q_REGION_MIN_THICKNESS', 1.5, pixels_per_mm)
+                        k = max(3, int(round(float(min_thick_px))))
+                        if k % 2 == 0: k += 1
+                        kernel_smooth = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                        diff = cv2.morphologyEx(diff, cv2.MORPH_OPEN, kernel_smooth, iterations=1)
+                        diff = cv2.morphologyEx(diff, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3)), iterations=1)
+                    except Exception:
+                        pass
+                    cand_cnts2, _ = cv2.findContours(diff, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    for c2 in cand_cnts2:
+                        area_px = cv2.contourArea(c2)
+                        if area_px <= 1.0:
+                            continue
+                        r2 = cv2.minAreaRect(c2)
+                        (cx, cy), (rw, rh), ang = r2
+                        width_mm = (min(rw, rh) / float(pixels_per_mm)) if pixels_per_mm else 0.0
+                        length_mm = (max(rw, rh) / float(pixels_per_mm)) if pixels_per_mm else 0.0
+                        area_mm2 = (rw * rh) / float(pixels_per_mm * pixels_per_mm) if pixels_per_mm else 0.0
+                        try:
+                            p_def_local2 = params.get('DEFECT_DETECTION', {})
+                            q_cfg2 = float(p_def_local2.get('Q_MAX_SIDE_MM', 0.0))
+                        except Exception:
+                            q_cfg2 = 0.0
+                        # 同样施加 50mm 硬性上限
+                        q_max_side_mm2 = 50.0 if (q_cfg2 is None or q_cfg2 <= 0.0 or q_cfg2 > 50.0) else q_cfg2
+                        max_side_ok2 = (length_mm <= q_max_side_mm2 and width_mm <= q_max_side_mm2)
+                        if width_mm >= 5.0 and area_mm2 >= 25.0 and max_side_ok2:
+                            box2 = cv2.boxPoints(r2).astype(np.int32)
+                            eps = max(2.0, 0.02 * float(cv2.arcLength(c2, True)))
+                            approx = cv2.approxPolyDP(c2, eps, True)
+                            if approx is None or len(approx) < 3:
+                                approx = c2
+                            corner_contour_q_defects.append({
+                                'type': 'Q',
+                                'min_area_rect': r2,
+                                'box_points': box2,
+                                'region_contour': approx.astype(np.int32),
+                                'center': (int(round(cx)), int(round(cy))),
+                                'origin': 'corner_contour',
+                                'corner_point': tuple(map(int, cp)),
+                                'outside_pixel_count': int(cv2.countNonZero(diff)),
+                                'barrier_lines': [
+                                    [int(round(cp[0])), int(round(cp[1])), int(round(i1_pt[0])), int(round(i1_pt[1]))],
+                                    [int(round(cp[0])), int(round(cp[1])), int(round(i2_pt[0])), int(round(i2_pt[1]))]
+                                ],
+                                'barrier_contour': main_cnt_qc.reshape(-1,2).astype(int).tolist(),
+                                'intersections': [tuple(map(int, i1_pt)), tuple(map(int, i2_pt))]
+                            })
+    except Exception:
+        pass
+
+    # 去重：基于质心距离（像素）与 origin，避免重复 Q
+    def _dedup_q(existing, new_list, dist_px: float = 6.0):
+        kept = existing[:]
+        for nd in new_list:
+            c_new = np.array(nd.get('center', (0,0)), dtype=float)
+            duplicated = False
+            for od in kept:
+                if od.get('type') != 'Q':
+                    continue
+                c_old = np.array(od.get('center', (0,0)), dtype=float)
+                if np.linalg.norm(c_new - c_old) < dist_px:
+                    duplicated = True
+                    break
+            if not duplicated:
+                kept.append(nd)
+        return kept
+
+    rect_q_defects = _dedup_q(rect_q_defects, corner_contour_q_defects)
 
     # 计算某条主边“平行四边形扫描带”的平均亮度，选择相对于缺角三角形质心的内侧（与三角形相反侧）半带，剔除边线与端点
     # 用作缺角(Q)亮度门控的对比基准
@@ -968,7 +1246,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         )
         
         intersection = find_line_intersection(line1, line2)
-        if intersection is None: continue
+        if intersection is None:
+            continue
         
         dists_i = [np.linalg.norm(intersection - line1[:2]), np.linalg.norm(intersection - line1[2:])]; endpoint_idx_i = np.argmin(dists_i)
         dists_j = [np.linalg.norm(intersection - line2[:2]), np.linalg.norm(intersection - line2[2:])]; endpoint_idx_j = np.argmin(dists_j)
@@ -977,8 +1256,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             continue
 
         corner_gap_px = _get_dist_px(p_defect, "CORNER_MAX_PHYSICAL_GAP_MM", "CORNER_MAX_PHYSICAL_GAP", None, pixels_per_mm)
+        # 允许 ROI 外延：若线段被 ROI 截断，允许最多 20% ROI 宽度的“虚拟延长”参与交点
+        roi_ext_allow = 0.2 * float(roi_w)
+        max_extend_eff = max(float(max_extension_dist), float(roi_ext_allow))
         is_physical = dists_i[endpoint_idx_i] < corner_gap_px and dists_j[endpoint_idx_j] < corner_gap_px
-        is_valid_virtual = dists_i[endpoint_idx_i] < max_extension_dist and dists_j[endpoint_idx_j] < max_extension_dist
+        is_valid_virtual = dists_i[endpoint_idx_i] < max_extend_eff and dists_j[endpoint_idx_j] < max_extend_eff
 
         if (is_physical or is_valid_virtual) and (0 <= intersection[0] < roi_w and 0 <= intersection[1] < roi_h):
             endpoint_paired_status[i][endpoint_idx_i] = True; endpoint_paired_status[j][endpoint_idx_j] = True
@@ -1013,8 +1295,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 # lateral 宽度容差采用既有 Q_CANNY_STRIPE_HALF_WIDTH_PX（像素）
                 stripe_half = int(max(1, int(params.get('DEFECT_DETECTION', {}).get('Q_CANNY_STRIPE_HALF_WIDTH_PX', 2))))
                 # Harris 搜索范围：沿两主边的最大延伸（像素）
-                max_d1 = float(min(max_extension_dist, np.linalg.norm(p1_far - intersection))) if n1 > 1e-6 else 0.0
-                max_d2 = float(min(max_extension_dist, np.linalg.norm(p2_far - intersection))) if n2 > 1e-6 else 0.0
+                max_d1 = float(min(max_extend_eff, np.linalg.norm(p1_far - intersection))) if n1 > 1e-6 else 0.0
+                max_d2 = float(min(max_extend_eff, np.linalg.norm(p2_far - intersection))) if n2 > 1e-6 else 0.0
 
                 new_p1, new_p2 = _find_q_endpoints_harris(
                     roi_gray,
@@ -2007,10 +2289,22 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
     
-    for edge in edges_for_drawing:
-        pt1 = tuple(map(int, edge[:2]))
-        pt2 = tuple(map(int, edge[2:]))
-        cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
+    # 若存在 corner_contour 的 Q（带 barrier），则不画原始主边，改为在后续绘制 barrier
+    has_barrier_debug = False
+    try:
+        for d in final_defects_for_report:
+            raw = d.get('raw_defect', {})
+            if d.get('type') == 'Q' and raw.get('origin') == 'corner_contour' and raw.get('barrier_lines') is not None:
+                has_barrier_debug = True
+                break
+    except Exception:
+        has_barrier_debug = False
+
+    if not has_barrier_debug:
+        for edge in edges_for_drawing:
+            pt1 = tuple(map(int, edge[:2]))
+            pt2 = tuple(map(int, edge[2:]))
+            cv2.line(roi_color, pt1, pt2, (0, 255, 0), 2)
     annotations_to_draw = []
     
     for defect_report in final_defects_for_report:
@@ -2035,22 +2329,8 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         
         annotations_to_draw.append({'text': text, 'color': color_bgr})
 
-        if defect["type"] == "Q" and "endpoints" in defect:
-            center = np.array(defect["center"])
-            p1_orig, p2_orig = np.array(defect["endpoints"][0]), np.array(defect["endpoints"][1])
-            v1_final, v2_final = p1_orig, p2_orig 
-
-            triangle_vertices = np.array([tuple(map(int, center)), tuple(map(int, v1_final)), tuple(map(int, v2_final))], dtype=np.int32)
-            overlay = roi_color.copy()
-            cv2.fillPoly(overlay, [triangle_vertices], color_bgr)
-            cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
-            blue_color = (255, 0, 0)
-            draw_dashed_line(roi_color, tuple(map(int, center)), tuple(map(int, v1_final)), blue_color, thickness=2, dash_length=8)
-            draw_dashed_line(roi_color, tuple(map(int, center)), tuple(map(int, v2_final)), blue_color, thickness=2, dash_length=8)
-
-        elif defect["type"] == "X" and "center" in defect:
-            cv2.circle(roi_color, defect["center"], 15, color_bgr, THICKNESS)
-        elif defect_report["type"] == "Q" and "region_contour" in defect:
+        # Q 不再强制绘制三角形，统一用 region_contour；若有 barrier 信息，附加 barrier 显示
+        if defect_report["type"] == "Q" and "region_contour" in defect:
             # 使用像素块的真实轮廓高亮（不使用 minAreaRect 来圈出）
             region = defect["region_contour"]
             overlay = roi_color.copy()
@@ -2058,6 +2338,26 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
             # 可选：画细边框帮助观察（维持同色细线）——如完全不需要可去掉下一行
             cv2.drawContours(roi_color, [region], 0, color_bgr, THICKNESS)
+            # barrier 调试：画 barrier 线与玻璃轮廓（黄色）以及交点（青色）
+            raw_q = defect
+            if raw_q.get('origin') == 'corner_contour' and raw_q.get('barrier_lines') is not None:
+                try:
+                    for bl in raw_q.get('barrier_lines', []):
+                        x1,y1,x2,y2 = bl
+                        cv2.line(roi_color, (x1,y1), (x2,y2), (0,255,255), 1)
+                    bc = raw_q.get('barrier_contour')
+                    if bc:
+                        bc_np = np.array(bc, dtype=np.int32)
+                        cv2.polylines(roi_color, [bc_np], True, (0,255,255), 1)
+                    for ipt in raw_q.get('intersections', []):
+                        cv2.circle(roi_color, tuple(map(int, ipt)), 4, (255,255,0), -1)
+                    cp = raw_q.get('corner_point')
+                    if cp:
+                        cv2.circle(roi_color, tuple(map(int, cp)), 5, (0,128,255), -1)
+                except Exception:
+                    pass
+        elif defect["type"] == "X" and "center" in defect:
+            cv2.circle(roi_color, defect["center"], 15, color_bgr, THICKNESS)
         elif defect_report["type"] in ["L", "B", "X", "E"] and "box_points" in defect:
             # 其它缺陷继续使用自身 box_points 可视化
             box_points = defect["box_points"]
@@ -2077,11 +2377,12 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             if area_px > 10.0:
                 ok_area = True  # 不再按轮廓面积门控，统一进入外接形状计算
                 if ok_area:
-                    # 绘制玻璃原始主体轮廓（红色）
-                    try:
-                        cv2.drawContours(roi_color, [main_viz], -1, (0, 0, 255), 1)
-                    except Exception:
-                        pass
+                    # barrier 调试模式下，不绘制原始玻璃主体轮廓
+                    if not has_barrier_debug:
+                        try:
+                            cv2.drawContours(roi_color, [main_viz], -1, (0, 0, 255), 1)
+                        except Exception:
+                            pass
 
                     # 结合“主边缘直线 + 玻璃主体轮廓”计算一个“最小包裹轮廓且与主边平行”的平行四边形（最小外接平行包络）
                     try:
@@ -2118,102 +2419,104 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             v_dir = np.array([-u_dir[1], u_dir[0]], dtype=np.float32)
                             angle_deg = float(np.degrees(np.arctan2(u_dir[1], u_dir[0])))
 
-                        # 2) 在 (u,v) 坐标系中：用主体轮廓确定范围，用主边缘直线“对齐”四条边的位置
+                        # 2) 仅依靠主边缘直线生成平行四边形：按方向分组，取各自偏移极值构造两对平行线
                         pts = main_viz.reshape(-1, 2).astype(np.float32)
                         center = np.mean(pts, axis=0).astype(np.float32)
-                        rel = pts - center
-                        u = rel @ u_dir
-                        v = rel @ v_dir
-                        u_min, u_max = float(np.min(u)), float(np.max(u))
-                        v_min, v_max = float(np.min(v)), float(np.max(v))
-                        if v_max - v_min < 1e-6 or u_max - u_min < 1e-6:
-                            raise RuntimeError('degenerate glass contour in uv range')
 
-                        # 最小包裹：直接以轮廓在 (u,v) 的极值作为四边偏移（保证完全包裹且面积最小）
-                        u_left = u_min; u_right = u_max
-                        v_top = v_min; v_bottom = v_max
-
-                        # 构建四条“无限长”边线以求交点，确保边与主边方向平行
-                        T_local = float(max(roi_gray.shape) * 20)
-                        def _line_from_v(v0):
-                            c = center + v0 * v_dir
-                            return np.array([c[0] - T_local*u_dir[0], c[1] - T_local*u_dir[1], c[0] + T_local*u_dir[0], c[1] + T_local*u_dir[1]])
-                        def _line_from_u(u0):
-                            c = center + u0 * u_dir
-                            return np.array([c[0] - T_local*v_dir[0], c[1] - T_local*v_dir[1], c[0] + T_local*v_dir[0], c[1] + T_local*v_dir[1]])
-                        lt = find_line_intersection(_line_from_u(u_left), _line_from_v(v_top))
-                        rt = find_line_intersection(_line_from_u(u_right), _line_from_v(v_top))
-                        rb = find_line_intersection(_line_from_u(u_right), _line_from_v(v_bottom))
-                        lb = find_line_intersection(_line_from_u(u_left), _line_from_v(v_bottom))
-                        if any(pt is None for pt in (lt, rt, rb, lb)):
-                            raise RuntimeError('failed to intersect snapped lines')
-                        quad_pts = np.array([
-                            [int(round(lt[0])), int(round(lt[1]))],
-                            [int(round(rt[0])), int(round(rt[1]))],
-                            [int(round(rb[0])), int(round(rb[1]))],
-                            [int(round(lb[0])), int(round(lb[1]))]
-                        ], dtype=np.int32)
-
-                        # 5) 结果模式：与主边方向平行的“最小包裹”平行四边形（不强制与某一条主线重合）
-                        mode = 'parallel-min-envelope'
-
-                        # 面积计算（px² 与 mm²）
-                        width_px = float(u_right - u_left)
-                        height_px = float(v_bottom - v_top)
-                        area_px2 = max(0.0, width_px) * max(0.0, height_px)
-                        area_mm2 = float(area_px2) / float(pixels_per_mm * pixels_per_mm) if pixels_per_mm else 0.0
-
-                        # 允许检测的最小面积（mm²）
                         try:
-                            min_detect_area_mm2 = float(params.get('DEFECT_DETECTION', {}).get('ENVELOPE_MIN_DETECT_AREA_MM2', 10000.0))
+                            angle_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('ENVELOPE_SNAP_ANGLE_TOL_DEG', 8.0))
                         except Exception:
-                            min_detect_area_mm2 = 10000.0
+                            angle_tol_deg = 8.0
+                        cos_tol = np.cos(np.deg2rad(angle_tol_deg))
 
-                        # 写入报告（不影响现有消费者）
-                        try:
+                        group_u = []  # 与 u_dir 平行 → 用于 v=const 的上下边
+                        group_v = []  # 与 v_dir 平行 → 用于 u=const 的左右边
+                        for e in (main_edges or []):
+                            x1, y1, x2, y2 = map(float, e)
+                            p1 = np.array([x1, y1], dtype=np.float32)
+                            p2 = np.array([x2, y2], dtype=np.float32)
+                            vec = p2 - p1
+                            L = float(np.hypot(vec[0], vec[1]))
+                            if L <= 1e-6:
+                                continue
+                            dir_line = vec / L
+                            if abs(float(np.dot(dir_line, u_dir))) >= cos_tol:
+                                v1 = (p1 - center) @ v_dir; v2 = (p2 - center) @ v_dir
+                                v_off = float(0.5 * (v1 + v2))
+                                group_u.append({'line': e, 'v_off': v_off})
+                            elif abs(float(np.dot(dir_line, v_dir))) >= cos_tol:
+                                u1 = (p1 - center) @ u_dir; u2 = (p2 - center) @ u_dir
+                                u_off = float(0.5 * (u1 + u2))
+                                group_v.append({'line': e, 'u_off': u_off})
+
+                        # 需要两组方向各至少两条直线，才能纯由主边生成一个闭合平行四边形
+                        if len(group_u) >= 2 and len(group_v) >= 2:
+                            group_u.sort(key=lambda it: it['v_off'])
+                            group_v.sort(key=lambda it: it['u_off'])
+                            v_top = float(group_u[0]['v_off']); v_bottom = float(group_u[-1]['v_off'])
+                            u_left = float(group_v[0]['u_off']); u_right = float(group_v[-1]['u_off'])
+
+                            # 生成无限长边线并求四角
+                            T_local = float(max(roi_gray.shape) * 20)
+                            def _line_from_v(v0):
+                                c = center + v0 * v_dir
+                                return np.array([c[0] - T_local*u_dir[0], c[1] - T_local*u_dir[1], c[0] + T_local*u_dir[0], c[1] + T_local*u_dir[1]])
+                            def _line_from_u(u0):
+                                c = center + u0 * u_dir
+                                return np.array([c[0] - T_local*v_dir[0], c[1] - T_local*v_dir[1], c[0] + T_local*v_dir[0], c[1] + T_local*v_dir[1]])
+
+                            lt = find_line_intersection(_line_from_u(u_left), _line_from_v(v_top))
+                            rt = find_line_intersection(_line_from_u(u_right), _line_from_v(v_top))
+                            rb = find_line_intersection(_line_from_u(u_right), _line_from_v(v_bottom))
+                            lb = find_line_intersection(_line_from_u(u_left), _line_from_v(v_bottom))
+                            if any(pt is None for pt in (lt, rt, rb, lb)):
+                                raise RuntimeError('failed to intersect snapped lines')
+                            quad_pts = np.array([
+                                [int(round(lt[0])), int(round(lt[1]))],
+                                [int(round(rt[0])), int(round(rt[1]))],
+                                [int(round(rb[0])), int(round(rb[1]))],
+                                [int(round(lb[0])), int(round(lb[1]))]
+                            ], dtype=np.int32)
+
+                            # 结果模式：仅由主边直线生成的平行四边形
+                            mode = 'lines-parallelogram'
+
+                            # 面积（px² 与 mm²）
+                            width_px = float(u_right - u_left)
+                            height_px = float(v_bottom - v_top)
+                            area_px2 = max(0.0, width_px) * max(0.0, height_px)
+                            area_mm2 = float(area_px2) / float(pixels_per_mm * pixels_per_mm) if pixels_per_mm else 0.0
+
+                            # 写入报告
                             roi_report['envelope'] = {
                                 'mode': mode,
                                 'angle_deg': angle_deg,
                                 'points': quad_pts.tolist(),
                                 'area_mm2': float(area_mm2),
-                                'min_detect_area_mm2': float(min_detect_area_mm2)
+                                'status': 'ok'
                             }
-                            # 仅在面积达标时提供全图绘制点；否则标记 too-small-for-detection
                             gx, gy = int(x), int(y)
-                            if area_mm2 >= min_detect_area_mm2:
-                                quad_global = (quad_pts + np.array([gx, gy], dtype=np.int32)).tolist()
-                                roi_report['envelope']['points_global'] = quad_global
-                                roi_report['envelope']['status'] = 'ok'
-                            else:
-                                roi_report['envelope']['status'] = 'too-small-for-detection'
-                        except Exception:
-                            pass
-
-                        # 可视化绘制我们外接四边形（青色）
-                        try:
-                            # 仅当面积达标才在 ROI 内叠加绘制
-                            if area_mm2 >= min_detect_area_mm2:
+                            roi_report['envelope']['points_global'] = (quad_pts + np.array([gx, gy], dtype=np.int32)).tolist()
+                            # ROI 内绘制（不再受面积门槛限制）
+                            try:
                                 cv2.polylines(roi_color, [quad_pts], True, (0, 255, 255), 1)
-                        except Exception:
-                            pass
-
-                        # 若面积不足以允许检测，则在此阶段对 Q 缺陷进行过滤（不输出），以满足“面积达标才允许进行检测”的约束
-                        try:
-                            if area_mm2 < min_detect_area_mm2 and isinstance(roi_report.get('defects'), list):
-                                roi_report['defects'] = [d for d in roi_report['defects'] if d.get('type') != 'Q']
-                        except Exception:
-                            pass
+                            except Exception:
+                                pass
+                        else:
+                            # 主边直线不足以闭合平行四边形：仅记录状态，不绘制、不使用 fallback
+                            try:
+                                roi_report['envelope'] = {
+                                    'mode': 'lines-parallelogram',
+                                    'status': 'insufficient-lines',
+                                    'angle_deg': angle_deg
+                                }
+                            except Exception:
+                                pass
                     except Exception:
-                        # 回退：绘制最小外接矩形（青色），并写入报告
+                        # 构建失败则静默跳过（不使用最小矩形回退，以满足“仅依赖主边直线”）
                         try:
-                            rect_fallback = cv2.minAreaRect(main_viz)
-                            box_fb = cv2.boxPoints(rect_fallback).astype(np.int32)
-                            cv2.polylines(roi_color, [box_fb], True, (0, 255, 255), 1)
-                            roi_report['envelope'] = {
-                                'mode': 'rectangle-fallback',
-                                'angle_deg': float(rect_fallback[2]) if isinstance(rect_fallback[2], (int, float)) else 0.0,
-                                'points': box_fb.tolist()
-                            }
+                            if 'envelope' not in roi_report:
+                                roi_report['envelope'] = {'mode': 'lines-parallelogram', 'status': 'build-error'}
                         except Exception:
                             pass
     except Exception:
@@ -2304,15 +2607,14 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
         x, y, w, h = roi_report["x"], roi_report["y"], roi_report["w"], roi_report["h"]
         if w > 0 and h > 0: final_image[y:y+h, x:x+w] = roi_color
 
-        # 在整幅原图上绘制缺角检测的外接四边形（仅当面积达标），避免仅在 ROI 内导致残缺
+        # 在整幅原图上绘制缺角检测的外接四边形（不受面积门槛限制），避免仅在 ROI 内导致残缺
         try:
             env = roi_report.get('envelope') if isinstance(roi_report, dict) else None
             if isinstance(env, dict):
-                if env.get('status') == 'ok':
-                    pts_g = env.get('points_global')
-                    if pts_g and len(pts_g) >= 4:
-                        quad_g = np.array(pts_g, dtype=np.int32)
-                        cv2.polylines(final_image, [quad_g], True, (0, 255, 255), 1)
+                pts_g = env.get('points_global')
+                if pts_g and len(pts_g) >= 4:
+                    quad_g = np.array(pts_g, dtype=np.int32)
+                    cv2.polylines(final_image, [quad_g], True, (0, 255, 255), 1)
         except Exception:
             pass
         
