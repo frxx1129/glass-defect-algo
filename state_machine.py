@@ -78,6 +78,9 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     except Exception:
         enter_min_time_s = 1.5
     pane_enter_time_s = None
+    # 记录触发进入的首个相机与ROI（仅用于打印）
+    first_presence_cam_idx = None
+    first_presence_roi_idx = None
 
     # 自动分路：每片玻璃内的 NG 汇聚与一次性触发
     auto_ng_cams = set()           # 出现NG的相机集合（逻辑索引）
@@ -441,6 +444,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         presence_streak = 0
         absence_streak = 0
         pane_enter_time_s = None
+        first_presence_cam_idx = None
+        first_presence_roi_idx = None
         try:
             auto_ng_cams.clear(); last_result_by_cam.clear()
         except Exception:
@@ -822,6 +827,28 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             elif machine_state == "WAITING_FOR_PANE":
                 if current_total_panes > 0:
                     presence_streak += 1
+                    # 记录首次出现 state_code>0 的相机与其触发 ROI（只记录一次）
+                    try:
+                        if first_presence_cam_idx is None and int(result.get('state_code', 0) or 0) > 0:
+                            first_presence_cam_idx = int(cam_index)
+                            # 选择触发ROI：优先 near_vertical_line_count>0，其次 defects 非空，否则取第一个
+                            trig_roi = 0
+                            rois_list = result.get('rois', []) or []
+                            for i_roi, r in enumerate(rois_list):
+                                try:
+                                    if int(r.get('near_vertical_line_count', 0) or 0) > 0:
+                                        trig_roi = i_roi
+                                        break
+                                except Exception:
+                                    continue
+                            else:
+                                for i_roi, r in enumerate(rois_list):
+                                    if r.get('defects'):
+                                        trig_roi = i_roi
+                                        break
+                            first_presence_roi_idx = int(trig_roi)
+                    except Exception:
+                        pass
                     # 仅使用帧数去抖判定进入；最短持续时间在离开时及剔废触发时验证
                     if presence_streak >= ENTER_CONFIRM_FRAMES:
                         # 不再支持滞后剔废：无需处理上一片的延迟上传
@@ -860,7 +887,10 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             except Exception:
                                 pass
                         pane_enter_time_s = time.time()
-                        print("--- [状态机]: 玻璃进入事件 ---")
+                        if first_presence_cam_idx is not None:
+                            print(f"--- [状态机]: 玻璃进入事件 (触发: 相机{first_presence_cam_idx + 1} ROI{first_presence_roi_idx}) ---")
+                        else:
+                            print("--- [状态机]: 玻璃进入事件 (触发: 未捕获) ---")
                 else:
                     # 连续无玻璃：重置帧计数
                     presence_streak = 0
