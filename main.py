@@ -455,8 +455,23 @@ def main():
     try:
         rejection_controller = RejectionController(port=rej_port, baud=rej_baud)
     except Exception as e:
-        print(f"[主进程]: 初始化剔废控制器失败，将使用默认模拟控制器: {e}")
-        rejection_controller = RejectionController()
+        # 若显式配置了端口，但初始化抛错，则直接跳过该设备
+        print(f"[主进程]: 初始化剔废控制器异常，已跳过: {e}")
+        rejection_controller = None
+
+    # 健康检测：若配置了端口但 5 秒内无法建立稳定通信，则跳过该设备
+    if rej_port:
+        if rejection_controller is None:
+            print("[主进程]: 剔除控制器未就绪（初始化失败），剔除功能将被禁用。")
+        else:
+            try:
+                healthy = (not getattr(rejection_controller, 'is_simulation', False)) and \
+                          rejection_controller.health_check(timeout_s=5.0, tries=5)
+            except Exception as _:
+                healthy = False
+            if not healthy:
+                print("[主进程]: 5 秒内无法与剔除控制器建立稳定通信，已跳过连接并禁用剔除功能。")
+                rejection_controller = None
     
     if shared_settings.alarm_port:
         alarm_light_service_instance = _AlarmLightService(port=shared_settings.alarm_port, baud_rate=9600, command_queue=alarm_command_queue)
