@@ -262,8 +262,14 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm: floa
         endpoint_exclude_r = max(3, int(min(0.3 * scan_width, 15)))
 
     ignore_mask = np.zeros_like(roi_gray)
-    if edge_ignore_px > 0:
-        cv2.line(ignore_mask, tuple(map(int, p1)), tuple(map(int, p2)), 255, thickness=int(round(edge_ignore_px)))
+    if edge_ignore_px > 0.5:
+        thickness_px = int(math.ceil(edge_ignore_px))
+        # 安全约束：OpenCV 需要 thickness>=1；再限制一个上限防止异常配置
+        if thickness_px < 1:
+            thickness_px = 1
+        if thickness_px > 256:
+            thickness_px = 256
+        cv2.line(ignore_mask, tuple(map(int, p1)), tuple(map(int, p2)), 255, thickness=thickness_px)
     # 两端点圆形区域直接去除
     cv2.circle(ignore_mask, tuple(map(int, p1)), int(round(endpoint_exclude_r)), 255, thickness=-1)
     cv2.circle(ignore_mask, tuple(map(int, p2)), int(round(endpoint_exclude_r)), 255, thickness=-1)
@@ -1107,8 +1113,13 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 endpoint_exclude_r = max(3, int(min(0.3 * scan_width, 15)))
 
             ignore_mask = np.zeros(roi_gray.shape, dtype=np.uint8)
-            if edge_ignore_px and edge_ignore_px > 0:
-                cv2.line(ignore_mask, tuple(map(int, p1)), tuple(map(int, p2)), 255, thickness=int(round(edge_ignore_px)))
+            if edge_ignore_px and edge_ignore_px > 0.5:
+                thickness_px = int(math.ceil(edge_ignore_px))
+                if thickness_px < 1:
+                    thickness_px = 1
+                if thickness_px > 256:
+                    thickness_px = 256
+                cv2.line(ignore_mask, tuple(map(int, p1)), tuple(map(int, p2)), 255, thickness=thickness_px)
             cv2.circle(ignore_mask, tuple(map(int, p1)), int(round(endpoint_exclude_r)), 255, thickness=-1)
             cv2.circle(ignore_mask, tuple(map(int, p2)), int(round(endpoint_exclude_r)), 255, thickness=-1)
 
