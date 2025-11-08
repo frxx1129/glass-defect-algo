@@ -306,6 +306,234 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm: floa
     return initial_contours
 
 
+def scan_edge_for_chipping_blocks(roi_gray, edge, params, pixels_per_mm: float):
+    """块状(按长度5mm或配置)统计对比的崩边检测。
+    思路:
+      1. 沿主边线构建一条贴边扫描带(宽度 BLOCK_BAND_WIDTH_MM)。
+      2. 按 BLOCK_LENGTH_MM(默认5mm)切分为若干长条块(矩形)。
+      3. 对每块计算特征: 灰度均值、灰度标准差、平均梯度幅值、边缘密度(Canny)。
+      4. 以每种特征的中位数+MAD(中位绝对偏差)做鲁棒离群检测；任一特征偏离超过对应倍数则判定为异常块。
+      5. 将连续异常块合并为更长矩形区域，输出其多边形轮廓。
+    参数(DEFECT_DETECTION下可配置):
+      BLOCK_BASED_CHIPPING_ENABLED: 开关 (bool)
+      BLOCK_LENGTH_MM: 块长度(默认5.0mm)
+      BLOCK_BAND_WIDTH_MM: 扫描带宽度(默认复用 LUMINOSITY_SCAN_WIDTH_MM)
+      BLOCK_MEAN_MAD_K: 灰度均值离群倍数(默认3.0)
+      BLOCK_STD_MAD_K: 灰度标准差离群倍数(默认3.0)
+      BLOCK_GRAD_MAD_K: 梯度幅值离群倍数(默认2.5)
+      BLOCK_EDGE_DENSITY_MAD_K: 边缘密度离群倍数(默认2.5)
+      BLOCK_MIN_CONSECUTIVE: 合并时最少连续块数(默认1)
+    返回: list[np.ndarray] 轮廓列表
+    """
+    p_def = params.get("DEFECT_DETECTION", {})
+    p1 = np.array(edge[:2], dtype=float); p2 = np.array(edge[2:], dtype=float)
+    line_vec = p2 - p1; line_len = float(np.linalg.norm(line_vec))
+    if line_len < 1e-6:
+        return []
+    unit_vec = line_vec / line_len
+    normal_vec = np.array([-unit_vec[1], unit_vec[0]], dtype=float)
+    normal_angle_deg = float((np.degrees(np.arctan2(normal_vec[1], normal_vec[0])) + 180.0) % 180.0)
+    # 宽度: 若无单独配置则复用亮度法的扫描带宽度
+    scan_width_px = _get_dist_px(p_def, "BLOCK_BAND_WIDTH_MM", "BLOCK_BAND_WIDTH", None, pixels_per_mm)
+    if scan_width_px is None or scan_width_px <= 0:
+        scan_width_px = _get_dist_px(p_def, "LUMINOSITY_SCAN_WIDTH_MM", "LUMINOSITY_SCAN_WIDTH", None, pixels_per_mm)
+    scan_width_px = max(2.0, float(scan_width_px))
+    half_width_vec = (scan_width_px / 2.0) * np.array([-unit_vec[1], unit_vec[0]])
+    # 块长度
+    block_len_px = _get_dist_px(p_def, "BLOCK_LENGTH_MM", "BLOCK_LENGTH", None, pixels_per_mm)
+    if block_len_px is None or block_len_px <= 0:
+        block_len_px = 5.0 * float(pixels_per_mm if pixels_per_mm else 1.0)
+    block_len_px = max(4.0, float(block_len_px))
+    # 至少需要两个块才有意义(否则无法形成“异常”)；不足则返回空
+    n_blocks = int(math.floor(line_len / block_len_px))
+    if n_blocks < 2:
+        return []
+    # 预计算梯度与 Canny
+    try:
+        blurred = cv2.medianBlur(roi_gray, 3)
+        grad_x = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = cv2.magnitude(grad_x, grad_y)
+        edge_img = cv2.Canny(blurred, 50, 150)
+    except Exception:
+        grad_x = np.zeros_like(roi_gray, dtype=np.float32)
+        grad_y = np.zeros_like(roi_gray, dtype=np.float32)
+        grad_mag = np.zeros_like(roi_gray, dtype=np.float32)
+        edge_img = np.zeros_like(roi_gray, dtype=np.uint8)
+    # 可选：自适应边缘屏蔽（复用亮度法的动态忽略宽度+端点剔除）
+    use_edge_ignore = bool(p_def.get('BLOCK_USE_EDGE_IGNORE', True))
+    ignore_mask = np.zeros_like(roi_gray, dtype=np.uint8)
+    if use_edge_ignore:
+        # 动态忽略宽度：基于边中点到全图中心距离（px -> mm，0px->0mm, 2000px->4mm）
+        edge_mid = (p1 + p2) / 2.0
+        frame_w = float(params.get('FRAME_WIDTH', roi_gray.shape[1]))
+        frame_h = float(params.get('FRAME_HEIGHT', roi_gray.shape[0]))
+        off_x = float(params.get('ROI_OFFSET_X', 0.0))
+        off_y = float(params.get('ROI_OFFSET_Y', 0.0))
+        edge_mid_global = edge_mid + np.array([off_x, off_y], dtype=float)
+        global_center = np.array([frame_w / 2.0, frame_h / 2.0], dtype=float)
+        dist_px_dynamic = float(np.linalg.norm(edge_mid_global - global_center))
+        ignore_width_mm = min(4.0, max(0.0, dist_px_dynamic * 0.002))
+        if pixels_per_mm and pixels_per_mm > 0:
+            edge_ignore_px = ignore_width_mm * pixels_per_mm
+        else:
+            edge_ignore_px = ignore_width_mm
+        # 允许通过 OVERRIDE_LUMINOSITY_EDGE_IGNORE_MM 覆盖
+        try:
+            override_mm = params.get('DEFECT_DETECTION', {}).get('OVERRIDE_LUMINOSITY_EDGE_IGNORE_MM', None)
+            if override_mm is not None:
+                ov_mm = float(override_mm)
+                if ov_mm >= 0:
+                    edge_ignore_px = ov_mm * (pixels_per_mm if pixels_per_mm else 1.0)
+        except Exception:
+            pass
+        endpoint_exclude_r = _get_dist_px(p_def, "LUMINOSITY_ENDPOINT_EXCLUDE_RADIUS_MM", None, None, pixels_per_mm, default_px=0.0)
+        if endpoint_exclude_r is None or endpoint_exclude_r <= 0:
+            # 缺省：按扫描带宽度的0.3比例，限制上限15px，下限3px
+            endpoint_exclude_r = max(3, int(min(0.3 * scan_width_px, 15)))
+        # 画忽略线与端点圆
+        if edge_ignore_px > 0.5:
+            thickness_px = int(math.ceil(edge_ignore_px))
+            if thickness_px < 1: thickness_px = 1
+            if thickness_px > 256: thickness_px = 256
+            cv2.line(ignore_mask, tuple(map(int, p1)), tuple(map(int, p2)), 255, thickness=thickness_px)
+        cv2.circle(ignore_mask, tuple(map(int, p1)), int(round(endpoint_exclude_r)), 255, thickness=-1)
+        cv2.circle(ignore_mask, tuple(map(int, p2)), int(round(endpoint_exclude_r)), 255, thickness=-1)
+
+    features = []  # 每块: {idx, mean, std, grad, edge_density, poly, dir_ratio}
+    # 构建块并提取特征
+    for bi in range(n_blocks):
+        s = bi * block_len_px
+        e = s + block_len_px
+        if e > line_len:
+            e = line_len
+        seg_p1 = p1 + unit_vec * s
+        seg_p2 = p1 + unit_vec * e
+        # 矩形四点: seg_p1±half_width_vec, seg_p2±half_width_vec
+        q1 = seg_p1 + half_width_vec
+        q2 = seg_p2 + half_width_vec
+        q3 = seg_p2 - half_width_vec
+        q4 = seg_p1 - half_width_vec
+        poly = np.array([q1, q2, q3, q4], dtype=np.int32).reshape((-1, 1, 2))
+        # ROI 裁剪掩膜
+        mask = np.zeros_like(roi_gray, dtype=np.uint8)
+        cv2.fillPoly(mask, [poly], 255)
+        if use_edge_ignore:
+            # 在块统计前剔除贴边忽略区和端点区域
+            mask = cv2.subtract(mask, ignore_mask)
+        # 特征计算
+        mean_val = cv2.mean(roi_gray, mask=mask)[0]
+        # 标准差: 使用 masked 像素
+        pixels = roi_gray[mask == 255]
+        if pixels.size < 4:
+            continue
+        std_val = float(np.std(pixels))
+        grad_mean = cv2.mean(grad_mag, mask=mask)[0]
+        edge_roi = edge_img[mask == 255]
+        edge_density = float(np.count_nonzero(edge_roi)) / float(edge_roi.size if edge_roi.size else 1.0)
+        # 结构一致性：梯度方向是否与边法线一致
+        dir_ratio = 0.0
+        try:
+            # 仅统计 mask 内且为边缘像素的位置
+            h_, w_ = roi_gray.shape
+            edge_positions = np.where((mask == 255) & (edge_img > 0))
+            cnt = int(edge_positions[0].size)
+            if cnt >= 10:
+                gy = grad_y[edge_positions].astype(np.float32)
+                gx = grad_x[edge_positions].astype(np.float32)
+                ang = np.degrees(np.arctan2(gy, gx))
+                ang = np.mod(ang + 180.0, 180.0)  # 0..180
+                diff = np.abs(ang - normal_angle_deg)
+                diff = np.minimum(diff, 180.0 - diff)
+                tol = float(p_def.get('BLOCK_GRAD_DIR_TOL_DEG', 35.0))
+                dir_ratio = float(np.mean(diff <= tol))
+        except Exception:
+            dir_ratio = 0.0
+
+        features.append({"idx": bi, "mean": mean_val, "std": std_val, "grad": grad_mean, "edge_density": edge_density, "poly": poly, "dir_ratio": dir_ratio})
+    if len(features) < 2:
+        return []
+    def _median(values):
+        return float(np.median(np.array(values, dtype=float)))
+    def _mad(values, med):
+        v = np.abs(np.array(values, dtype=float) - med)
+        m = np.median(v)
+        return float(m if m > 1e-6 else 1e-6)
+    means = [f["mean"] for f in features]; m_mean = _median(means); mad_mean = _mad(means, m_mean)
+    stds = [f["std"] for f in features]; m_std = _median(stds); mad_std = _mad(stds, m_std)
+    grads = [f["grad"] for f in features]; m_grad = _median(grads); mad_grad = _mad(grads, m_grad)
+    eds = [f["edge_density"] for f in features]; m_ed = _median(eds); mad_ed = _mad(eds, m_ed)
+    k_mean = float(p_def.get("BLOCK_MEAN_MAD_K", 3.0))
+    k_std = float(p_def.get("BLOCK_STD_MAD_K", 3.0))
+    k_grad = float(p_def.get("BLOCK_GRAD_MAD_K", 2.5))
+    k_ed = float(p_def.get("BLOCK_EDGE_DENSITY_MAD_K", 2.5))
+    structural_mode = bool(p_def.get("BLOCK_STRUCTURAL_MODE", False))
+    # 结构优先模式：忽略亮度均值/标准差离群，只看梯度与边缘密度（或再加最少有效像素比例）
+    min_effective_ratio = float(p_def.get("BLOCK_MIN_EFFECTIVE_PIXEL_RATIO", 0.3)) if structural_mode else 0.0
+    grad_dir_min_ratio = float(p_def.get("BLOCK_GRAD_DIR_MIN_RATIO", 0.5)) if structural_mode else 0.0
+    # 至少需要同时满足一定数量特征的离群判定，才能认为该块异常
+    min_feat_outliers = int(p_def.get("BLOCK_MIN_FEATURE_OUTLIERS", 2))
+    abnormal_indices = []
+    for f in features:
+        dev_mean = abs(f["mean"] - m_mean) / mad_mean
+        dev_std = abs(f["std"] - m_std) / mad_std
+        dev_grad = abs(f["grad"] - m_grad) / mad_grad
+        dev_ed = abs(f["edge_density"] - m_ed) / mad_ed
+        outlier_count = 0
+        if structural_mode:
+            # 计算该块有效像素比例(用于剔除被屏蔽后过窄的块)
+            # poly 掩膜已经减去 ignore_mask 后统计的 pixels.size
+            effective_count = int(np.count_nonzero(roi_gray[f["poly"].reshape(-1,2)[:,1].clip(0,roi_gray.shape[0]-1), f["poly"].reshape(-1,2)[:,0].clip(0,roi_gray.shape[1]-1)])) if False else None
+            # 简化：直接用特征计算阶段的像素数与理论块面积估计比例
+            # 理论面积 ~ block_len_px * scan_width_px；像素数可用 std 计算时的 pixels.size
+            # (此处不重新计算，保守跳过最少比例判断，后续可改进为传入 pixels.size 和面积)
+            if dev_grad > k_grad: outlier_count += 1
+            if dev_ed > k_ed: outlier_count += 1
+            # 方向一致性约束：需要一定比例的边缘梯度方向与边法线一致
+            if f.get('dir_ratio', 0.0) < grad_dir_min_ratio:
+                outlier_count = -9999  # 强制不达标
+        else:
+            if dev_mean > k_mean: outlier_count += 1
+            if dev_std > k_std: outlier_count += 1
+            if dev_grad > k_grad: outlier_count += 1
+            if dev_ed > k_ed: outlier_count += 1
+        if outlier_count >= max(1, min_feat_outliers):
+            abnormal_indices.append(f["idx"])
+    if not abnormal_indices:
+        return []
+    # 合并连续块
+    abnormal_indices.sort()
+    min_consecutive = int(p_def.get("BLOCK_MIN_CONSECUTIVE", 1))
+    merged_polys = []
+    group_start = None; prev = None
+    for idx in abnormal_indices:
+        if group_start is None:
+            group_start = idx; prev = idx; continue
+        if idx == prev + 1:
+            prev = idx; continue
+        # 结束前一组
+        if prev - group_start + 1 >= min_consecutive:
+            merged_polys.append((group_start, prev))
+        group_start = idx; prev = idx
+    if group_start is not None and prev is not None and prev - group_start + 1 >= min_consecutive:
+        merged_polys.append((group_start, prev))
+    contours_out = []
+    for (gs, ge) in merged_polys:
+        s = gs * block_len_px
+        e = (ge + 1) * block_len_px
+        if e > line_len:
+            e = line_len
+        seg_p1 = p1 + unit_vec * s
+        seg_p2 = p1 + unit_vec * e
+        q1 = seg_p1 + half_width_vec
+        q2 = seg_p2 + half_width_vec
+        q3 = seg_p2 - half_width_vec
+        q4 = seg_p1 - half_width_vec
+        poly = np.array([q1, q2, q3, q4], dtype=np.int32)
+        contours_out.append(poly.reshape((-1, 1, 2)))
+    return contours_out
+
+
 def find_gradient_endpoint(start_point, line_vec_normalized, roi_gray_blurred, max_search_dist, search_width=2, gradient_stop_threshold=20.0):
     h, w = roi_gray_blurred.shape
     perp_vec = np.array([-line_vec_normalized[1], line_vec_normalized[0]])
@@ -1249,8 +1477,12 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
 
     # 将斜边缺陷并入后续缺陷列表
     all_chipping_contours = []; chipping_defects = []
+    use_block_based = bool(params.get("DEFECT_DETECTION", {}).get("BLOCK_BASED_CHIPPING_ENABLED", False))
     for edge in true_edges:
-        all_chipping_contours.extend(scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm))
+        if use_block_based:
+            all_chipping_contours.extend(scan_edge_for_chipping_blocks(roi_gray, edge, params, pixels_per_mm))
+        else:
+            all_chipping_contours.extend(scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm))
     if all_chipping_contours:
         defect_canvas = np.zeros(roi_dims, dtype=np.uint8)
         cv2.drawContours(defect_canvas, all_chipping_contours, -1, 255, -1)
