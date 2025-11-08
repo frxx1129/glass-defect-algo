@@ -848,10 +848,10 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     # 新增：按角度将主边分类为 平行 / 垂直 / 斜边，并为斜边生成基于 boundingRect 的缺陷
     skew_line_defects = []
     try:
-        # 默认容忍角度由 15° 调整为 17°（可通过 DEFECT_DETECTION.VERTICAL_ANGLE_TOL_DEG 覆盖）
-        vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 17.0))
+        # 默认容忍角度改为 10°（可通过 DEFECT_DETECTION.VERTICAL_ANGLE_TOL_DEG 覆盖）
+        vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
     except Exception:
-        vertical_tol_deg = 17.0
+        vertical_tol_deg = 10.0
 
     def _angle_to_x_axis_deg(line):
         x1, y1, x2, y2 = map(float, line)
@@ -1458,7 +1458,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             def _handle_as_x_defect():
                 angle = calculate_vertex_angle(p1_far, intersection, p2_far)
                 # 仅在合理范围考虑 X（避免尖角/钝角极端值）
-                if angle < 20.0 or angle > 160.0:
+                if angle < 5.0 or angle > 175.0:
                     return
                 # 按规则对 90° 邻域进行修约
                 corrected_angle = _adjust_angle_near_90(angle)
@@ -2280,10 +2280,10 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
     # 统计“近竖直”的主边数量（0~2 常见）：基于主边段方向角(相对x轴 0~90°)，角度>=90°-tol 视为近竖直
     try:
-        # 默认容忍角度与主流程保持一致：17°（可通过 DEFECT_DETECTION.VERTICAL_ANGLE_TOL_DEG 覆盖）
-        vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 17.0))
+        # 默认容忍角度与主流程保持一致：10°（可通过 DEFECT_DETECTION.VERTICAL_ANGLE_TOL_DEG 覆盖）
+        vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
     except Exception:
-        vertical_tol_deg = 17.0
+        vertical_tol_deg = 10.0
     def _line_angle_deg(line):
         x1, y1, x2, y2 = map(float, line)
         dx, dy = (x2 - x1), (y2 - y1)
