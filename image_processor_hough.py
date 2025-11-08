@@ -225,7 +225,37 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm: floa
     scan_mask = mask_plus if mean_plus < mean_minus else mask_minus
 
     # 从扫描掩膜中剔除边缘线本体及两端点的圆形区域
-    edge_ignore_px = _get_dist_px(p, "LUMINOSITY_EDGE_IGNORE_WIDTH_MM", "LUMINOSITY_EDGE_IGNORE_WIDTH", 0.0, pixels_per_mm)
+    # 动态忽略宽度（仅用于 B 类型亮度缺陷的边线屏蔽）：
+    # 以边线“中点”到整图中心（或提供的全局中心）直线距离线性映射：
+    #   距离 0px -> 忽略 0mm
+    #   距离 2000px -> 忽略 4mm
+    # 即忽略宽度(mm) = clamp(dist_px * 0.002, 0, 4)
+    # 支持参数传入全局图像尺寸 FRAME_WIDTH, FRAME_HEIGHT 与 ROI 偏移 ROI_OFFSET_X/Y；
+    # 若未提供则退回使用当前 roi 的中心作为“整图中心”近似。
+    edge_mid = (p1 + p2) / 2.0
+    frame_w = float(params.get('FRAME_WIDTH', roi_gray.shape[1]))
+    frame_h = float(params.get('FRAME_HEIGHT', roi_gray.shape[0]))
+    off_x = float(params.get('ROI_OFFSET_X', 0.0))
+    off_y = float(params.get('ROI_OFFSET_Y', 0.0))
+    # 计算全局中点与全局中心
+    edge_mid_global = edge_mid + np.array([off_x, off_y], dtype=float)
+    global_center = np.array([frame_w / 2.0, frame_h / 2.0], dtype=float)
+    dist_px_dynamic = float(np.linalg.norm(edge_mid_global - global_center))
+    ignore_width_mm = min(4.0, max(0.0, dist_px_dynamic * 0.002))  # 0.002 mm/px
+    if pixels_per_mm and pixels_per_mm > 0:
+        edge_ignore_px = ignore_width_mm * pixels_per_mm
+    else:
+        # 若无标定，直接用像素距离的一个保守比例（等效 1px = 0.002mm，假设 1mm≈1px -> 宽度≈dist_px*0.002）
+        edge_ignore_px = ignore_width_mm  # 作为像素近似
+    # 保留向后兼容：若配置显式要求固定值，可通过设置 OVERRIDE_LUMINOSITY_EDGE_IGNORE_MM 忽略动态计算
+    try:
+        override_mm = params.get('DEFECT_DETECTION', {}).get('OVERRIDE_LUMINOSITY_EDGE_IGNORE_MM', None)
+        if override_mm is not None:
+            ov_mm = float(override_mm)
+            if ov_mm >= 0:
+                edge_ignore_px = ov_mm * (pixels_per_mm if pixels_per_mm else 1.0)
+    except Exception:
+        pass
     endpoint_exclude_r = _get_dist_px(p, "LUMINOSITY_ENDPOINT_EXCLUDE_RADIUS_MM", None, None, pixels_per_mm, default_px=0.0)
     if endpoint_exclude_r is None or endpoint_exclude_r <= 0:
         # 缺省：按扫描带宽度的 0.3 比例，限制上限 15px，下限 3px
@@ -1050,7 +1080,28 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             scan_mask = mask_minus if s > 0 else mask_plus
 
             # 剔除边线本体与两端点圆形区域，以匹配崩边检测的有效区域
-            edge_ignore_px = _get_dist_px(p, "LUMINOSITY_EDGE_IGNORE_WIDTH_MM", "LUMINOSITY_EDGE_IGNORE_WIDTH", 0.0, pixels_per_mm)
+            # 动态忽略宽度同 B 缺陷：基于边线中点到整图中心距离线性映射
+            edge_mid = (p1 + p2) / 2.0
+            frame_w = float(params.get('FRAME_WIDTH', roi_gray.shape[1]))
+            frame_h = float(params.get('FRAME_HEIGHT', roi_gray.shape[0]))
+            off_x = float(params.get('ROI_OFFSET_X', 0.0))
+            off_y = float(params.get('ROI_OFFSET_Y', 0.0))
+            edge_mid_global = edge_mid + np.array([off_x, off_y], dtype=float)
+            global_center = np.array([frame_w / 2.0, frame_h / 2.0], dtype=float)
+            dist_px_dynamic = float(np.linalg.norm(edge_mid_global - global_center))
+            ignore_width_mm = min(4.0, max(0.0, dist_px_dynamic * 0.002))
+            if pixels_per_mm and pixels_per_mm > 0:
+                edge_ignore_px = ignore_width_mm * pixels_per_mm
+            else:
+                edge_ignore_px = ignore_width_mm
+            try:
+                override_mm = params.get('DEFECT_DETECTION', {}).get('OVERRIDE_LUMINOSITY_EDGE_IGNORE_MM', None)
+                if override_mm is not None:
+                    ov_mm = float(override_mm)
+                    if ov_mm >= 0:
+                        edge_ignore_px = ov_mm * (pixels_per_mm if pixels_per_mm else 1.0)
+            except Exception:
+                pass
             endpoint_exclude_r = _get_dist_px(p, "LUMINOSITY_ENDPOINT_EXCLUDE_RADIUS_MM", None, None, pixels_per_mm, default_px=0.0)
             if endpoint_exclude_r is None or endpoint_exclude_r <= 0:
                 endpoint_exclude_r = max(3, int(min(0.3 * scan_width, 15)))
