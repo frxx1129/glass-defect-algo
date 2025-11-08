@@ -741,7 +741,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         except Exception:
             return []
 
-    rect_q_defects = _detect_q_by_rect_diff(roi_gray, pixels_per_mm, params)
+    # 方法一（矩形差分法）已停用：不再使用四边形与轮廓差来检测 Q
+    rect_q_defects = []
 
     # 新逻辑：利用已获得角部交点与两条主边，与玻璃轮廓求最近交点生成三角形缺角区域
     # 收集玻璃主体轮廓（与矩形差法重复一次，后续可优化成复用）
@@ -871,6 +872,15 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 for (idx_i, idx_j, cp) in corner_inters:
                     # 直接使用该交点对应的两条主边
                     chosen = [(idx_i, edges_for_drawing[idx_i]), (idx_j, edges_for_drawing[idx_j])]
+                    # 新增规则：若角点在玻璃主体轮廓上或距离轮廓<=6px，则跳过该角的Q检测，避免边缘轻微毛刺被误判为缺角
+                    try:
+                        # 计算角点到轮廓所有点的最小欧氏距离
+                        dist_min = float(np.min(np.linalg.norm(cnt_pts - cp, axis=1))) if cnt_pts.size > 0 else 9999.0
+                    except Exception:
+                        dist_min = 9999.0
+                    if dist_min <= 6.0:
+                        # 跳过该角：不构建三角形
+                        continue
                     # 两条线分别求与玻璃轮廓的射线-轮廓交点
                     inter_hits = []  # (point, edge_index)
                     ray_hits_dbg = []  # debug: store dir, t, stripe poly
@@ -998,8 +1008,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 kept.append(nd)
         return kept
 
-    # 以 corner_contour 结果为基准，只有当 rect_diff 结果与其不重叠时才追加
-    rect_q_defects = _dedup_q(corner_contour_q_defects, rect_q_defects)
+    # 仅采用方法二（corner_contour）的 Q 结果
+    rect_q_defects = corner_contour_q_defects
 
     # 计算某条主边“平行四边形扫描带”的平均亮度，选择相对于缺角三角形质心的内侧（与三角形相反侧）半带，剔除边线与端点
     # 用作缺角(Q)亮度门控的对比基准
