@@ -169,14 +169,22 @@ def main():
             print(f"错误: 无法打开视频文件 '{args.input}'。")
             return
         
-        # --- FIX: 设置视频编写器 (VideoWriter) ---
+        # --- FIX: 设置视频编写器 (VideoWriter)，并根据输入格式选择编码器 ---
         fps = cap.get(cv2.CAP_PROP_FPS)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v') # 使用 .mp4 编码器
         
-        base_filename = os.path.splitext(os.path.basename(args.input))[0]
-        output_video_path = os.path.join(args.output, f"{base_filename}_annotated.mp4")
+        base_filename, input_ext = os.path.splitext(os.path.basename(args.input))
+        
+        if input_ext.lower() == '.webm':
+            # 使用 VP8 编码器输出 WebM 格式
+            fourcc = cv2.VideoWriter_fourcc(*'VP80')
+            output_video_path = os.path.join(args.output, f"{base_filename}_annotated.webm")
+        else:
+            # 默认使用 mp4v 编码器输出 MP4 格式
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            output_video_path = os.path.join(args.output, f"{base_filename}_annotated.mp4")
+
         out_video = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
         print(f"输出视频将保存至: {output_video_path}")
 

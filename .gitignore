@@ -36,7 +36,7 @@ dist/
 # OS junk
 Thumbs.db
 .DS_Store
-
+collections/
 # Project-specific artifacts
 main.build/
 main.dist/
