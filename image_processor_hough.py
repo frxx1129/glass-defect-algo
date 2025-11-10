@@ -826,6 +826,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     endpoint_paired_status = {i: [False, False] for i in range(num_true_edges)}
     # 收集未产生 Q 的直线交点，用于后续过滤其附近的 B 误检
     non_q_intersections = []
+    # 记录已确认的角点，供 Q 检测阶段复用，避免重复计算交点
+    paired_corners = []  # 列表元素: (i_idx, j_idx, np.array([x,y]))
     
     def get_line_quadrant(line, w, h):
         center_x, center_y = w / 2, h / 2
@@ -844,6 +846,97 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         return 2
 
     edge_quadrants = [get_line_quadrant(edge, roi_w, roi_h) for edge in true_edges]
+
+    # 新增：为缺角(Q)检测稳定角点，将可靠的“近竖直直线”延长到当前 ROI 边界内
+    # 开关：DEFECT_DETECTION.ENABLE_VERTICAL_EXTENSION_FOR_Q (默认 True)
+    # 最短长度门槛：DEFECT_DETECTION.VERTICAL_EXTEND_MIN_LEN_MM (默认 5mm)
+    try:
+        enable_v_ext = bool(params.get('DEFECT_DETECTION', {}).get('ENABLE_VERTICAL_EXTENSION_FOR_Q', True))
+    except Exception:
+        enable_v_ext = True
+    try:
+        v_ext_min_len_px = _get_dist_px(params.get('DEFECT_DETECTION', {}), 'VERTICAL_EXTEND_MIN_LEN_MM', None, 5.0, pixels_per_mm)
+    except Exception:
+        v_ext_min_len_px = 5.0 * float(pixels_per_mm if pixels_per_mm else 1.0)
+
+    def _clip_infinite_line_to_roi(seg, w, h):
+        """将由 seg 两点确定的无限直线裁剪到 ROI 边界内，返回裁剪后的线段(两端在边界上)。
+        若直线与 ROI 无交则返回原始 seg。"""
+        try:
+            x1, y1, x2, y2 = map(float, seg)
+            dx, dy = (x2 - x1), (y2 - y1)
+            if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+                return seg
+            candidates = []
+            # 与 x=0, x=w-1 相交
+            if abs(dx) >= 1e-9:
+                for xk in (0.0, float(w - 1)):
+                    t = (xk - x1) / dx
+                    yk = y1 + t * dy
+                    if 0.0 <= yk <= float(h - 1):
+                        candidates.append((xk, yk))
+            # 与 y=0, y=h-1 相交
+            if abs(dy) >= 1e-9:
+                for yk in (0.0, float(h - 1)):
+                    t = (yk - y1) / dy
+                    xk = x1 + t * dx
+                    if 0.0 <= xk <= float(w - 1):
+                        candidates.append((xk, yk))
+            # 去重并选择两个最远点
+            if len(candidates) < 2:
+                return seg
+            # 唯一化
+            uniq = []
+            for pt in candidates:
+                if not any(abs(pt[0]-q[0]) < 0.5 and abs(pt[1]-q[1]) < 0.5 for q in uniq):
+                    uniq.append(pt)
+            if len(uniq) < 2:
+                return seg
+            # 选相互最远的两点
+            pts = np.array(uniq, dtype=float)
+            idx0, idx1 = 0, 1
+            maxd = -1.0
+            for i0 in range(len(pts)):
+                for i1 in range(i0+1, len(pts)):
+                    d = float(np.hypot(pts[i1,0]-pts[i0,0], pts[i1,1]-pts[i0,1]))
+                    if d > maxd:
+                        maxd = d; idx0, idx1 = i0, i1
+            a, b = pts[idx0], pts[idx1]
+            return np.array([a[0], a[1], b[0], b[1]], dtype=float)
+        except Exception:
+            return seg
+
+    if enable_v_ext and true_edges:
+        try:
+            # 与“斜边分类”一致使用的竖直容忍角度
+            try:
+                vertical_tol_deg_local = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+            except Exception:
+                vertical_tol_deg_local = 10.0
+            def _angle_to_x_axis_deg_local(line):
+                x1, y1, x2, y2 = map(float, line)
+                dx, dy = (x2 - x1), (y2 - y1)
+                ang = abs(np.degrees(np.arctan2(dy, dx)))
+                if ang > 90.0:
+                    ang = 180.0 - ang
+                return ang
+            H_roi, W_roi = roi_h, roi_w
+            for idx in range(len(true_edges)):
+                seg = true_edges[idx]
+                # 长度门槛
+                try:
+                    if v_ext_min_len_px and v_ext_min_len_px > 0:
+                        if float(np.hypot(seg[2]-seg[0], seg[3]-seg[1])) < float(v_ext_min_len_px):
+                            continue
+                except Exception:
+                    pass
+                ang = _angle_to_x_axis_deg_local(seg)
+                # 近竖直
+                if ang >= (90.0 - vertical_tol_deg_local):
+                    ext = _clip_infinite_line_to_roi(seg, W_roi, H_roi)
+                    true_edges[idx] = np.array(ext, dtype=float)
+        except Exception:
+            pass
 
     # 新增：按角度将主边分类为 平行 / 垂直 / 斜边，并为斜边生成基于 boundingRect 的缺陷
     skew_line_defects = []
@@ -1121,17 +1214,16 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         return float(sum(np.linalg.norm(np.array(path[m+1],dtype=float) - np.array(path[m],dtype=float)) for m in range(len(path)-1)))
                     return (path_f, _path_len(path_f)), (path_b, _path_len(path_b))
 
-                # 基于主边对的真实几何交点来逐一处理缺角：为每个 intersection 独立执行射线与轮廓求交与泛洪
+                # 基于之前确认的角点集合逐一处理缺角：避免在此阶段再次枚举所有主边组合
                 corner_inters = []  # 列表元素: (i, j, cp)
                 H_roi2, W_roi2 = roi_gray.shape[:2]
-                for i_e in range(len(edges_for_drawing)):
-                    for j_e in range(i_e + 1, len(edges_for_drawing)):
-                        inter = find_line_intersection(edges_for_drawing[i_e], edges_for_drawing[j_e])
-                        if inter is None:
-                            continue
-                        xi, yi = float(inter[0]), float(inter[1])
+                for (ii, jj, cp_arr) in paired_corners:
+                    try:
+                        xi, yi = float(cp_arr[0]), float(cp_arr[1])
                         if 0 <= xi < W_roi2 and 0 <= yi < H_roi2:
-                            corner_inters.append((i_e, j_e, np.array([xi, yi], dtype=float)))
+                            corner_inters.append((ii, jj, np.array([xi, yi], dtype=float)))
+                    except Exception:
+                        continue
 
                 for (idx_i, idx_j, cp) in corner_inters:
                     # 直接使用该交点对应的两条主边
@@ -1252,6 +1344,29 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                             'intersections': [tuple(map(int, i1_pt)), tuple(map(int, i2_pt))],
                             'ray_segments': [rh['seg'] for rh in ray_hits_dbg]
                         })
+                # 去重：同一角点附近的 Q 仅保留一个（按中心距离阈值选三角像素面积较大者）
+                try:
+                    if corner_contour_q_defects:
+                        dist_thr = float(params.get('DEFECT_DETECTION', {}).get('Q_DEDUP_CENTER_DIST_PX', 12.0))
+                        dedup = []
+                        for nd in corner_contour_q_defects:
+                            c_new = np.array(nd.get('center', (0,0)), dtype=float)
+                            picked = False
+                            for idx_old, od in enumerate(dedup):
+                                c_old = np.array(od.get('center', (0,0)), dtype=float)
+                                if float(np.linalg.norm(c_new - c_old)) <= dist_thr:
+                                    # 替换为面积更大者
+                                    a_new = float(nd.get('triangle_area_px', 0.0) or 0.0)
+                                    a_old = float(od.get('triangle_area_px', 0.0) or 0.0)
+                                    if a_new > a_old:
+                                        dedup[idx_old] = nd
+                                    picked = True
+                                    break
+                            if not picked:
+                                dedup.append(nd)
+                        corner_contour_q_defects = dedup
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -1454,6 +1569,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             # 预先计算反向端点（用于 Q 回溯及 X 角度判定）
             p1_far = line1[2:] if endpoint_idx_i == 0 else line1[:2]
             p2_far = line2[2:] if endpoint_idx_j == 0 else line2[:2]
+            # 记录角点供 Q 检测阶段复用，避免再次枚举所有主边组合
+            try:
+                paired_corners.append((int(i), int(j), np.array([float(intersection[0]), float(intersection[1])], dtype=float)))
+            except Exception:
+                pass
 
             def _handle_as_x_defect():
                 angle = calculate_vertex_angle(p1_far, intersection, p2_far)
@@ -1903,11 +2023,141 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     p_hough = params["HOUGH_TRANSFORM"]
     binary_edges = preprocess_for_hough_enhanced(roi_gray, params)
+    # 保证传入 HoughLinesP 的参数为整数类型（OpenCV 要求 threshold 为 int，其他也用 int 更稳妥）
     min_len_pixels = roi_gray.shape[1] * p_hough.get("MIN_LINE_LENGTH_RATIO", 0.05)
+    try:
+        min_len_pixels_i = int(max(1, round(float(min_len_pixels))))
+    except Exception:
+        min_len_pixels_i = max(1, int(roi_gray.shape[1] * 0.05))
+
     max_line_gap_px = _get_dist_px(p_hough, "MAX_LINE_GAP_MM", "MAX_LINE_GAP", None, pixels_per_mm)
-    raw_lines = cv2.HoughLinesP(binary_edges, 1, np.pi / 180, p_hough["THRESHOLD"], minLineLength=min_len_pixels, maxLineGap=max_line_gap_px)
+    try:
+        max_line_gap_px_i = int(max(0, round(float(max_line_gap_px)))) if max_line_gap_px is not None else 0
+    except Exception:
+        max_line_gap_px_i = 0
+
+    try:
+        hough_threshold_i = int(round(float(p_hough.get("THRESHOLD", 50))))
+    except Exception:
+        hough_threshold_i = 50
+
+    raw_lines = cv2.HoughLinesP(
+        binary_edges,
+        1,
+        np.pi / 180,
+        hough_threshold_i,
+        minLineLength=min_len_pixels_i,
+        maxLineGap=max_line_gap_px_i,
+    )
     
     main_edges = merge_lines_and_get_main_edges(raw_lines, params, pixels_per_mm, edge_img=binary_edges)
+
+    # 接入“跨 ROI 统一竖直虚拟边”：将全局共享竖直边裁剪到本 ROI 并并入主边
+    try:
+        p_def_sh = params.get('DEFECT_DETECTION', {})
+        cross_enabled = bool(p_def_sh.get('CROSS_ROI_VERTICAL_ENABLED', True))
+    except Exception:
+        cross_enabled = True
+
+    def _clip_infinite_line_to_roi_local(seg, w_loc, h_loc):
+        try:
+            x1, y1, x2, y2 = map(float, seg)
+            dx, dy = (x2 - x1), (y2 - y1)
+            if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+                return None
+            candidates = []
+            if abs(dx) >= 1e-9:
+                for xk in (0.0, float(w_loc - 1)):
+                    t = (xk - x1) / dx
+                    yk = y1 + t * dy
+                    if 0.0 <= yk <= float(h_loc - 1):
+                        candidates.append((xk, yk))
+            if abs(dy) >= 1e-9:
+                for yk in (0.0, float(h_loc - 1)):
+                    t = (yk - y1) / dy
+                    xk = x1 + t * dx
+                    if 0.0 <= xk <= float(w_loc - 1):
+                        candidates.append((xk, yk))
+            uniq = []
+            for pt in candidates:
+                if not any(abs(pt[0]-q[0]) < 0.5 and abs(pt[1]-q[1]) < 0.5 for q in uniq):
+                    uniq.append(pt)
+            if len(uniq) < 2:
+                return None
+            pts = np.array(uniq, dtype=float)
+            idx0, idx1 = 0, 1
+            maxd = -1.0
+            for i0 in range(len(pts)):
+                for i1 in range(i0+1, len(pts)):
+                    d = float(np.hypot(pts[i1,0]-pts[i0,0], pts[i1,1]-pts[i0,1]))
+                    if d > maxd:
+                        maxd = d; idx0, idx1 = i0, i1
+            a, b = pts[idx0], pts[idx1]
+            return np.array([a[0], a[1], b[0], b[1]], dtype=float)
+        except Exception:
+            return None
+
+    if cross_enabled:
+        try:
+            shared_global = params.get('CROSS_ROI_SHARED_VERTICAL_GLOBAL_EDGES', []) or []
+            if shared_global:
+                # 竖直判定容忍角（与其他流程一致）
+                try:
+                    vertical_tol_deg_local2 = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+                except Exception:
+                    vertical_tol_deg_local2 = 10.0
+                # 将全局共享直线变换到本 ROI 坐标系并裁剪
+                H_roi_loc, W_roi_loc = roi_gray.shape[:2]
+                appended = []
+                for gseg in shared_global:
+                    try:
+                        gx1, gy1, gx2, gy2 = map(float, gseg)
+                        lseg = [gx1 - x, gy1 - y, gx2 - x, gy2 - y]
+                        clipped = _clip_infinite_line_to_roi_local(lseg, W_roi_loc, H_roi_loc)
+                        if clipped is None:
+                            continue
+                        # 仅保留近竖直
+                        dx = float(clipped[2] - clipped[0])
+                        dy = float(clipped[3] - clipped[1])
+                        ang = abs(np.degrees(np.arctan2(dy, dx)))
+                        if ang > 90.0:
+                            ang = 180.0 - ang
+                        if ang < (90.0 - vertical_tol_deg_local2):
+                            continue
+                        appended.append(np.array(clipped, dtype=float))
+                    except Exception:
+                        continue
+                if appended:
+                    # 简单去重：若与现有主边距离很近则跳过
+                    def _seg_perp_dist(a, b, c, d):
+                        A = np.array([a, b], dtype=float); B = np.array([c, d], dtype=float)
+                        v = B - A
+                        L = float(np.hypot(v[0], v[1]))
+                        if L < 1e-6:
+                            return 1e9
+                        mid = (A + B) * 0.5
+                        best = 1e9
+                        for e in main_edges:
+                            E1 = np.array(e[:2], dtype=float); E2 = np.array(e[2:], dtype=float)
+                            ev = E2 - E1
+                            el = float(np.hypot(ev[0], ev[1]))
+                            if el < 1e-6:
+                                continue
+                            # 点到直线距离
+                            cross = float(ev[0]*(mid[1]-E1[1]) - ev[1]*(mid[0]-E1[0]))
+                            dperp = abs(cross)/el
+                            if dperp < best:
+                                best = dperp
+                        return best
+                    for cseg in appended:
+                        try:
+                            d0 = _seg_perp_dist(cseg[0], cseg[1], cseg[2], cseg[3])
+                        except Exception:
+                            d0 = 1e9
+                        if d0 > 2.0:
+                            main_edges.append(cseg)
+        except Exception:
+            pass
     # 计算本帧（该 ROI）主边之间的有效相交点（仅在本 ROI 范围内）
     intersections_frame = []
     if main_edges and len(main_edges) >= 2:
@@ -2374,6 +2624,54 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
             cv2.drawContours(roi_color, [box_points], 0, color_bgr, THICKNESS)
 
+    # 绘制识别到的主直线和“理想直线边”（可配置开关）
+    try:
+        draw_main = bool(p_vis.get('DRAW_MAIN_EDGES', True))
+    except Exception:
+        draw_main = True
+    try:
+        draw_ideal = bool(p_vis.get('DRAW_IDEAL_EDGES', True))
+    except Exception:
+        draw_ideal = True
+    try:
+        draw_shared = bool(p_vis.get('DRAW_SHARED_VERTICAL_EDGES', True))
+    except Exception:
+        draw_shared = True
+
+    if draw_main and len(main_edges) > 0:
+        for e in main_edges:
+            try:
+                x1,y1,x2,y2 = map(int, map(round, e))
+                cv2.line(roi_color, (x1,y1), (x2,y2), (0,255,0), 2)
+            except Exception:
+                continue
+
+    # 共享竖直虚拟边（跨 ROI）以青色虚线绘制
+    if draw_shared:
+        try:
+            shared_global = params.get('CROSS_ROI_SHARED_VERTICAL_GLOBAL_EDGES', []) or []
+            if shared_global:
+                H_loc, W_loc = roi_gray.shape[:2]
+                for g in shared_global:
+                    try:
+                        gx1,gy1,gx2,gy2 = map(float, g)
+                        loc_seg = [gx1 - x, gy1 - y, gx2 - x, gy2 - y]
+                        clipped = None
+                        try:
+                            clipped = _clip_infinite_line_to_roi_local(loc_seg, W_loc, H_loc)
+                        except Exception:
+                            # 若局部裁剪函数不可用，则退回为直接裁剪到 ROI 矩形边界
+                            clipped = None
+                        if clipped is None:
+                            # 粗略范围检查
+                            continue
+                        x1,y1,x2,y2 = map(int, map(round, clipped))
+                        draw_dashed_line(roi_color, (x1,y1), (x2,y2), (255,255,0), thickness=1, dash_length=10)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
     # 在最终标注图上叠加“玻璃最大轮廓 + 最小外接矩形”，便于在结果视频中观察
     try:
         kernel_viz = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -2491,8 +2789,12 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             area_px2 = max(0.0, width_px) * max(0.0, height_px)
                             area_mm2 = float(area_px2) / float(pixels_per_mm * pixels_per_mm) if pixels_per_mm else 0.0
 
-                            # 按新需求：不再写入 envelope 到报告（屏蔽）
-                            pass
+                            # 绘制理想直线边（平行四边形边界）为白色虚线
+                            if draw_ideal:
+                                for k in range(4):
+                                    p0 = tuple(map(int, quad_pts[k]))
+                                    p1 = tuple(map(int, quad_pts[(k+1)%4]))
+                                    draw_dashed_line(roi_color, p0, p1, (255,255,255), thickness=1, dash_length=8)
                         else:
                             # 主边直线不足以闭合平行四边形：仅记录状态，不绘制、不使用 fallback
                             # 不写入 envelope 信息
@@ -2579,6 +2881,167 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
                 pass
             return ({"roi_idx": i, "x": x, "y": y, "w": w, "h": h, "defects": [], "edges_found": 0, "near_vertical_line_count": 0}, roi_bgr)
 
+    # 预收集跨 ROI 的共享竖直直线（全局坐标）
+    try:
+        p_def_cross = hough_params.get('DEFECT_DETECTION', {})
+        cross_enabled = bool(p_def_cross.get('CROSS_ROI_VERTICAL_ENABLED', True))
+    except Exception:
+        cross_enabled = True
+
+    shared_vertical_global = []
+    # 允许外部预注入的共享竖直边（跨帧基线复用）
+    try:
+        preseed_shared = hough_params.get('PRESEEDED_CROSS_ROI_SHARED_VERTICAL_GLOBAL_EDGES', []) or []
+    except Exception:
+        preseed_shared = []
+    if cross_enabled and template_rois:
+        # 角度容忍与最短长度
+        try:
+            vertical_tol_deg_cross = float(hough_params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+        except Exception:
+            vertical_tol_deg_cross = 10.0
+        try:
+            min_len_px_cross = _get_dist_px(hough_params.get('DEFECT_DETECTION', {}), 'CROSS_ROI_VERTICAL_MIN_LEN_MM', None, 5.0, pixels_per_mm)
+        except Exception:
+            min_len_px_cross = 5.0 * float(pixels_per_mm if pixels_per_mm else 1.0)
+        try:
+            cluster_x_px = float(hough_params.get('DEFECT_DETECTION', {}).get('CROSS_ROI_VERTICAL_CLUSTER_XPX', 12.0))
+        except Exception:
+            cluster_x_px = 12.0
+
+        def _parse_roi(rt):
+            if isinstance(rt, (list, tuple)) and len(rt) >= 4:
+                return int(rt[0]), int(rt[1]), int(rt[2]), int(rt[3])
+            if isinstance(rt, dict):
+                if 'x' in rt or 'y' in rt or 'width' in rt or 'height' in rt:
+                    x0 = int(rt.get('x', 0)); y0 = int(rt.get('y', 0))
+                    w0 = int(rt.get('width', rt.get('w', 0)) or 0)
+                    h0 = int(rt.get('height', rt.get('h', 0)) or 0)
+                    return x0, y0, w0, h0
+                if all(k in rt for k in ('left','top','right','bottom')):
+                    left = int(rt.get('left', 0)); top = int(rt.get('top', 0))
+                    right = int(rt.get('right', left)); bottom = int(rt.get('bottom', top))
+                    return left, top, max(0, right - left), max(0, bottom - top)
+            return 0, 0, 0, 0
+
+        cand_global = []  # 每条为 [x1,y1,x2,y2] 全局
+        for r in template_rois:
+            try:
+                rx, ry, rw, rh = _parse_roi(r)
+                if rw <= 0 or rh <= 0:
+                    continue
+                roi_gray = image_gray[ry:ry+rh, rx:rx+rw]
+                edge_img = preprocess_for_hough_enhanced(roi_gray, hough_params)
+                p_h = hough_params.get('HOUGH_TRANSFORM', {})
+                min_len_pixels = roi_gray.shape[1] * p_h.get('MIN_LINE_LENGTH_RATIO', 0.05)
+                try:
+                    min_len_pixels_i = int(max(1, round(float(min_len_pixels))))
+                except Exception:
+                    min_len_pixels_i = max(1, int(roi_gray.shape[1] * 0.05))
+                max_line_gap_px = _get_dist_px(p_h, 'MAX_LINE_GAP_MM', 'MAX_LINE_GAP', None, pixels_per_mm)
+                try:
+                    max_line_gap_px_i = int(max(0, round(float(max_line_gap_px)))) if max_line_gap_px is not None else 0
+                except Exception:
+                    max_line_gap_px_i = 0
+                try:
+                    hough_threshold_i = int(round(float(p_h.get('THRESHOLD', 50))))
+                except Exception:
+                    hough_threshold_i = 50
+                raw = cv2.HoughLinesP(
+                    edge_img,
+                    1,
+                    np.pi/180,
+                    hough_threshold_i,
+                    minLineLength=min_len_pixels_i,
+                    maxLineGap=max_line_gap_px_i,
+                )
+                merged = merge_lines_and_get_main_edges(raw, hough_params, pixels_per_mm, edge_img=edge_img)
+                for seg in merged:
+                    try:
+                        x1,y1,x2,y2 = map(float, seg)
+                        dx = x2 - x1; dy = y2 - y1
+                        ang = abs(np.degrees(np.arctan2(dy, dx)))
+                        if ang > 90.0:
+                            ang = 180.0 - ang
+                        if ang < (90.0 - vertical_tol_deg_cross):
+                            continue
+                        L = float(np.hypot(dx, dy))
+                        if L < float(min_len_px_cross):
+                            continue
+                        # 转全局
+                        cand_global.append([x1 + rx, y1 + ry, x2 + rx, y2 + ry])
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        if cand_global:
+            # 按 x 中值聚类
+            xs = []
+            for s in cand_global:
+                xs.append(0.5 * (float(s[0]) + float(s[2])))
+            order = np.argsort(np.array(xs))
+            groups = []
+            for idx in order:
+                xm = xs[int(idx)]
+                seg = cand_global[int(idx)]
+                if not groups:
+                    groups.append({'xs':[xm],'segs':[seg]})
+                else:
+                    if abs(xm - float(np.mean(groups[-1]['xs']))) <= cluster_x_px:
+                        groups[-1]['xs'].append(xm); groups[-1]['segs'].append(seg)
+                    else:
+                        groups.append({'xs':[xm],'segs':[seg]})
+            # 每组生成一条全局竖直边：x = 均值；y 范围 = 该组所有段的 min/max
+            for g in groups:
+                x_mean = float(np.mean(np.array(g['xs'], dtype=float)))
+                y_min = 1e9; y_max = -1e9
+                for s in g['segs']:
+                    y_min = min(y_min, float(min(s[1], s[3])))
+                    y_max = max(y_max, float(max(s[1], s[3])))
+                if y_max - y_min >= 1.0:
+                    shared_vertical_global.append([x_mean, y_min, x_mean, y_max])
+
+        # 与外部预注入的共享竖直边合并（按 x 接近去重）
+        try:
+            if preseed_shared:
+                def _x_mid(seg):
+                    try:
+                        return 0.5 * (float(seg[0]) + float(seg[2]))
+                    except Exception:
+                        return float('inf')
+                merged = list(shared_vertical_global)
+                for p in preseed_shared:
+                    px = _x_mid(p)
+                    if not np.isfinite(px):
+                        continue
+                    found_close = False
+                    for s in merged:
+                        sx = _x_mid(s)
+                        if abs(px - sx) <= cluster_x_px:
+                            found_close = True
+                            break
+                    if not found_close:
+                        # 直接追加预注入基线
+                        try:
+                            x1,y1,x2,y2 = map(float, p)
+                            merged.append([x1,y1,x2,y2])
+                        except Exception:
+                            continue
+                shared_vertical_global = merged
+        except Exception:
+            pass
+
+    # 将共享竖直边放入参数供 ROI 线程读取
+    try:
+        # 无论是否为空，都同步当前帧的共享竖直边到参数，供 ROI 线程绘制使用
+        if cross_enabled:
+            hough_params['CROSS_ROI_SHARED_VERTICAL_GLOBAL_EDGES'] = shared_vertical_global
+        else:
+            hough_params.pop('CROSS_ROI_SHARED_VERTICAL_GLOBAL_EDGES', None)
+    except Exception:
+        pass
+
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(_safe_roi_hough, i, r) for i, r in enumerate(template_rois)]
         results = [future.result() for future in futures]
@@ -2597,9 +3060,15 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
             report["image_status"] = "NG"
             report["defects"].extend(roi_report["defects"])
             
-        slim_report = {k: roi_report.get(k) for k in ("roi_idx","x","y","w","h","edges_found")}
+    # 将 near_vertical_line_count 也带入状态机可用的精简 ROI 报告
+        slim_report = {k: roi_report.get(k) for k in ("roi_idx","x","y","w","h","edges_found","near_vertical_line_count")}
         report['rois'].append(slim_report)
 
     report["state_code"] = 1 if max_edges_found > 0 else 0
+    # 将共享竖直边作为输出的一部分，便于上层做跨帧基线稳定判定/复用
+    try:
+        report['shared_vertical_edges'] = [list(map(float, s)) for s in (shared_vertical_global or [])]
+    except Exception:
+        report['shared_vertical_edges'] = []
     
     return report, final_image

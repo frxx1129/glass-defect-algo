@@ -118,6 +118,27 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                     algo_mode = int(getattr(shared_settings, 'algorithm_mode', 1))
                 except Exception:
                     algo_mode = 1
+
+                # 在调用算法前注入状态机侧的“跨帧共享竖直边基线”（仅本次调用有效）
+                try:
+                    preseed_map = getattr(shared_settings, 'preseed_vertical_edges_by_cam', {})
+                except Exception:
+                    preseed_map = {}
+                try:
+                    edges_preseed = None
+                    if isinstance(preseed_map, dict):
+                        edges_preseed = preseed_map.get(str(cam_idx)) or preseed_map.get(cam_idx)
+                    if edges_preseed:
+                        config.setdefault('hough_inspector_params', {})['PRESEEDED_CROSS_ROI_SHARED_VERTICAL_GLOBAL_EDGES'] = edges_preseed
+                    else:
+                        if 'hough_inspector_params' in config and 'PRESEEDED_CROSS_ROI_SHARED_VERTICAL_GLOBAL_EDGES' in config['hough_inspector_params']:
+                            try:
+                                del config['hough_inspector_params']['PRESEEDED_CROSS_ROI_SHARED_VERTICAL_GLOBAL_EDGES']
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
                 pane_json, annotated_image = fused_image_processor.process_image(
                     frame_data, roi_cache[cam_idx], config, algo_mode)
 
@@ -206,6 +227,12 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                 if not success_original:
                     continue
 
+                # 额外编码一份“原始灰度图”用于 NG 原图保存（使用 PNG 无损）
+                try:
+                    success_raw, raw_buffer_encoded = cv2.imencode('.png', frame_data)
+                except Exception:
+                    success_raw, raw_buffer_encoded = False, None
+
                 PREVIEW_WIDTH = int(config.get('system_params', {}).get('preview_width', 800) or 800)
                 height, width, _ = annotated_image.shape
                 scale = PREVIEW_WIDTH / width
@@ -214,6 +241,8 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                 success_preview, preview_buffer_encoded = cv2.imencode('.jpg', preview_image, [cv2.IMWRITE_JPEG_QUALITY, jpg_q_preview])
 
                 base64_image_string = base64.b64encode(preview_buffer_encoded if success_preview else original_buffer_encoded).decode('utf-8')
+
+                # 注：此处不再修改 config 的预注入键，避免污染后续帧；上面已在调用前处理
 
                 result = {
                     "camera_index": cam_idx,
@@ -224,6 +253,10 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                     "state_code": pane_json.get('state_code', 0),
                     "should_reject": should_reject_overall,
                     "annotated_image_buffer": original_buffer_encoded.tobytes(),
+                    # 透传本帧计算得到的共享竖直边，供状态机判断是否稳定
+                    "shared_vertical_edges": pane_json.get('shared_vertical_edges', []),
+                    # 原始灰度图（PNG）缓冲，用于 NG 保存
+                    "raw_image_buffer": (raw_buffer_encoded.tobytes() if success_raw else None),
                 }
                 # 采集模式下不保存 inspection_results 目录（主逻辑已有 storage_path，但这里只控制结果入队即可）
                 results_queue.put(result)

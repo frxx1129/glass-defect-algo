@@ -64,8 +64,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     # 默认帧数略降到3，在引入“进入最短时间”门槛后整体更稳且响应更快
     ENTER_CONFIRM_FRAMES = int(getattr(shared_settings, 'enter_confirm_frames', 3))
     LEAVE_CONFIRM_FRAMES = int(getattr(shared_settings, 'leave_confirm_frames', 3))
-    presence_streak = 0
-    absence_streak = 0
+    presence_streak = 0           # 连续“进入”条件满足的帧计数（这里改为：连续水平组缺失）
+    absence_streak = 0            # 连续“离开”条件满足的帧计数（这里改为：连续水平+竖直组同时出现）
     presence_start_time_s = None  # 不再用于进入判定，仅用于可能的扩展/调试
     # 新增：玻璃进入后的最大持续时间（秒），超时强制退出
     try:
@@ -82,12 +82,43 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     first_presence_cam_idx = None
     first_presence_roi_idx = None
 
+    # 跨帧“基线复用”参数与缓存（按相机）
+    try:
+        memory_enabled = bool(getattr(shared_settings, 'memory_enabled', True))
+    except Exception:
+        memory_enabled = True
+    try:
+        memory_baseline_stability_frames = int(getattr(shared_settings, 'memory_baseline_stability_frames', 2) or 2)
+    except Exception:
+        memory_baseline_stability_frames = 2
+    try:
+        memory_max_shift_px = float(getattr(shared_settings, 'memory_max_shift_px', 6.0) or 6.0)
+    except Exception:
+        memory_max_shift_px = 6.0
+
+    pane_vert_history_by_cam = {}
+    pane_vert_streak_by_cam = {}
+    pane_preseed_set_cams = set()
+
     # 自动分路：每片玻璃内的 NG 汇聚与一次性触发
     auto_ng_cams = set()           # 出现NG的相机集合（逻辑索引）
     last_result_by_cam = {}        # 最近一帧NG结果（含缺陷坐标）的引用
     auto_first_ng_ts_ms = None     # 第一次检测到NG的时间（毫秒）
     # 新增：按整片玻璃周期统计的“竖直边总数”的最大值（跨相机求和，跨时刻取最大）
     pane_max_total_vertical_count = 0
+
+    # 新增：基于“直线组”（水平/竖直）的进入/离开判定所需缓存
+    # 记录每个相机最近一次帧的(总边数, 竖直边数)，用于跨相机聚合
+    last_groups_by_cam: dict[int, tuple[int, int]] = {}
+    # 可配置阈值（缺省给出保守值，可根据产线调参）
+    try:
+        group_min_vertical = int(getattr(shared_settings, 'group_min_vertical', 3) or 3)
+    except Exception:
+        group_min_vertical = 3
+    try:
+        group_min_horizontal = int(getattr(shared_settings, 'group_min_horizontal', 3) or 3)
+    except Exception:
+        group_min_horizontal = 3
 
     def _get_line_mark_info(shared_settings):
         """获取当前产线的标记映射信息：
@@ -389,6 +420,20 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         send_reports_batch_to_server(reports_for_upload, images_for_upload, shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
         print(f"    [状态机]: 本片玻璃上传完成，共 {len(reports_for_upload)} 张 NG 图像。")
 
+    def _clear_preseed_for_all_cams():
+        """清空跨帧竖直边基线（预注入）缓存与共享设置。"""
+        try:
+            if hasattr(shared_settings, 'preseed_vertical_edges_by_cam'):
+                shared_settings.preseed_vertical_edges_by_cam = {}
+        except Exception:
+            pass
+        try:
+            pane_vert_history_by_cam.clear()
+            pane_vert_streak_by_cam.clear()
+            pane_preseed_set_cams.clear()
+        except Exception:
+            pass
+
     # Initial state fetch
     fetch_collection_id_from_server(shared_settings, shared_collection_id)
     initial_state = fetch_initial_state_from_server(shared_settings)
@@ -458,6 +503,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 alarm_light_controller.set_normal_state()
             except Exception:
                 pass
+        # 清空跨帧基线预注入
+        _clear_preseed_for_all_cams()
         # 采集模式：重置跨相机 pane 激活标记
         try:
             if getattr(shared_settings, 'data_collection_mode', False):
@@ -549,11 +596,126 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             last_camera_states[cam_index] = result['state_code']
             current_total_panes = int(np.sum(last_camera_states))
 
+            # 基线稳定与预注入逻辑：仅在玻璃检测状态
+            if memory_enabled and machine_state == "PANE_DETECTED":
+                try:
+                    shared_edges = result.get('shared_vertical_edges') or []
+                    if shared_edges:
+                        hist = pane_vert_history_by_cam.get(cam_index, [])
+                        hist.append(shared_edges)
+                        # 保留最近 (memory_baseline_stability_frames + 1) 份
+                        keep_n = max(2, memory_baseline_stability_frames + 1)
+                        if len(hist) > keep_n:
+                            hist = hist[-keep_n:]
+                        pane_vert_history_by_cam[cam_index] = hist
+                        # 计算与上一帧的平均 x 位移
+                        if len(hist) >= 2:
+                            prev = hist[-2]; curr = hist[-1]
+                            def _mid_x_list(seg_list):
+                                xs = []
+                                for seg in seg_list:
+                                    try:
+                                        xs.append(0.5 * (float(seg[0]) + float(seg[2])))
+                                    except Exception:
+                                        continue
+                                return xs
+                            xs_prev = sorted(_mid_x_list(prev))
+                            xs_curr = sorted(_mid_x_list(curr))
+                            if xs_prev and xs_curr:
+                                m = min(len(xs_prev), len(xs_curr))
+                                diffs = [abs(xs_curr[i] - xs_prev[i]) for i in range(m)] if m > 0 else []
+                                avg_shift = (sum(diffs) / len(diffs)) if diffs else None
+                                if avg_shift is not None and avg_shift <= memory_max_shift_px:
+                                    pane_vert_streak_by_cam[cam_index] = pane_vert_streak_by_cam.get(cam_index, 0) + 1
+                                else:
+                                    pane_vert_streak_by_cam[cam_index] = 0
+                        # 达到稳定阈值 -> 聚合最近 hist 中的竖直边并设置预注入（一次性）
+                        if pane_vert_streak_by_cam.get(cam_index, 0) >= memory_baseline_stability_frames and cam_index not in pane_preseed_set_cams:
+                            # 聚合：按 x 聚类（阈值 memory_max_shift_px），y 取最小-最大
+                            try:
+                                all_edges = [e for seq in hist for e in seq]
+                                def _xmid(seg):
+                                    try:
+                                        return 0.5 * (float(seg[0]) + float(seg[2]))
+                                    except Exception:
+                                        return float('inf')
+                                ordered = sorted(all_edges, key=_xmid)
+                                clusters = []
+                                for seg in ordered:
+                                    xm = _xmid(seg)
+                                    if not clusters:
+                                        clusters.append({'xs':[xm],'ys':[(float(seg[1]), float(seg[3]))]})
+                                    else:
+                                        cur_mean = float(np.mean(clusters[-1]['xs']))
+                                        if abs(xm - cur_mean) <= memory_max_shift_px:
+                                            clusters[-1]['xs'].append(xm)
+                                            clusters[-1]['ys'].append((float(seg[1]), float(seg[3])))
+                                        else:
+                                            clusters.append({'xs':[xm],'ys':[(float(seg[1]), float(seg[3]))]})
+                                agg = []
+                                for c in clusters:
+                                    x_mean = float(np.mean(c['xs']))
+                                    ymin = min(min(a,b) for (a,b) in c['ys'])
+                                    ymax = max(max(a,b) for (a,b) in c['ys'])
+                                    if ymax - ymin >= 1.0:
+                                        agg.append([x_mean, ymin, x_mean, ymax])
+                            except Exception:
+                                agg = []
+                            if agg:
+                                try:
+                                    if not hasattr(shared_settings, 'preseed_vertical_edges_by_cam') or not isinstance(getattr(shared_settings, 'preseed_vertical_edges_by_cam'), dict):
+                                        shared_settings.preseed_vertical_edges_by_cam = {}
+                                except Exception:
+                                    pass
+                                try:
+                                    m = getattr(shared_settings, 'preseed_vertical_edges_by_cam', {})
+                                    if isinstance(m, dict):
+                                        m[str(cam_index)] = agg
+                                        shared_settings.preseed_vertical_edges_by_cam = m
+                                except Exception:
+                                    pass
+                                pane_preseed_set_cams.add(cam_index)
+                except Exception:
+                    pass
+
+            # 统计当前相机帧的“直线组”信息，并更新跨相机聚合
+            def _sum_groups_for_result(res_obj: dict) -> tuple[int, int]:
+                total_edges = 0
+                total_vert = 0
+                try:
+                    rois_list = res_obj.get('rois', []) or []
+                    for r in rois_list:
+                        try:
+                            ef = int(r.get('edges_found', 0) or 0)
+                        except Exception:
+                            ef = 0
+                        try:
+                            nv = int(r.get('near_vertical_line_count', 0) or 0)
+                        except Exception:
+                            nv = 0
+                        total_edges += ef
+                        total_vert += nv
+                except Exception:
+                    pass
+                return total_edges, total_vert
+
+            try:
+                last_groups_by_cam[int(cam_index)] = _sum_groups_for_result(result)
+            except Exception:
+                pass
+
+            # 跨相机聚合：估算“竖直组总数”“水平组总数”
+            agg_edges = int(sum(v[0] for v in last_groups_by_cam.values())) if last_groups_by_cam else 0
+            agg_vertical = int(sum(v[1] for v in last_groups_by_cam.values())) if last_groups_by_cam else 0
+            agg_horizontal = max(0, agg_edges - agg_vertical)
+            has_both_groups = (agg_vertical >= group_min_vertical and agg_horizontal >= group_min_horizontal)
+            # 水平组缺失（或极少）作为“在玻璃上”的主要指示；竖直组有时会不清晰，因此不强制要求
+            horizontal_missing = (agg_horizontal < group_min_horizontal)
+
             if machine_state == "PANE_DETECTED":
-                # 检测离开
-                if current_total_panes == 0:
+                # 检测离开：当“水平+竖直组同时出现”连续满足一定帧数，且已满足进入后的最短停留时间
+                if has_both_groups:
                     absence_streak += 1
-                    # 在达到“进入后的最短持续时间”之前，禁止离开（强制保持检测状态）
                     try:
                         dwell_s = (time.time() - pane_enter_time_s) if pane_enter_time_s is not None else 0.0
                     except Exception:
@@ -561,10 +723,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     if dwell_s < enter_min_time_s:
                         # 仍在最短持续时间窗口内：不允许离开，重置离开去抖
                         absence_streak = 0
-                        continue
-
-                    if absence_streak >= LEAVE_CONFIRM_FRAMES:
-                        print("--- [状态机]: 玻璃离开事件 ---")
+                    elif absence_streak >= LEAVE_CONFIRM_FRAMES:
+                        print("--- [状态机]: 玻璃离开事件（基于直线组） ---")
                         machine_state = "WAITING_FOR_PANE"
                         machine_state_shared.value = 0
                         # 采集模式下：关闭跨相机 pane 激活标记
@@ -589,6 +749,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
 
                         # 立即上传并结算；不支持滞后剔废
                         upload_current_pane_if_needed()
+                        # 清空跨帧基线预注入
+                        _clear_preseed_for_all_cams()
                         # 上传后清理
                         current_pane_ng_buffer.clear()
                         current_pane_reports.clear()
@@ -609,6 +771,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         pane_enter_time_s = None
                         continue
                 else:
+                    # 没有同时出现水平+竖直组：重置离开去抖
                     absence_streak = 0
 
                 # 超时强制退出：玻璃处于检测状态超过 pane_max_duration_s
@@ -636,6 +799,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                 pass
                         # 超时强退时也立即上传并结算；不支持滞后剔废
                         upload_current_pane_if_needed()
+                        # 清空跨帧基线预注入
+                        _clear_preseed_for_all_cams()
                         current_pane_ng_buffer.clear()
                         current_pane_reports.clear()
                         current_pane_folder = None
@@ -690,6 +855,13 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     if img_buf:
                         with open(os.path.join(current_pane_folder, base_name + '.jpg'), 'wb') as f:
                             f.write(img_buf)
+                    raw_buf = result.get('raw_image_buffer')
+                    if raw_buf:
+                        try:
+                            with open(os.path.join(current_pane_folder, base_name + '_raw.png'), 'wb') as f:
+                                f.write(raw_buf)
+                        except Exception:
+                            pass
                     with open(os.path.join(current_pane_folder, base_name + '.json'), 'w', encoding='utf-8') as f:
                         json.dump(rpt, f, ensure_ascii=False, indent=2, default=str)
                     if not is_current_event_rejected and alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
@@ -825,8 +997,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             send_reports_batch_to_server(current_pane_reports, [r.get('annotated_image_buffer') for r in current_pane_ng_buffer], shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
 
             elif machine_state == "WAITING_FOR_PANE":
-                if current_total_panes > 0:
-                    presence_streak += 1
+                # 进入不去抖：一旦检测到“水平组缺失”，立刻进入检测状态
+                if horizontal_missing:
                     # 记录首次出现 state_code>0 的相机与其触发 ROI（只记录一次）
                     try:
                         if first_presence_cam_idx is None and int(result.get('state_code', 0) or 0) > 0:
@@ -849,50 +1021,50 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             first_presence_roi_idx = int(trig_roi)
                     except Exception:
                         pass
-                    # 仅使用帧数去抖判定进入；最短持续时间在离开时及剔废触发时验证
-                    if presence_streak >= ENTER_CONFIRM_FRAMES:
-                        # 不再支持滞后剔废：无需处理上一片的延迟上传
-                        machine_state = "PANE_DETECTED"
-                        machine_state_shared.value = 1
-                        # 采集模式下：进入时统一递增 pane 序号并置为激活
+                    # 立即进入检测
+                    machine_state = "PANE_DETECTED"
+                    machine_state_shared.value = 1
+                    # 采集模式下：进入时统一递增 pane 序号并置为激活
+                    try:
+                        if getattr(shared_settings, 'data_collection_mode', False):
+                            try:
+                                cur_seq = int(getattr(shared_settings, 'collection_pane_seq', 0) or 0)
+                            except Exception:
+                                cur_seq = 0
+                            shared_settings.collection_pane_seq = cur_seq + 1
+                            shared_settings.collection_pane_active = True
+                            shared_settings.collection_day_dir = datetime.now().strftime('%Y%m%d')
+                            print(f"    [状态机]: 采集会话开启 -> pane{shared_settings.collection_pane_seq}")
+                    except Exception:
+                        pass
+                    current_pane_ng_buffer.clear()
+                    current_pane_reports.clear()
+                    current_pane_folder = None
+                    pane_ng_frame_counter = 0
+                    max_complexity_snapshot.fill(0)
+                    is_current_event_rejected = False
+                    rejection_details = {}
+                    saved_for_this_pane = False
+                    can_late_reject.value = False
+                    presence_streak = 0
+                    absence_streak = 0
+                    # 重置自动分路聚合状态
+                    auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
+                    pane_max_total_vertical_count = 0
+                    if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                         try:
-                            if getattr(shared_settings, 'data_collection_mode', False):
-                                try:
-                                    cur_seq = int(getattr(shared_settings, 'collection_pane_seq', 0) or 0)
-                                except Exception:
-                                    cur_seq = 0
-                                shared_settings.collection_pane_seq = cur_seq + 1
-                                shared_settings.collection_pane_active = True
-                                shared_settings.collection_day_dir = datetime.now().strftime('%Y%m%d')
-                                print(f"    [状态机]: 采集会话开启 -> pane{shared_settings.collection_pane_seq}")
+                            alarm_light_controller.set_normal_state()
                         except Exception:
                             pass
-                        current_pane_ng_buffer.clear()
-                        current_pane_reports.clear()
-                        current_pane_folder = None
-                        pane_ng_frame_counter = 0
-                        max_complexity_snapshot.fill(0)
-                        is_current_event_rejected = False
-                        rejection_details = {}
-                        saved_for_this_pane = False
-                        can_late_reject.value = False
-                        presence_streak = 0
-                        absence_streak = 0
-                        # 重置自动分路聚合状态
-                        auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
-                        pane_max_total_vertical_count = 0
-                        if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
-                            try:
-                                alarm_light_controller.set_normal_state()
-                            except Exception:
-                                pass
-                        pane_enter_time_s = time.time()
-                        if first_presence_cam_idx is not None:
-                            print(f"--- [状态机]: 玻璃进入事件 (触发: 相机{first_presence_cam_idx + 1} ROI{first_presence_roi_idx}) ---")
-                        else:
-                            print("--- [状态机]: 玻璃进入事件 (触发: 未捕获) ---")
+                    pane_enter_time_s = time.time()
+                    if first_presence_cam_idx is not None:
+                        print(f"--- [状态机]: 玻璃进入事件 (触发: 相机{first_presence_cam_idx + 1} ROI{first_presence_roi_idx}) ---")
+                    else:
+                        print("--- [状态机]: 玻璃进入事件 (触发: 未捕获) ---")
+                    # 新片开始：清空跨帧基线预注入
+                    _clear_preseed_for_all_cams()
                 else:
-                    # 连续无玻璃：重置帧计数
+                    # 水平组未缺失：保持等待
                     presence_streak = 0
         except Exception as e:
             print(f"[状态机]: 处理结果时出错: {e}")
