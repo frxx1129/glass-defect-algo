@@ -95,10 +95,17 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         memory_max_shift_px = float(getattr(shared_settings, 'memory_max_shift_px', 6.0) or 6.0)
     except Exception:
         memory_max_shift_px = 6.0
+    # 新增：预注入基线在“当前帧未检测到竖直边”时的顺延帧数（默认5）
+    try:
+        memory_preseed_hold_frames = int(getattr(shared_settings, 'memory_preseed_hold_frames', 5) or 5)
+    except Exception:
+        memory_preseed_hold_frames = 5
 
     pane_vert_history_by_cam = {}
     pane_vert_streak_by_cam = {}
     pane_preseed_set_cams = set()
+    # 每相机预注入基线的剩余顺延帧数（当某帧没有检测到竖直边时递减）
+    pane_preseed_ttl_by_cam = {}
 
     # 自动分路：每片玻璃内的 NG 汇聚与一次性触发
     auto_ng_cams = set()           # 出现NG的相机集合（逻辑索引）
@@ -431,6 +438,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             pane_vert_history_by_cam.clear()
             pane_vert_streak_by_cam.clear()
             pane_preseed_set_cams.clear()
+            pane_preseed_ttl_by_cam.clear()
         except Exception:
             pass
 
@@ -672,9 +680,37 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                     if isinstance(m, dict):
                                         m[str(cam_index)] = agg
                                         shared_settings.preseed_vertical_edges_by_cam = m
+                                        # 设置/刷新该相机的顺延TTL
+                                        pane_preseed_ttl_by_cam[cam_index] = int(memory_preseed_hold_frames)
                                 except Exception:
                                     pass
                                 pane_preseed_set_cams.add(cam_index)
+                        else:
+                            # 尚未稳定，但当前帧能检测到 shared_edges：若已存在预注入，也刷新顺延TTL
+                            try:
+                                m = getattr(shared_settings, 'preseed_vertical_edges_by_cam', {})
+                                if isinstance(m, dict) and str(cam_index) in m:
+                                    pane_preseed_ttl_by_cam[cam_index] = int(memory_preseed_hold_frames)
+                            except Exception:
+                                pass
+                    else:
+                        # 本帧未检测到竖直边：若有历史预注入且TTL>0，则继续沿用并递减TTL；否则清除
+                        try:
+                            m = getattr(shared_settings, 'preseed_vertical_edges_by_cam', {})
+                        except Exception:
+                            m = {}
+                        if isinstance(m, dict) and str(cam_index) in m:
+                            ttl = int(pane_preseed_ttl_by_cam.get(cam_index, 0) or 0)
+                            if ttl > 0:
+                                pane_preseed_ttl_by_cam[cam_index] = ttl - 1
+                            else:
+                                # 过期：移除该相机的预注入
+                                try:
+                                    del m[str(cam_index)]
+                                    shared_settings.preseed_vertical_edges_by_cam = m
+                                except Exception:
+                                    pass
+                                pane_preseed_ttl_by_cam.pop(cam_index, None)
                 except Exception:
                     pass
 

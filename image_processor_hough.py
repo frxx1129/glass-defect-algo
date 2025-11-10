@@ -674,86 +674,109 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
     # 先按支持度排序（强边在前）
     merged_lines_with_scores.sort(key=lambda item: item['score'], reverse=True)
 
-    # 过滤与其它直线中段相交（或延长后会相交）的干扰直线：保留更强的一条
-    p_crack = params.get("CRACK_CLASSIFICATION", {})
-    endpoint_margin_px = _get_dist_px(p_crack, "ENDPOINT_PROXIMITY_THRESHOLD_MM", None, 5.5, pixels_per_mm)
-    # 允许的短延长容差（毫米）→ 像素，用于判定“延长后会相交”
-    extend_margin_px_default = _mm_to_px(5.0, pixels_per_mm)
+    # 改进：取消原有“竖直与水平线段相交距离过滤”逻辑，仅对完全重合/重复的线段进行去重，保留几何直觉交叉
+    # 新增参数：LINE_MERGING.DUPLICATE_MERGE_MAX_OFFSET_PX（默认 2.0）控制重合判定的平移容差
+    try:
+        dup_offset_px = float(params.get('LINE_MERGING', {}).get('DUPLICATE_MERGE_MAX_OFFSET_PX', 2.0))
+    except Exception:
+        dup_offset_px = 2.0
+    try:
+        dup_angle_tol_deg = float(params.get('LINE_MERGING', {}).get('DUPLICATE_MERGE_ANGLE_TOL_DEG', 3.0))
+    except Exception:
+        dup_angle_tol_deg = 3.0
 
-    n = len(merged_lines_with_scores)
-    valid = [True] * n
+    def _angle_deg(seg):
+        x1,y1,x2,y2 = map(float, seg)
+        ang = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        if ang < 0: ang += 180.0
+        return ang
 
-    def _t_param_and_perp_dist(pt, a, b):
-        v = b - a
-        denom = float(np.dot(v, v))
-        if denom < 1e-8:
-            return 0.0, np.linalg.norm(pt - a), 0.0
-        t = float(np.dot(pt - a, v) / denom)
-        proj = a + t * v
-        return t, float(np.linalg.norm(pt - proj)), float(np.linalg.norm(v))
+    def _proj_length(seg):
+        return float(np.hypot(float(seg[2]) - float(seg[0]), float(seg[3]) - float(seg[1])))
 
-    for i in range(n):
-        if not valid[i]:
-            continue
-        li = merged_lines_with_scores[i]['line']
-        ai = np.array(li[:2], dtype=float); bi = np.array(li[2:], dtype=float)
-        for j in range(i + 1, n):
-            if not valid[j]:
+    # 将线段按支持度排序后做重复检测：角度接近且距离差小，判为重复，保留强的一条
+    filtered = []
+    for item in merged_lines_with_scores:
+        seg = item['line']
+        ang = _angle_deg(seg)
+        keep = True
+        sx1, sy1, sx2, sy2 = map(float, seg)
+        for kept in filtered:
+            kseg = kept['line']
+            kang = _angle_deg(kseg)
+            ang_diff = min(abs(ang - kang), 180.0 - abs(ang - kang))
+            if ang_diff > dup_angle_tol_deg:
                 continue
-            lj = merged_lines_with_scores[j]['line']
-            aj = np.array(lj[:2], dtype=float); bj = np.array(lj[2:], dtype=float)
-
-            inter = find_line_intersection(li, lj)
-            if inter is None:
+            # 计算本线段四个端点到已保留线段的最小距离，用于判断是否近乎重合
+            ax1, ay1, ax2, ay2 = map(float, kseg)
+            a = np.array([ax1, ay1]); b = np.array([ax2, ay2])
+            v = b - a
+            lv = float(np.dot(v, v))
+            if lv < 1e-6:
                 continue
-
-            t_i, d_perp_i, len_i = _t_param_and_perp_dist(inter, ai, bi)
-            t_j, d_perp_j, len_j = _t_param_and_perp_dist(inter, aj, bj)
-            if len_i < 1e-6 or len_j < 1e-6:
-                continue
-
-            # 要求“几乎相交”且参数落在段内或小范围延长内
-            ext_tol_i = extend_margin_px_default / len_i
-            ext_tol_j = extend_margin_px_default / len_j
-            near_line = (d_perp_i < 1.5) and (d_perp_j < 1.5)
-            within_i = (-ext_tol_i <= t_i <= 1.0 + ext_tol_i)
-            within_j = (-ext_tol_j <= t_j <= 1.0 + ext_tol_j)
-            if not (near_line and within_i and within_j):
-                continue
-
-            # 判断是否为“中间部分”相交（避免角点端点附近）
-            inter = inter.astype(float)
-            di_min = min(np.linalg.norm(inter - ai), np.linalg.norm(inter - bi))
-            dj_min = min(np.linalg.norm(inter - aj), np.linalg.norm(inter - bj))
-
-            # 若交点位于两条线段的内部（0..1）且都远离端点，则认为是干扰交叉；
-            # 或者其中一条在内部且远离端点，另一条在小范围延长内，也认为是干扰。
-            inside_i = (0.0 <= t_i <= 1.0)
-            inside_j = (0.0 <= t_j <= 1.0)
-            is_middle_cross = (
-                (inside_i and inside_j and di_min > endpoint_margin_px and dj_min > endpoint_margin_px)
-                or (inside_i and di_min > endpoint_margin_px and not inside_j)
-                or (inside_j and dj_min > endpoint_margin_px and not inside_i)
-            )
-
-            if is_middle_cross:
-                # 移除较弱的一条
-                if merged_lines_with_scores[i]['score'] >= merged_lines_with_scores[j]['score']:
-                    valid[j] = False
-                else:
-                    valid[i] = False
-                    break
-
-    filtered = [merged_lines_with_scores[k] for k in range(n) if valid[k]]
-    filtered.sort(key=lambda item: item['score'], reverse=True)
+            def _pt_dist(pt):
+                t = float(np.dot(pt - a, v) / lv)
+                t_clamped = max(0.0, min(1.0, t))
+                proj = a + t_clamped * v
+                return float(np.linalg.norm(pt - proj))
+            d1 = _pt_dist(np.array([sx1, sy1]))
+            d2 = _pt_dist(np.array([sx2, sy2]))
+            if d1 <= dup_offset_px and d2 <= dup_offset_px:
+                # 判为重复：仅保留已存在的（更强的）
+                keep = False
+                break
+        if keep:
+            filtered.append(item)
+    # 保持支持度排序
+    filtered.sort(key=lambda it: it['score'], reverse=True)
 
     # 根据是否与其它直线（实际或小范围延长后）相交，决定用于角度/扫描/过滤的有效线段：
     # - 不相交：保持原始长度
     # - 相交（含延长容差内相交）：使用“交点 → 原始线段最远端点”的新线段
     edges = [item['line'] for item in filtered[:p["TOP_N_EDGES"]]]
+    # 多样性保护：若 Top-N 中没有近竖直主边，而候选集中存在强近竖直主边，则用其替换最弱一条
+    try:
+        ensure_vertical = bool(params.get('LINE_MERGING', {}).get('ENSURE_VERTICAL_PRESENCE', True))
+    except Exception:
+        ensure_vertical = True
+    if ensure_vertical and len(filtered) > 0 and len(edges) > 0:
+        try:
+            v_tol = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+        except Exception:
+            v_tol = 10.0
+        def _a_deg(seg):
+            x1,y1,x2,y2 = map(float, seg)
+            ang = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+            if ang > 90.0:
+                ang = 180.0 - ang
+            return ang
+        def _is_vertical(seg):
+            return _a_deg(seg) >= (90.0 - v_tol)
+        if not any(_is_vertical(e) for e in edges):
+            # 找到候选集中（按得分排序后的 filtered）第一个近竖直，但不在 edges 中的线
+            cur_set = {tuple(map(float, e)) for e in edges}
+            candidate = None; candidate_idx = None
+            for idx_f, item in enumerate(filtered):
+                seg = item['line']
+                if _is_vertical(seg) and tuple(map(float, seg)) not in cur_set:
+                    candidate = seg; candidate_idx = idx_f; break
+            if candidate is not None:
+                # 替换 edges 中末尾（最弱）一条
+                edges[-1] = candidate
     m = len(edges)
     if m <= 1:
         return edges
+
+    # 用于后续“交点裁剪”步骤的辅助：短延长容差与垂距/参数计算
+    extend_margin_px_default = _mm_to_px(5.0, pixels_per_mm)
+    def _t_param_and_perp_dist(pt, a, b):
+        v = b - a
+        denom = float(np.dot(v, v))
+        if denom < 1e-8:
+            return 0.0, float(np.linalg.norm(pt - a)), 0.0
+        t = float(np.dot(pt - a, v) / denom)
+        proj = a + t * v
+        return t, float(np.linalg.norm(pt - proj)), float(np.linalg.norm(v))
 
     best_intersection = [None] * m  # (inter_pt, t_i, d_perp_i, len_i)
     # 复用上面定义的 _t_param_and_perp_dist 与 extend 容差
@@ -782,7 +805,21 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
 
             ext_tol_i = extend_margin_px_default / len_i
             ext_tol_j = extend_margin_px_default / len_j
+            # 放宽：对“近正交”线对（近似竖直×水平），取消相交的距离限制（d_perp）
+            try:
+                def _ang_deg(seg):
+                    x1,y1,x2,y2 = map(float, seg)
+                    a = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+                    if a < 0: a += 180.0
+                    return a
+                diff_deg = min(abs(_ang_deg(li) - _ang_deg(lj)), 180.0 - abs(_ang_deg(li) - _ang_deg(lj)))
+                ortho_accept_deg = float(params.get('LINE_MERGING', {}).get('INTERSECTION_ORTHO_ACCEPT_MIN_DIFF_DEG', 60.0))
+            except Exception:
+                diff_deg = 0.0; ortho_accept_deg = 60.0
             near_line = (d_perp_i < 1.5) and (d_perp_j < 1.5)
+            if diff_deg >= ortho_accept_deg:
+                # 近似竖直×水平：视为有交，不要求近线距离
+                near_line = True
             within_i = (-ext_tol_i <= t_i <= 1.0 + ext_tol_i)
             within_j = (-ext_tol_j <= t_j <= 1.0 + ext_tol_j)
             if near_line and within_i and within_j:
@@ -820,6 +857,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     crack_indices = set()
 
     true_edges = [edge for i, edge in enumerate(edges) if i not in crack_indices]
+    # 记录修改前的主边拷贝，用于后续判断“水平边的延长部分”（相对原坐标）
+    true_edges_before_ext = [edge.copy() for edge in true_edges]
     
     corner_defects = []; num_true_edges = len(true_edges)
     edges_for_drawing = [edge.copy() for edge in true_edges]
@@ -937,6 +976,98 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     true_edges[idx] = np.array(ext, dtype=float)
         except Exception:
             pass
+
+    # 新增：当存在“理想竖直边”（近竖直主边）时，将近水平主边延长到与这些竖直边相交
+    # 开关：DEFECT_DETECTION.ENABLE_HORIZONTAL_EXTENSION_TO_VERTICAL (默认 True)
+    # 最长延长间隙：DEFECT_DETECTION.HORIZONTAL_EXTEND_MAX_GAP_MM (默认 40mm)
+    # 近水平角度容忍：DEFECT_DETECTION.HORIZONTAL_ANGLE_TOL_DEG (默认 与竖直容忍相同 10°)
+    # 固定策略：若同一 ROI 内存在至少一条近竖直主边与任意水平主边，则强制延长水平主边到竖直主边的交点，不使用可配置阈值
+    if true_edges:
+        try:
+            # 判定近竖直：沿用 vertical_tol_deg_local
+            def _is_vertical(seg):
+                ang = _angle_to_x_axis_deg_local(seg)
+                return ang >= (90.0 - vertical_tol_deg_local)
+            vertical_ideals = [seg.copy() for seg in true_edges if _is_vertical(seg)]
+            if vertical_ideals:
+                # 水平判定：角度接近 0°（不再使用可配置容忍）
+                def _is_horizontal(seg):
+                    ang = _angle_to_x_axis_deg_local(seg)
+                    return ang <= 10.0  # 固定阈值 10° 内视为水平
+                for idx, seg in enumerate(true_edges):
+                    if not _is_horizontal(seg):
+                        continue
+                    x1, y1, x2, y2 = map(float, seg)
+                    dx = x2 - x1; dy = y2 - y1
+                    if abs(dx) < 1e-6:
+                        continue
+                    # 构造无限延长后的水平直线，与每条竖直理想边求交点（使用竖直边的延长线）
+                    intersections = []
+                    for vseg in vertical_ideals:
+                        vx1, vy1, vx2, vy2 = map(float, vseg)
+                        inter = find_line_intersection(seg, vseg)
+                        if inter is None:
+                            continue
+                        # 要求交点 y 在竖直边段范围内（±1px 缓冲）
+                        vy_min = min(vy1, vy2) - 1.0; vy_max = max(vy1, vy2) + 1.0
+                        if vy_min <= inter[1] <= vy_max:
+                            intersections.append(inter.astype(float))
+                    if not intersections:
+                        # 若没有真正段内交点，允许用竖直线的中点作为“目标”强制延长（确保连接）
+                        for vseg in vertical_ideals:
+                            vx1, vy1, vx2, vy2 = map(float, vseg)
+                            mid_y = 0.5 * (vy1 + vy2)
+                            # 计算水平线在 mid_y 的 x：水平线近似 y 常数，直接使用交点公式退化
+                            # 用两个端点的平均 y 判定是否可用（避免垂直线误差）；这里直接采用竖直线 x 中值
+                            mid_x = 0.5 * (vx1 + vx2)
+                            intersections.append(np.array([mid_x, mid_y], dtype=float))
+                        if not intersections:
+                            continue
+                    seg_xmin = min(x1, x2); seg_xmax = max(x1, x2)
+                    # 不再区分左右候选，只要交点在段外就延长；段内交点忽略（已包含）
+                    left_ext_pt = None; right_ext_pt = None
+                    for pt in intersections:
+                        if pt[0] < seg_xmin - 0.5:
+                            if (left_ext_pt is None) or (pt[0] < left_ext_pt[0]):
+                                left_ext_pt = pt
+                        if pt[0] > seg_xmax + 0.5:
+                            if (right_ext_pt is None) or (pt[0] > right_ext_pt[0]):
+                                right_ext_pt = pt
+                    if left_ext_pt is None and right_ext_pt is None:
+                        continue
+                    # 原线斜率（用于 y 外推）
+                    slope = dy / dx if abs(dx) > 1e-6 else 0.0
+                    def _y_at(new_x):
+                        return y1 + slope * (new_x - x1)
+                    new_x1 = x1; new_y1 = y1; new_x2 = x2; new_y2 = y2
+                    if left_ext_pt is not None:
+                        target_x = max(0.0, min(float(roi_w - 1), left_ext_pt[0]))
+                        if x1 < x2:
+                            new_x1 = target_x
+                            new_y1 = _y_at(new_x1)
+                        else:
+                            new_x2 = target_x
+                            new_y2 = _y_at(new_x2)
+                    if right_ext_pt is not None:
+                        target_x = max(0.0, min(float(roi_w - 1), right_ext_pt[0]))
+                        if x1 < x2:
+                            new_x2 = target_x
+                            new_y2 = _y_at(new_x2)
+                        else:
+                            new_x1 = target_x
+                            new_y1 = _y_at(new_x1)
+                    true_edges[idx] = np.array([new_x1, new_y1, new_x2, new_y2], dtype=float)
+        except Exception as _e_horiz_ext:
+            # 失败安全：不中断后续流程
+            pass
+
+    # 注意：我们在上面可能修改了 true_edges（竖直/水平的延长）。
+    # 因此需要在此处刷新用于绘制与配对的边集合与象限归属，确保后续角点/缺角逻辑使用更新后的线段。
+    try:
+        edges_for_drawing = [edge.copy() for edge in true_edges]
+        edge_quadrants = [get_line_quadrant(edge, roi_w, roi_h) for edge in true_edges]
+    except Exception:
+        pass
 
     # 新增：按角度将主边分类为 平行 / 垂直 / 斜边，并为斜边生成基于 boundingRect 的缺陷
     skew_line_defects = []
@@ -1076,9 +1207,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     q_cfg = float(p_def_local.get('Q_MAX_SIDE_MM', 0.0))
                 except Exception:
                     q_cfg = 0.0
-                # 硬性上限：>50mm 的 Q 一律过滤；若配置更严（<=50），按配置取更小者
-                q_max_side_mm = 50.0 if (q_cfg is None or q_cfg <= 0.0 or q_cfg > 50.0) else q_cfg
-                max_side_ok = (length_mm <= q_max_side_mm and width_mm <= q_max_side_mm)
+                # 删除 50mm 硬性上限：若配置 Q_MAX_SIDE_MM>0 则按配置限制，否则不限制最大边
+                if q_cfg is not None and q_cfg > 0.0:
+                    max_side_ok = (length_mm <= q_cfg and width_mm <= q_cfg)
+                else:
+                    max_side_ok = True
                 if width_mm >= 5.0 and area_mm2 >= 25.0 and max_side_ok:
                     box2 = cv2.boxPoints(r2).astype(np.int32)
                     # 生成用于高亮的像素块轮廓（而不是画 minAreaRect）：简化原始连通域轮廓
@@ -1101,7 +1234,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     # 方法一（矩形差分法）已停用：不再使用四边形与轮廓差来检测 Q
     rect_q_defects = []
 
-    # 新逻辑：利用已获得角部交点与两条主边，与玻璃轮廓求最近交点生成三角形缺角区域
+    # 新逻辑A（保留）：利用已获得角部交点与两条主边，与玻璃轮廓求最近交点生成三角形缺角区域
     # 收集玻璃主体轮廓（与矩形差法重复一次，后续可优化成复用）
     corner_contour_q_defects = []
     try:
@@ -1327,8 +1460,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         q_cfg2 = float(p_def_local2.get('Q_MAX_SIDE_MM', 0.0))
                     except Exception:
                         q_cfg2 = 0.0
-                    q_max_side_mm2 = 70.0 if (q_cfg2 is None or q_cfg2 <= 0.0 or q_cfg2 > 70.0) else q_cfg2
-                    max_side_ok2 = (length_mm <= q_max_side_mm2 and width_mm <= q_max_side_mm2)
+                    # 同样取消硬性上限：按配置生效，否则不限制
+                    if q_cfg2 is not None and q_cfg2 > 0.0:
+                        max_side_ok2 = (length_mm <= q_cfg2 and width_mm <= q_cfg2)
+                    else:
+                        max_side_ok2 = True
                     # 基本阈值：短边>=5mm，面积>=25mm^2，长短边均不超过上限
                     if width_mm >= 5.0 and area_mm2 >= 25.0 and max_side_ok2:
                         box2 = cv2.boxPoints(r2).astype(np.int32)
@@ -1387,8 +1523,142 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 kept.append(nd)
         return kept
 
-    # 仅采用方法二（corner_contour）的 Q 结果
-    rect_q_defects = corner_contour_q_defects
+    # 新逻辑B（替换）：使用“理想竖直边 + 水平边相对原坐标的延长部分 + 玻璃 Canny 边缘”构成闭合区域作为缺角
+    hv_corner_q_defects = []
+    try:
+        # 需要玻璃主体轮廓与辅助函数；若上面未成功计算轮廓，则跳过该方法
+        if cnts_qc and main_cnt_qc is not None and cv2.contourArea(main_cnt_qc) > 10.0:
+            cnt_pts = main_cnt_qc.reshape(-1,2).astype(float)
+
+            def _nearest_point_on_contour(P: np.ndarray, contour_points: np.ndarray):
+                best_pt = None; best_idx = 0; best_d = 1e18
+                n = len(contour_points)
+                for k in range(n):
+                    a = contour_points[k]
+                    b = contour_points[(k+1) % n]
+                    ab = b - a
+                    L2 = float(np.dot(ab, ab))
+                    if L2 < 1e-12:
+                        proj = a
+                    else:
+                        t = float(np.dot(P - a, ab) / L2)
+                        t = max(0.0, min(1.0, t))
+                        proj = a + ab * t
+                    d = float(np.linalg.norm(P - proj))
+                    if d < best_d:
+                        best_d = d; best_pt = proj; best_idx = k
+                return best_pt, best_idx
+
+            # 识别“理想竖直边”与“近水平边”
+            try:
+                vertical_tol_deg_local2 = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+            except Exception:
+                vertical_tol_deg_local2 = 10.0
+
+            def _ang_to_x(line):
+                x1,y1,x2,y2 = map(float, line)
+                dx, dy = (x2-x1), (y2-y1)
+                ang = abs(np.degrees(np.arctan2(dy, dx)))
+                if ang > 90.0: ang = 180.0 - ang
+                return ang
+
+            def _is_vertical2(seg):
+                return _ang_to_x(seg) >= (90.0 - vertical_tol_deg_local2)
+            def _is_horizontal2(seg):
+                return _ang_to_x(seg) <= 10.0
+
+            vertical_ideals_now = [seg for seg in true_edges if _is_vertical2(seg)]
+            # 遍历每条近水平边，检测其相对原坐标是否发生延长（x 端点变动）
+            for idx_h, seg_now in enumerate(true_edges):
+                if not _is_horizontal2(seg_now):
+                    continue
+                if idx_h >= len(true_edges_before_ext):
+                    continue
+                seg_old = true_edges_before_ext[idx_h]
+                x1n, y1n, x2n, y2n = map(float, seg_now)
+                x1o, y1o, x2o, y2o = map(float, seg_old)
+                # 判断左/右端是否发生延长（相对原坐标 x 变化）
+                tol = 0.5
+                left_extended = (abs(x1n - x1o) > tol)
+                right_extended = (abs(x2n - x2o) > tol)
+                if not (left_extended or right_extended):
+                    continue
+
+                # 针对每个发生延长的一侧，构造缺角区域
+                for side in (('left', left_extended), ('right', right_extended)):
+                    if not side[1]:
+                        continue
+                    if side[0] == 'left':
+                        cp = np.array([x1n, y1n], dtype=float)   # 与竖直理想边的相交点端
+                        orig_ep = np.array([x1o, y1o], dtype=float)  # 原端点（水平延长部分的另一端）
+                    else:
+                        cp = np.array([x2n, y2n], dtype=float)
+                        orig_ep = np.array([x2o, y2o], dtype=float)
+
+                    # 寻找离 cp 最近的理想竖直边（按 x 距离）
+                    if not vertical_ideals_now:
+                        continue
+                    vx_best = None; best_dx = 1e18
+                    for vseg in vertical_ideals_now:
+                        vx1, vy1, vx2, vy2 = map(float, vseg)
+                        vx_mid = 0.5 * (vx1 + vx2)
+                        dx_abs = abs(vx_mid - cp[0])
+                        if dx_abs < best_dx:
+                            best_dx = dx_abs; vx_best = np.array([vx1, vy1, vx2, vy2], dtype=float)
+                    if vx_best is None:
+                        continue
+
+                    # 沿竖直方向从 cp 发射双向射线，取最近与主体轮廓的命中点 v_hit
+                    vdir = np.array([0.0, 1.0], dtype=float)
+                    try:
+                        # 竖直边方向近似由其端点决定，取“走向更远端”的方向
+                        vy_len1 = float(np.hypot(vx_best[0]-cp[0], vx_best[1]-cp[1]))
+                        vy_len2 = float(np.hypot(vx_best[2]-cp[0], vx_best[3]-cp[1]))
+                        vdir_raw = np.array([0.0, 1.0 if vy_len2 >= vy_len1 else -1.0], dtype=float)
+                        vdir = vdir_raw / (np.linalg.norm(vdir_raw) + 1e-9)
+                    except Exception:
+                        pass
+
+                    hit_up = _ray_intersect_contour(cp, -vdir, cnt_pts, t_min=1.0)
+                    hit_dn = _ray_intersect_contour(cp,  vdir, cnt_pts, t_min=1.0)
+                    cand_hits = []
+                    if hit_up is not None: cand_hits.append(hit_up)
+                    if hit_dn is not None: cand_hits.append(hit_dn)
+                    if not cand_hits:
+                        # 回退到“最近投影”
+                        v_hit_pt, v_hit_idx = _nearest_point_on_contour(cp, cnt_pts)
+                    else:
+                        cand_hits.sort(key=lambda it: it[0])
+                        _, v_hit_pt, v_hit_idx = cand_hits[0]
+
+                    # 从原端点 orig_ep 到主体轮廓的最近投影作为 h_hit
+                    h_hit_pt, h_hit_idx = _nearest_point_on_contour(orig_ep, cnt_pts)
+                    if h_hit_pt is None or v_hit_pt is None:
+                        continue
+
+                    # 取两命中点沿轮廓的较短路径，构成闭合区域的一边
+                    (path_f, len_f), (path_b, len_b) = _build_contour_path(h_hit_idx, h_hit_pt, v_hit_idx, v_hit_pt, cnt_pts)
+                    contour_path = path_f if len_f <= len_b else path_b
+
+                    # 组合闭合区域：cp -> orig_ep（水平延长段）-> 轮廓路径 -> v_hit -> cp（由 fillPoly 自动闭合）
+                    poly_pts = [cp, orig_ep] + [np.array(p, dtype=float) for p in contour_path[1:-1]] + [v_hit_pt]
+                    poly_cnt = np.array(poly_pts, dtype=np.int32).reshape((-1,1,2))
+                    if cv2.contourArea(poly_cnt) <= 1.0:
+                        continue
+
+                    # 生成缺角对象（与现有可视化兼容：使用 region_contour 填充显示）
+                    cx_cy = np.mean(np.array([cp, orig_ep, v_hit_pt], dtype=float), axis=0)
+                    hv_corner_q_defects.append({
+                        'type': 'Q',
+                        'region_contour': poly_cnt,
+                        'center': (int(round(cx_cy[0])), int(round(cx_cy[1]))),
+                        'origin': 'hv_closed_region',
+                    })
+    except Exception:
+        hv_corner_q_defects = []
+
+    # 优先采用“理想竖直 + 水平延长 + 轮廓”的闭合区域方法；若无结果，则回退到角点三角形方法
+    rect_q_defects = hv_corner_q_defects if hv_corner_q_defects else corner_contour_q_defects
 
     # 计算某条主边“平行四边形扫描带”的平均亮度，选择相对于缺角三角形质心的内侧（与三角形相反侧）半带，剔除边线与端点
     # 用作缺角(Q)亮度门控的对比基准
@@ -1531,11 +1801,13 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         return None
 
     for i, j in potential_pairs:
-        if all(endpoint_paired_status.get(i, [True,True])) or all(endpoint_paired_status.get(j, [True,True])): continue
-        line1, line2 = true_edges[i], true_edges[j]
-        
+        if all(endpoint_paired_status.get(i, [True,True])) or all(endpoint_paired_status.get(j, [True,True])):
+            continue
+        # 使用最新坐标的线段参与角点计算：优先采用 edges_for_drawing
+        line1 = edges_for_drawing[i] if i < len(edges_for_drawing) else true_edges[i]
+        line2 = edges_for_drawing[j] if j < len(edges_for_drawing) else true_edges[j]
+
         angle_between = calculate_angle_between_lines(line1, line2)
-        # 角点延伸距离以毫米配置
         max_extension_dist = _get_dist_px(
             p_defect,
             "CORNER_MAX_EXTENSION_DIST_PERPENDICULAR_MM" if abs(angle_between - 90.0) < p_defect["PERPENDICULAR_ANGLE_TOLERANCE"] else "CORNER_MAX_EXTENSION_DIST_NORMAL_MM",
@@ -1543,11 +1815,21 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             None,
             pixels_per_mm
         )
-        
+
         intersection = find_line_intersection(line1, line2)
         if intersection is None:
             continue
-        
+
+        try:
+            p1a = np.array(line1[:2], dtype=float); p1b = np.array(line1[2:], dtype=float)
+            v1 = p1b - p1a; L1 = float(np.dot(v1, v1))
+            t1 = float(np.dot(intersection - p1a, v1) / L1) if L1 > 1e-9 else -999.0
+            p2a = np.array(line2[:2], dtype=float); p2b = np.array(line2[2:], dtype=float)
+            v2 = p2b - p2a; L2 = float(np.dot(v2, v2))
+            t2 = float(np.dot(intersection - p2a, v2) / L2) if L2 > 1e-9 else -999.0
+        except Exception:
+            t1 = -999.0; t2 = -999.0
+
         dists_i = [np.linalg.norm(intersection - line1[:2]), np.linalg.norm(intersection - line1[2:])]; endpoint_idx_i = np.argmin(dists_i)
         dists_j = [np.linalg.norm(intersection - line2[:2]), np.linalg.norm(intersection - line2[2:])]; endpoint_idx_j = np.argmin(dists_j)
 
@@ -1555,21 +1837,27 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             continue
 
         corner_gap_px = _get_dist_px(p_defect, "CORNER_MAX_PHYSICAL_GAP_MM", "CORNER_MAX_PHYSICAL_GAP", None, pixels_per_mm)
-        # 允许 ROI 外延：若线段被 ROI 截断，允许最多 20% ROI 宽度的“虚拟延长”参与交点
         roi_ext_allow = 0.2 * float(roi_w)
         max_extend_eff = max(float(max_extension_dist), float(roi_ext_allow))
         is_physical = dists_i[endpoint_idx_i] < corner_gap_px and dists_j[endpoint_idx_j] < corner_gap_px
         is_valid_virtual = dists_i[endpoint_idx_i] < max_extend_eff and dists_j[endpoint_idx_j] < max_extend_eff
 
-        if (is_physical or is_valid_virtual) and (0 <= intersection[0] < roi_w and 0 <= intersection[1] < roi_h):
+        inside_i = (0.0 <= t1 <= 1.0)
+        inside_j = (0.0 <= t2 <= 1.0)
+        accept_inside = inside_i and inside_j
+
+        if (accept_inside or is_physical or is_valid_virtual) and (0 <= intersection[0] < roi_w and 0 <= intersection[1] < roi_h):
             endpoint_paired_status[i][endpoint_idx_i] = True; endpoint_paired_status[j][endpoint_idx_j] = True
-            edges_for_drawing[i][endpoint_idx_i*2:(endpoint_idx_i*2)+2] = intersection
-            edges_for_drawing[j][endpoint_idx_j*2:(endpoint_idx_j*2)+2] = intersection
+            if not accept_inside:
+                edges_for_drawing[i][endpoint_idx_i*2:(endpoint_idx_i*2)+2] = intersection
+                edges_for_drawing[j][endpoint_idx_j*2:(endpoint_idx_j*2)+2] = intersection
             p1_near = line1[:2] if endpoint_idx_i == 0 else line1[2:]; p2_near = line2[:2] if endpoint_idx_j == 0 else line2[2:]
-            # 预先计算反向端点（用于 Q 回溯及 X 角度判定）
             p1_far = line1[2:] if endpoint_idx_i == 0 else line1[:2]
             p2_far = line2[2:] if endpoint_idx_j == 0 else line2[:2]
-            # 记录角点供 Q 检测阶段复用，避免再次枚举所有主边组合
+            try:
+                paired_corners.append((int(i), int(j), np.array([float(intersection[0]), float(intersection[1])], dtype=float)))
+            except Exception:
+                pass
             try:
                 paired_corners.append((int(i), int(j), np.array([float(intersection[0]), float(intersection[1])], dtype=float)))
             except Exception:
@@ -1594,6 +1882,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 non_q_intersections.append((float(intersection[0]), float(intersection[1])))
             except Exception:
                 pass
+        
 
     # 将斜边缺陷并入后续缺陷列表
     all_chipping_contours = []; chipping_defects = []
@@ -1985,7 +2274,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         else:
             filtered_defects.append(d)
 
-    return edges_for_drawing, filtered_defects
+    return edges_for_drawing, filtered_defects, paired_corners
 
 
 def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm):
@@ -2172,7 +2461,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     intersections_frame.append((int(round(x_int)), int(round(y_int))))
     # 打印每帧交点信息（ROI级别）
     # 不再打印 intersections_frame 调试信息
-    edges_for_drawing, all_defects = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, params, pixels_per_mm, binary_edges)
+    edges_for_drawing, all_defects, paired_corners = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, params, pixels_per_mm, binary_edges)
 
     # 构建“主边端点扫描带”掩膜：长度默认20mm（可通过 DEFECT_DETECTION.L_ENDPOINT_BELT_LENGTH_MM 配置），
     # 宽度等于亮度扫描带宽 LUMINOSITY_SCAN_WIDTH_MM；用于过滤位于边端扫描带内的 L 型缺陷（视为误检）。
@@ -2568,8 +2857,46 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
     
-    # 按最新要求：不再绘制直线与打印端点
+    # 绘制与打印：主边直线、角点
     annotations_to_draw = []
+    try:
+        # 打印主边信息并绘制主边（使用 edges_for_drawing，已包含延长/截断）
+        if edges_for_drawing:
+            print(f"[LINES][ROI {roi_idx}] count={len(edges_for_drawing)}")
+        for i, seg in enumerate(edges_for_drawing or []):
+            x1,y1,x2,y2 = map(float, seg)
+            dx, dy = (x2-x1), (y2-y1)
+            ang = abs(np.degrees(np.arctan2(dy, dx)))
+            if ang > 90.0: ang = 180.0 - ang
+            length_px = float(np.hypot(dx, dy))
+            length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
+            print(f"[LINES][ROI {roi_idx}] #{i}: ({x1:.1f},{y1:.1f})-({x2:.1f},{y2:.1f}), angle={ang:.1f}°, len={length_px:.1f}px ({length_mm:.1f}mm)")
+            # 颜色：近竖直=绿色，近水平=蓝色，其余=灰白
+            color = (200,200,200)
+            if ang >= 80.0:
+                color = (0,255,0)
+            elif ang <= 10.0:
+                color = (255,0,0)
+            cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
+            # 在中点标注线段索引
+            mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
+            try:
+                cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+            except Exception:
+                pass
+        # 打印与绘制角点（使用 paired_corners；不依赖是否生成 X/Q 缺陷）
+        if paired_corners:
+            print(f"[CORNERS][ROI {roi_idx}] count={len(paired_corners)}")
+        for (ii, jj, cp_arr) in (paired_corners or []):
+            try:
+                cx, cy = float(cp_arr[0]), float(cp_arr[1])
+                print(f"[CORNERS][ROI {roi_idx}] pair=({ii},{jj}) at ({cx:.1f},{cy:.1f})")
+                cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
+                cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
+            except Exception:
+                continue
+    except Exception:
+        pass
     
     for defect_report in final_defects_for_report:
         defect = defect_report['raw_defect']
@@ -2626,25 +2953,44 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
     # 绘制识别到的主直线和“理想直线边”（可配置开关）
     try:
-        draw_main = bool(p_vis.get('DRAW_MAIN_EDGES', True))
+        draw_main = False  
     except Exception:
-        draw_main = True
+        draw_main = False
     try:
-        draw_ideal = bool(p_vis.get('DRAW_IDEAL_EDGES', True))
+        draw_ideal = False
     except Exception:
-        draw_ideal = True
+        draw_ideal = False
     try:
-        draw_shared = bool(p_vis.get('DRAW_SHARED_VERTICAL_EDGES', True))
+        draw_shared = False
     except Exception:
-        draw_shared = True
+        draw_shared = False
 
-    if draw_main and len(main_edges) > 0:
-        for e in main_edges:
-            try:
-                x1,y1,x2,y2 = map(int, map(round, e))
-                cv2.line(roi_color, (x1,y1), (x2,y2), (0,255,0), 2)
-            except Exception:
+    # 仍保留：若某些缺陷对象自身提供 center/region_contour，则额外用绿色标点以示区分
+    try:
+        for defect_report in final_defects_for_report:
+            if defect_report.get('type') not in ('X','Q'):
                 continue
+            raw = defect_report.get('raw_defect', {})
+            center_pt = None
+            if 'center' in raw and raw['center'] is not None:
+                try:
+                    cx, cy = int(raw['center'][0]), int(raw['center'][1])
+                    center_pt = (cx, cy)
+                except Exception:
+                    center_pt = None
+            if center_pt is None and 'region_contour' in raw and raw['region_contour'] is not None:
+                try:
+                    cnt = np.array(raw['region_contour'], dtype=np.int32)
+                    m = cv2.moments(cnt)
+                    if m['m00'] != 0:
+                        cx = int(m['m10']/m['m00']); cy = int(m['m01']/m['m00'])
+                        center_pt = (cx, cy)
+                except Exception:
+                    center_pt = None
+            if center_pt is not None:
+                cv2.circle(roi_color, center_pt, 6, (0,255,0), -1)
+    except Exception:
+        pass
 
     # 共享竖直虚拟边（跨 ROI）以青色虚线绘制
     if draw_shared:
