@@ -1299,32 +1299,50 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     return best_idx
 
                 def _ray_intersect_contour_thick(origin: np.ndarray, dir_vec: np.ndarray, contour_points: np.ndarray, t_min: float = 2.0, stripe_half_px: int = 2):
-                    # 使用加粗的射线（条带）与轮廓边界相交检测，避免共线退化；返回首个命中点
+                    # 使用加粗的射线（条带）首先对“主轮廓边界”求交；
+                    # 若主轮廓断裂未命中，则回退对 dilate 后的 Canny 边缘（edges_qc_dil）求交；
+                    # 返回首个命中点（t, point, nearest_contour_edge_idx）。
                     d = dir_vec.astype(float)
                     if np.linalg.norm(d) < 1e-9:
                         return None
                     d = d / np.linalg.norm(d)
                     nvec = np.array([-d[1], d[0]], dtype=float)
                     H, W = roi_gray.shape
-                    # 绘制轮廓边界到掩码（细线），仅用于几何检测，不参与最终可视化
+                    # 构造一个扫描函数，可在指定 mask 上查找命中
+                    def _scan_on_mask(mask_img: np.ndarray):
+                        T_max = float(max(H, W) * 2.0)
+                        step = 1.0
+                        t = float(max(t_min, 0.0))
+                        while t <= T_max:
+                            p = origin + d * t
+                            for off in range(-int(stripe_half_px), int(stripe_half_px) + 1):
+                                q = p + nvec * float(off)
+                                qx, qy = int(round(q[0])), int(round(q[1]))
+                                if 0 <= qx < W and 0 <= qy < H and mask_img[qy, qx] != 0:
+                                    hit_pt = np.array([float(qx), float(qy)], dtype=float)
+                                    idx = _nearest_contour_edge_index(hit_pt, contour_points)
+                                    return (t, hit_pt, idx)
+                            t += step
+                        return None
+
+                    # 1) 先在“主轮廓边界”上扫描
                     edge_mask = np.zeros((H, W), dtype=np.uint8)
                     try:
                         cv2.polylines(edge_mask, [main_cnt_qc], True, 255, 1)
                     except Exception:
                         pass
-                    T_max = float(max(H, W) * 2.0)
-                    step = 1.0
-                    t = float(max(t_min, 0.0))
-                    while t <= T_max:
-                        p = origin + d * t
-                        for off in range(-int(stripe_half_px), int(stripe_half_px) + 1):
-                            q = p + nvec * float(off)
-                            qx, qy = int(round(q[0])), int(round(q[1]))
-                            if 0 <= qx < W and 0 <= qy < H and edge_mask[qy, qx] != 0:
-                                hit_pt = np.array([float(qx), float(qy)], dtype=float)
-                                idx = _nearest_contour_edge_index(hit_pt, contour_points)
-                                return (t, hit_pt, idx)
-                        t += step
+                    hit = _scan_on_mask(edge_mask)
+                    if hit is not None:
+                        return hit
+
+                    # 2) 回退：在 dilate 后的 Canny 边缘图上扫描（允许命中连续的边缘像素区域）
+                    try:
+                        if edges_qc_dil is not None:
+                            hit2 = _scan_on_mask(edges_qc_dil)
+                            if hit2 is not None:
+                                return hit2
+                    except Exception:
+                        pass
                     return None
 
                 def _build_contour_path(i1_idx: int, i1_pt: np.ndarray, i2_idx: int, i2_pt: np.ndarray, contour_points: np.ndarray):
@@ -1358,6 +1376,17 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     except Exception:
                         continue
 
+                # 读取射线加宽像素（用于命中算法），默认为5px
+                try:
+                    ray_thickness_px = int(params.get('DEFECT_DETECTION', {}).get('Q_RAY_THICKNESS_PX', 5))
+                except Exception:
+                    ray_thickness_px = 5
+                if ray_thickness_px < 1:
+                    ray_thickness_px = 1
+                if ray_thickness_px > 31:
+                    ray_thickness_px = 31
+                stripe_half_px_cfg = max((ray_thickness_px - 1) // 2, 0)
+
                 for (idx_i, idx_j, cp) in corner_inters:
                     # 直接使用该交点对应的两条主边
                     chosen = [(idx_i, edges_for_drawing[idx_i]), (idx_j, edges_for_drawing[idx_j])]
@@ -1381,7 +1410,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                             if n <= 1e-6:
                                 continue
                             u0 = v / n
-                            hit = _ray_intersect_contour(cp, u0, cnt_pts, t_min=1.0)
+                            # 使用加粗射线求交，默认总厚度约等于 Q_RAY_THICKNESS_PX（奇数宽），例如5px
+                            hit = _ray_intersect_contour_thick(cp, u0, cnt_pts, t_min=1.0, stripe_half_px=stripe_half_px_cfg)
                             if hit is not None:
                                 cands.append((hit, u0))  # ((t, P, edge_idx), dir)
                         if cands:
@@ -1515,142 +1545,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 kept.append(nd)
         return kept
 
-    # 新逻辑B（替换）：使用“理想竖直边 + 水平边相对原坐标的延长部分 + 玻璃 Canny 边缘”构成闭合区域作为缺角
+    # 方法B（HV 闭合区域）已禁用：为提升速度，仅保留 corner_contour 方法
     hv_corner_q_defects = []
-    try:
-        # 需要玻璃主体轮廓与辅助函数；若上面未成功计算轮廓，则跳过该方法
-        if cnts_qc and main_cnt_qc is not None and cv2.contourArea(main_cnt_qc) > 10.0:
-            cnt_pts = main_cnt_qc.reshape(-1,2).astype(float)
 
-            def _nearest_point_on_contour(P: np.ndarray, contour_points: np.ndarray):
-                best_pt = None; best_idx = 0; best_d = 1e18
-                n = len(contour_points)
-                for k in range(n):
-                    a = contour_points[k]
-                    b = contour_points[(k+1) % n]
-                    ab = b - a
-                    L2 = float(np.dot(ab, ab))
-                    if L2 < 1e-12:
-                        proj = a
-                    else:
-                        t = float(np.dot(P - a, ab) / L2)
-                        t = max(0.0, min(1.0, t))
-                        proj = a + ab * t
-                    d = float(np.linalg.norm(P - proj))
-                    if d < best_d:
-                        best_d = d; best_pt = proj; best_idx = k
-                return best_pt, best_idx
-
-            # 识别“理想竖直边”与“近水平边”
-            try:
-                vertical_tol_deg_local2 = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
-            except Exception:
-                vertical_tol_deg_local2 = 10.0
-
-            def _ang_to_x(line):
-                x1,y1,x2,y2 = map(float, line)
-                dx, dy = (x2-x1), (y2-y1)
-                ang = abs(np.degrees(np.arctan2(dy, dx)))
-                if ang > 90.0: ang = 180.0 - ang
-                return ang
-
-            def _is_vertical2(seg):
-                return _ang_to_x(seg) >= (90.0 - vertical_tol_deg_local2)
-            def _is_horizontal2(seg):
-                return _ang_to_x(seg) <= 10.0
-
-            vertical_ideals_now = [seg for seg in true_edges if _is_vertical2(seg)]
-            # 遍历每条近水平边，检测其相对原坐标是否发生延长（x 端点变动）
-            for idx_h, seg_now in enumerate(true_edges):
-                if not _is_horizontal2(seg_now):
-                    continue
-                if idx_h >= len(true_edges_before_ext):
-                    continue
-                seg_old = true_edges_before_ext[idx_h]
-                x1n, y1n, x2n, y2n = map(float, seg_now)
-                x1o, y1o, x2o, y2o = map(float, seg_old)
-                # 判断左/右端是否发生延长（相对原坐标 x 变化）
-                tol = 0.5
-                left_extended = (abs(x1n - x1o) > tol)
-                right_extended = (abs(x2n - x2o) > tol)
-                if not (left_extended or right_extended):
-                    continue
-
-                # 针对每个发生延长的一侧，构造缺角区域
-                for side in (('left', left_extended), ('right', right_extended)):
-                    if not side[1]:
-                        continue
-                    if side[0] == 'left':
-                        cp = np.array([x1n, y1n], dtype=float)   # 与竖直理想边的相交点端
-                        orig_ep = np.array([x1o, y1o], dtype=float)  # 原端点（水平延长部分的另一端）
-                    else:
-                        cp = np.array([x2n, y2n], dtype=float)
-                        orig_ep = np.array([x2o, y2o], dtype=float)
-
-                    # 寻找离 cp 最近的理想竖直边（按 x 距离）
-                    if not vertical_ideals_now:
-                        continue
-                    vx_best = None; best_dx = 1e18
-                    for vseg in vertical_ideals_now:
-                        vx1, vy1, vx2, vy2 = map(float, vseg)
-                        vx_mid = 0.5 * (vx1 + vx2)
-                        dx_abs = abs(vx_mid - cp[0])
-                        if dx_abs < best_dx:
-                            best_dx = dx_abs; vx_best = np.array([vx1, vy1, vx2, vy2], dtype=float)
-                    if vx_best is None:
-                        continue
-
-                    # 沿竖直方向从 cp 发射双向射线，取最近与主体轮廓的命中点 v_hit
-                    vdir = np.array([0.0, 1.0], dtype=float)
-                    try:
-                        # 竖直边方向近似由其端点决定，取“走向更远端”的方向
-                        vy_len1 = float(np.hypot(vx_best[0]-cp[0], vx_best[1]-cp[1]))
-                        vy_len2 = float(np.hypot(vx_best[2]-cp[0], vx_best[3]-cp[1]))
-                        vdir_raw = np.array([0.0, 1.0 if vy_len2 >= vy_len1 else -1.0], dtype=float)
-                        vdir = vdir_raw / (np.linalg.norm(vdir_raw) + 1e-9)
-                    except Exception:
-                        pass
-
-                    hit_up = _ray_intersect_contour(cp, -vdir, cnt_pts, t_min=1.0)
-                    hit_dn = _ray_intersect_contour(cp,  vdir, cnt_pts, t_min=1.0)
-                    cand_hits = []
-                    if hit_up is not None: cand_hits.append(hit_up)
-                    if hit_dn is not None: cand_hits.append(hit_dn)
-                    if not cand_hits:
-                        # 回退到“最近投影”
-                        v_hit_pt, v_hit_idx = _nearest_point_on_contour(cp, cnt_pts)
-                    else:
-                        cand_hits.sort(key=lambda it: it[0])
-                        _, v_hit_pt, v_hit_idx = cand_hits[0]
-
-                    # 从原端点 orig_ep 到主体轮廓的最近投影作为 h_hit
-                    h_hit_pt, h_hit_idx = _nearest_point_on_contour(orig_ep, cnt_pts)
-                    if h_hit_pt is None or v_hit_pt is None:
-                        continue
-
-                    # 取两命中点沿轮廓的较短路径，构成闭合区域的一边
-                    (path_f, len_f), (path_b, len_b) = _build_contour_path(h_hit_idx, h_hit_pt, v_hit_idx, v_hit_pt, cnt_pts)
-                    contour_path = path_f if len_f <= len_b else path_b
-
-                    # 组合闭合区域：cp -> orig_ep（水平延长段）-> 轮廓路径 -> v_hit -> cp（由 fillPoly 自动闭合）
-                    poly_pts = [cp, orig_ep] + [np.array(p, dtype=float) for p in contour_path[1:-1]] + [v_hit_pt]
-                    poly_cnt = np.array(poly_pts, dtype=np.int32).reshape((-1,1,2))
-                    if cv2.contourArea(poly_cnt) <= 1.0:
-                        continue
-
-                    # 生成缺角对象（与现有可视化兼容：使用 region_contour 填充显示）
-                    cx_cy = np.mean(np.array([cp, orig_ep, v_hit_pt], dtype=float), axis=0)
-                    hv_corner_q_defects.append({
-                        'type': 'Q',
-                        'region_contour': poly_cnt,
-                        'center': (int(round(cx_cy[0])), int(round(cx_cy[1]))),
-                        'origin': 'hv_closed_region',
-                    })
-    except Exception:
-        hv_corner_q_defects = []
-
-    # 优先采用“理想竖直 + 水平延长 + 轮廓”的闭合区域方法；若无结果，则回退到角点三角形方法
-    rect_q_defects = hv_corner_q_defects if hv_corner_q_defects else corner_contour_q_defects
+    # 仅使用角点 + 轮廓三角法作为缺角(Q)检测结果
+    rect_q_defects = corner_contour_q_defects
 
     # 计算某条主边“平行四边形扫描带”的平均亮度，选择相对于缺角三角形质心的内侧（与三角形相反侧）半带，剔除边线与端点
     # 用作缺角(Q)亮度门控的对比基准
@@ -2881,6 +2780,8 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
             except Exception:
                 continue
+
+        # 取消固定长度演示射线：后续在缺陷绘制阶段按算法命中点绘制实际射线
     except Exception:
         pass
     
@@ -2893,7 +2794,29 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         defect_type_map = {'Q': '缺角', 'B': '崩边', 'E': '边缘异常', 'X': '斜边', 'L': '裂纹'}
         type_str = defect_type_map.get(defect_report['type'], '未知')
         
-        # 不再绘制射线段 ray_segments
+        # 若为 Q 且提供了射线段（由算法基于轮廓命中生成），按实际长度绘制箭头线
+        if defect_report["type"] == "Q" and isinstance(defect, dict) and defect.get('ray_segments'):
+            try:
+                rays = defect.get('ray_segments') or []
+                # 两条射线分别着色
+                ray_colors = [(0,255,255), (255,255,0)]
+                # 读取绘制厚度（默认5px），仅用于可视化
+                try:
+                    ray_draw_thickness = int(params.get('DEFECT_DETECTION', {}).get('Q_RAY_THICKNESS_PX', 5))
+                except Exception:
+                    ray_draw_thickness = 5
+                if ray_draw_thickness < 1:
+                    ray_draw_thickness = 1
+                if ray_draw_thickness > 16:
+                    ray_draw_thickness = 16
+                for ri, seg in enumerate(rays):
+                    try:
+                        (x0, y0), (x1, y1) = seg
+                        cv2.arrowedLine(roi_color, (int(x0), int(y0)), (int(x1), int(y1)), ray_colors[ri % len(ray_colors)], ray_draw_thickness, tipLength=0.2)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
 
         if defect_report['type'] in ('E', 'X'):
             # 若为曲边，展示曲度（曲率角）；否则展示与垂直参考的夹角
