@@ -1237,6 +1237,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     # 新逻辑A（保留）：利用已获得角部交点与两条主边，与玻璃轮廓求最近交点生成三角形缺角区域
     # 收集玻璃主体轮廓（与矩形差法重复一次，后续可优化成复用）
     corner_contour_q_defects = []
+    all_corner_ray_segments = []
     try:
         kernel_qc = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
         edges_qc = preprocess_for_hough_enhanced(roi_gray, params)
@@ -1299,9 +1300,9 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     return best_idx
 
                 def _ray_intersect_contour_thick(origin: np.ndarray, dir_vec: np.ndarray, contour_points: np.ndarray, t_min: float = 2.0, stripe_half_px: int = 2):
-                    # 使用加粗的射线（条带）首先对“主轮廓边界”求交；
-                    # 若主轮廓断裂未命中，则回退对 dilate 后的 Canny 边缘（edges_qc_dil）求交；
-                    # 返回首个命中点（t, point, nearest_contour_edge_idx）。
+                    # 使用加粗的射线（条带）在“膨胀后的 Canny 边缘图 edges_qc_dil”上求交；
+                    # 不再要求命中主轮廓；只要命中 ROI 内白色像素即视为有效；
+                    # 返回首个命中点（t, point, dummy_edge_idx=-1）。
                     d = dir_vec.astype(float)
                     if np.linalg.norm(d) < 1e-9:
                         return None
@@ -1320,27 +1321,13 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                 qx, qy = int(round(q[0])), int(round(q[1]))
                                 if 0 <= qx < W and 0 <= qy < H and mask_img[qy, qx] != 0:
                                     hit_pt = np.array([float(qx), float(qy)], dtype=float)
-                                    idx = _nearest_contour_edge_index(hit_pt, contour_points)
-                                    return (t, hit_pt, idx)
+                                    return (t, hit_pt, -1)
                             t += step
                         return None
-
-                    # 1) 先在“主轮廓边界”上扫描
-                    edge_mask = np.zeros((H, W), dtype=np.uint8)
-                    try:
-                        cv2.polylines(edge_mask, [main_cnt_qc], True, 255, 1)
-                    except Exception:
-                        pass
-                    hit = _scan_on_mask(edge_mask)
-                    if hit is not None:
-                        return hit
-
-                    # 2) 回退：在 dilate 后的 Canny 边缘图上扫描（允许命中连续的边缘像素区域）
+                    # 仅在 dilate 后的 Canny 边缘图上扫描（允许命中连续的边缘像素区域）
                     try:
                         if edges_qc_dil is not None:
-                            hit2 = _scan_on_mask(edges_qc_dil)
-                            if hit2 is not None:
-                                return hit2
+                            return _scan_on_mask(edges_qc_dil)
                     except Exception:
                         pass
                     return None
@@ -1387,6 +1374,39 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     ray_thickness_px = 31
                 stripe_half_px_cfg = max((ray_thickness_px - 1) // 2, 0)
 
+                # 计算射线与 ROI 边界的交点（当没有命中白色点时用于可视化延伸）
+                def _ray_end_at_roi_border(origin: np.ndarray, dir_vec: np.ndarray, W: int, H: int, t_min: float = 0.0) -> tuple:
+                    d = dir_vec.astype(float)
+                    n = float(np.linalg.norm(d))
+                    if n < 1e-9:
+                        return origin.copy(), 0.0
+                    d = d / n
+                    x0, y0 = float(origin[0]), float(origin[1])
+                    tx_list = []
+                    if abs(d[0]) > 1e-9:
+                        tx1 = (0.0 - x0) / d[0]
+                        tx2 = ((W - 1.0) - x0) / d[0]
+                        if tx1 >= t_min: tx_list.append(tx1)
+                        if tx2 >= t_min: tx_list.append(tx2)
+                    ty_list = []
+                    if abs(d[1]) > 1e-9:
+                        ty1 = (0.0 - y0) / d[1]
+                        ty2 = ((H - 1.0) - y0) / d[1]
+                        if ty1 >= t_min: ty_list.append(ty1)
+                        if ty2 >= t_min: ty_list.append(ty2)
+                    cand_t = [t for t in (tx_list + ty_list) if t >= t_min]
+                    if not cand_t:
+                        return origin.copy(), 0.0
+                    t_edge = float(min(cand_t))
+                    end_pt = origin + d * t_edge
+                    # 裁剪到 ROI 内边界
+                    end_pt[0] = float(np.clip(end_pt[0], 0.0, W - 1.0))
+                    end_pt[1] = float(np.clip(end_pt[1], 0.0, H - 1.0))
+                    return end_pt, t_edge
+
+                # 收集所有角点的射线段（无论是否形成 Q），用于统一可视化
+                all_corner_ray_segments = []  # 元素: ((x0,y0),(x1,y1))
+
                 for (idx_i, idx_j, cp) in corner_inters:
                     # 直接使用该交点对应的两条主边
                     chosen = [(idx_i, edges_for_drawing[idx_i]), (idx_j, edges_for_drawing[idx_j])]
@@ -1403,25 +1423,47 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     chosen_dirs = []
                     for _, seg in chosen:
                         p1 = np.array(seg[:2], dtype=float); p2 = np.array(seg[2:], dtype=float)
-                        cands = []
+                        cands_hit = []
+                        cands_nohit = []
+                        vis_choice = None  # 该主边用于可视化的一条射线段（命中或延伸到 ROI 边界）
                         for tgt in (p1, p2):
                             v = tgt - cp
                             n = float(np.linalg.norm(v))
                             if n <= 1e-6:
                                 continue
                             u0 = v / n
-                            # 使用加粗射线求交，默认总厚度约等于 Q_RAY_THICKNESS_PX（奇数宽），例如5px
+                            # 使用加粗射线求交（仅对 edges_qc_dil），默认总厚度约等于 Q_RAY_THICKNESS_PX（奇数宽），例如5px
                             hit = _ray_intersect_contour_thick(cp, u0, cnt_pts, t_min=1.0, stripe_half_px=stripe_half_px_cfg)
+                            end_pt_b, t_b = _ray_end_at_roi_border(cp, u0, W_roi2, H_roi2, t_min=1.0)
                             if hit is not None:
-                                cands.append((hit, u0))  # ((t, P, edge_idx), dir)
-                        if cands:
-                            cands.sort(key=lambda it: it[0][0])  # 取 t 最小者
-                            (t_sel, pt_sel, ei_sel), u_sel = cands[0]
+                                t_hit, pt_hit, ei_sel = hit
+                                cands_hit.append((t_hit, pt_hit, ei_sel, u0))
+                            else:
+                                cands_nohit.append((t_b, end_pt_b, u0))
+                        if cands_hit:
+                            cands_hit.sort(key=lambda it: it[0])  # 取命中 t 最小者
+                            t_sel, pt_sel, ei_sel, u_sel = cands_hit[0]
                             inter_hits.append((pt_sel, ei_sel))
                             chosen_dirs.append(u_sel)
-                            ray_hits_dbg.append({'seg': (tuple(map(int, cp)), (int(round(pt_sel[0])), int(round(pt_sel[1]))))})
+                            vis_choice = (tuple(map(int, cp)), (int(round(pt_sel[0])), int(round(pt_sel[1]))))
                         else:
-                            chosen_dirs.append(None)
+                            # 无命中：选择到 ROI 边界的最短射线用于可视化
+                            if cands_nohit:
+                                cands_nohit.sort(key=lambda it: it[0])
+                                t_sel_b, end_pt_b, u_sel_b = cands_nohit[0]
+                                chosen_dirs.append(None)
+                                vis_choice = (tuple(map(int, cp)), (int(round(end_pt_b[0])), int(round(end_pt_b[1]))))
+                            else:
+                                chosen_dirs.append(None)
+                                vis_choice = None
+                        if vis_choice is not None:
+                            ray_hits_dbg.append({'seg': vis_choice})
+                    # 无论是否命中，先将该角的可视化射线段收集到全局
+                    try:
+                        if ray_hits_dbg:
+                            all_corner_ray_segments.extend([rh['seg'] for rh in ray_hits_dbg if isinstance(rh, dict) and 'seg' in rh])
+                    except Exception:
+                        pass
                     # 若双边均获得命中才继续
                     if len(inter_hits) != 2 or any(d is None for d in chosen_dirs):
                         continue
@@ -1441,13 +1483,18 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         if mn > 1e-6:
                             m_dir = m / mn
                             ray_hits_dbg = []
-                            # 重建仅用于可视化的“内收”射线段
+                            # 重建仅用于可视化的“内收”射线段（这里仍使用命中点作为终点）
                             for k, (pt_hit, _) in enumerate(inter_hits):
                                 u = chosen_dirs[k]
                                 cand1 = _rotate(u, inward_deg)
                                 cand2 = _rotate(u, -inward_deg)
                                 u_vis = cand1 if float(np.dot(cand1, m_dir)) >= float(np.dot(cand2, m_dir)) else cand2
                                 ray_hits_dbg.append({'seg': (tuple(map(int, cp)), (int(round(pt_hit[0])), int(round(pt_hit[1]))))})
+                            # 更新全局射线段集合（内收版本）
+                            try:
+                                all_corner_ray_segments.extend([rh['seg'] for rh in ray_hits_dbg if isinstance(rh, dict) and 'seg' in rh])
+                            except Exception:
+                                pass
                     (i1_pt, i1_idx), (i2_pt, i2_idx) = inter_hits[0], inter_hits[1]
 
                     # 任一交点与角点距离 < 5mm 则跳过此角的Q检测（避免微小切角被误判）
@@ -2781,7 +2828,21 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             except Exception:
                 continue
 
-        # 取消固定长度演示射线：后续在缺陷绘制阶段按算法命中点绘制实际射线
+        # 绘制所有角点的射线区域（无论是否形成 Q）：命中时到白点；未命中时延伸到 ROI 边界
+        try:
+            ray_colors = [(0,255,255), (255,255,0)]
+            ray_draw_thickness = int(params.get('DEFECT_DETECTION', {}).get('Q_RAY_THICKNESS_PX', 5)) if isinstance(params, dict) else 5
+            if ray_draw_thickness < 1: ray_draw_thickness = 1
+            if ray_draw_thickness > 16: ray_draw_thickness = 16
+            segments_to_draw = locals().get('all_corner_ray_segments', []) or []
+            for ri, seg in enumerate(segments_to_draw):
+                try:
+                    (x0, y0), (x1, y1) = seg
+                    cv2.arrowedLine(roi_color, (int(x0), int(y0)), (int(x1), int(y1)), ray_colors[ri % len(ray_colors)], ray_draw_thickness, tipLength=0.2)
+                except Exception:
+                    continue
+        except Exception:
+            pass
     except Exception:
         pass
     
@@ -2795,28 +2856,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         type_str = defect_type_map.get(defect_report['type'], '未知')
         
         # 若为 Q 且提供了射线段（由算法基于轮廓命中生成），按实际长度绘制箭头线
-        if defect_report["type"] == "Q" and isinstance(defect, dict) and defect.get('ray_segments'):
-            try:
-                rays = defect.get('ray_segments') or []
-                # 两条射线分别着色
-                ray_colors = [(0,255,255), (255,255,0)]
-                # 读取绘制厚度（默认5px），仅用于可视化
-                try:
-                    ray_draw_thickness = int(params.get('DEFECT_DETECTION', {}).get('Q_RAY_THICKNESS_PX', 5))
-                except Exception:
-                    ray_draw_thickness = 5
-                if ray_draw_thickness < 1:
-                    ray_draw_thickness = 1
-                if ray_draw_thickness > 16:
-                    ray_draw_thickness = 16
-                for ri, seg in enumerate(rays):
-                    try:
-                        (x0, y0), (x1, y1) = seg
-                        cv2.arrowedLine(roi_color, (int(x0), int(y0)), (int(x1), int(y1)), ray_colors[ri % len(ray_colors)], ray_draw_thickness, tipLength=0.2)
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+        # 单独 Q 缺陷的专属射线绘制已迁移到全角统一绘制阶段，这里不再重复
 
         if defect_report['type'] in ('E', 'X'):
             # 若为曲边，展示曲度（曲率角）；否则展示与垂直参考的夹角
