@@ -1358,6 +1358,53 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     except Exception:
                         continue
 
+                # 若上游配对阶段因端点门槛未覆盖到由“理想竖直边 + 水平边”形成的交点，
+                # 这里补充一轮基于角度类别的交点收集，确保理想竖直边参与 Q 检测。
+                try:
+                    vertical_tol_deg_aug = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+                except Exception:
+                    vertical_tol_deg_aug = 10.0
+                try:
+                    horizontal_tol_deg_aug = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', vertical_tol_deg_aug))
+                except Exception:
+                    horizontal_tol_deg_aug = vertical_tol_deg_aug
+
+                def _is_vertical_aug(seg):
+                    ang = _angle_to_x_axis_deg(seg)
+                    return ang >= (90.0 - vertical_tol_deg_aug)
+
+                def _is_horizontal_aug(seg):
+                    ang = _angle_to_x_axis_deg(seg)
+                    return ang <= float(horizontal_tol_deg_aug)
+
+                idx_vertical = [(iv, e) for iv, e in enumerate(edges_for_drawing) if _is_vertical_aug(e)]
+                idx_horizontal = [(ih, e) for ih, e in enumerate(edges_for_drawing) if _is_horizontal_aug(e)]
+
+                # 已有角点坐标集合用于去重
+                existing_corners = [np.array(cp_arr, dtype=float) for (_, _, cp_arr) in corner_inters]
+
+                Hc, Wc = roi_gray.shape[:2]
+                for iv, vseg in idx_vertical:
+                    for ih, hseg in idx_horizontal:
+                        if iv == ih:
+                            continue
+                        inter_pt = find_line_intersection(vseg, hseg)
+                        if inter_pt is None:
+                            continue
+                        xi, yi = float(inter_pt[0]), float(inter_pt[1])
+                        if not (0.0 <= xi < float(Wc) and 0.0 <= yi < float(Hc)):
+                            continue
+                        # 与已收集角点去重
+                        is_dup = False
+                        for ec in existing_corners:
+                            if float(np.linalg.norm(ec - np.array([xi, yi], dtype=float))) <= 3.0:
+                                is_dup = True
+                                break
+                        if is_dup:
+                            continue
+                        corner_inters.append((iv, ih, np.array([xi, yi], dtype=float)))
+                        existing_corners.append(np.array([xi, yi], dtype=float))
+
                 for (idx_i, idx_j, cp) in corner_inters:
                     # 直接使用该交点对应的两条主边
                     chosen = [(idx_i, edges_for_drawing[idx_i]), (idx_j, edges_for_drawing[idx_j])]
@@ -1716,10 +1763,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             p1_far = line1[2:] if endpoint_idx_i == 0 else line1[:2]
             p2_far = line2[2:] if endpoint_idx_j == 0 else line2[:2]
             try:
-                paired_corners.append((int(i), int(j), np.array([float(intersection[0]), float(intersection[1])], dtype=float)))
-            except Exception:
-                pass
-            try:
+                # 记录角点（仅一次）供后续 Q 检测使用；索引基于 edges_for_drawing（已刷新过）
                 paired_corners.append((int(i), int(j), np.array([float(intersection[0]), float(intersection[1])], dtype=float)))
             except Exception:
                 pass
