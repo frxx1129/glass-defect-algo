@@ -180,38 +180,18 @@ def main():
             # 使用 VP8 编码器输出 WebM 格式
             fourcc = cv2.VideoWriter_fourcc(*'VP80')
             output_video_path = os.path.join(args.output, f"{base_filename}_annotated.webm")
-            canny_video_path = os.path.join(args.output, f"{base_filename}_canny_roi.webm")
         else:
             # 默认使用 mp4v 编码器输出 MP4 格式
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             output_video_path = os.path.join(args.output, f"{base_filename}_annotated.mp4")
-            canny_video_path = os.path.join(args.output, f"{base_filename}_canny_roi.mp4")
 
         out_video = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
-        # 额外输出一个基于当前 config 和 ROI 的 Canny 边缘视频（单独文件，帧尺寸与输入一致）
-        out_canny_video = cv2.VideoWriter(canny_video_path, fourcc, fps, (width, height))
         print(f"输出视频将保存至: {output_video_path}")
-        print(f"Canny(ROI) 视频将保存至: {canny_video_path}")
 
     # 视频模式下改为逐帧输出 Canny 图片（仅 ROI）
 
         total_items = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         frame_count = 0
-        # ROI 解析函数（与 image_processor 内部约定尽量保持一致的常见格式）
-        def _parse_roi(rt):
-            # 支持 dict: {x,y,w,h} 或 {x1,y1,x2,y2};
-            # 支持 list/tuple: [x,y,w,h]
-            if isinstance(rt, dict):
-                if all(k in rt for k in ('x','y','w','h')):
-                    return int(rt['x']), int(rt['y']), int(rt['w']), int(rt['h'])
-                if all(k in rt for k in ('x1','y1','x2','y2')):
-                    x1,y1,x2,y2 = int(rt['x1']), int(rt['y1']), int(rt['x2']), int(rt['y2'])
-                    return x1, y1, max(0, x2-x1+1), max(0, y2-y1+1)
-            if isinstance(rt, (list, tuple)) and len(rt) >= 4:
-                return int(rt[0]), int(rt[1]), int(rt[2]), int(rt[3])
-            # 兜底：整幅图
-            return 0, 0, width, height
-
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -226,32 +206,7 @@ def main():
             # --- FIX: 将处理后的帧写入输出视频 ---
             out_video.write(annotated_image)
 
-            # 生成 Canny(ROI) 帧：对每个 ROI，调用 image_processor 的预处理得到边缘并放回全图对应位置
-            canny_vis = np.zeros_like(frame)  # BGR 全黑底
-            rois = roi_cache.get(cam_index, [])
-            for rt in rois:
-                x, y, w, h = _parse_roi(rt)
-                # 防御边界
-                x = max(0, min(x, width-1)); y = max(0, min(y, height-1))
-                w = max(0, min(w, width - x)); h = max(0, min(h, height - y))
-                if w <= 0 or h <= 0:
-                    continue
-                roi_gray = gray_frame[y:y+h, x:x+w]
-                try:
-                    # 直接复用算法的增强预处理，以保证与主流程一致
-                    edges = image_processor.preprocess_for_hough_enhanced(roi_gray, config)
-                except Exception:
-                    # 回退：简单 Canny
-                    edges = cv2.Canny(roi_gray, 100, 200)
-                # 将边缘贴回对应位置（白色）
-                if edges.ndim == 2:
-                    canny_vis[y:y+h, x:x+w, :] = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-                else:
-                    canny_vis[y:y+h, x:x+w, :] = edges
-                # 可选：在可视化上画 ROI 框
-                cv2.rectangle(canny_vis, (x, y), (x+w-1, y+h-1), (0, 255, 255), 1)
-            # 写入 Canny 视频帧
-            out_canny_video.write(canny_vis)
+            # 不再输出 Canny 图片
             
             print(f"  报告: 状态={result['image_status']}, state_code={result['state_code']}, 缺陷数={len(result['defects'])}")
             
@@ -262,7 +217,6 @@ def main():
         # --- FIX: 释放视频读取和写入对象 ---
         cap.release()
         out_video.release()
-        out_canny_video.release()
         print("\n视频处理完成。")
     
     else:
