@@ -1363,69 +1363,61 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     chosen = [(idx_i, edges_for_drawing[idx_i]), (idx_j, edges_for_drawing[idx_j])]
                     # 新增规则：若角点在玻璃主体轮廓上或距离轮廓<=6px，则跳过该角的Q检测，避免边缘轻微毛刺被误判为缺角
                     try:
-                        # 计算角点到轮廓所有点的最小欧氏距离
                         dist_min = float(np.min(np.linalg.norm(cnt_pts - cp, axis=1))) if cnt_pts.size > 0 else 9999.0
                     except Exception:
                         dist_min = 9999.0
                     if dist_min <= 6.0:
-                        # 跳过该角：不构建三角形
                         continue
-                    # 两条线分别求与玻璃轮廓的射线-轮廓交点
+                    # 方向判定改为“基于轮廓的双向试探”：对每条主边，分别沿端点方向发射射线，选择命中距离更近的一侧
                     inter_hits = []  # (point, edge_index)
-                    ray_hits_dbg = []  # debug: store dir, t, stripe poly
-                    # 计算两条主边从交点出发、远离交点的单位方向向量
-                    dirs_local = []
+                    ray_hits_dbg = []
+                    chosen_dirs = []
                     for _, seg in chosen:
                         p1 = np.array(seg[:2], dtype=float); p2 = np.array(seg[2:], dtype=float)
-                        d1 = np.linalg.norm(cp - p1); d2 = np.linalg.norm(cp - p2)
-                        far_pt = p1 if d1 > d2 else p2
-                        v = far_pt - cp
-                        n = float(np.linalg.norm(v))
-                        if n < 1e-6:
-                            dirs_local.append(None)
+                        cands = []
+                        for tgt in (p1, p2):
+                            v = tgt - cp
+                            n = float(np.linalg.norm(v))
+                            if n <= 1e-6:
+                                continue
+                            u0 = v / n
+                            hit = _ray_intersect_contour(cp, u0, cnt_pts, t_min=1.0)
+                            if hit is not None:
+                                cands.append((hit, u0))  # ((t, P, edge_idx), dir)
+                        if cands:
+                            cands.sort(key=lambda it: it[0][0])  # 取 t 最小者
+                            (t_sel, pt_sel, ei_sel), u_sel = cands[0]
+                            inter_hits.append((pt_sel, ei_sel))
+                            chosen_dirs.append(u_sel)
+                            ray_hits_dbg.append({'seg': (tuple(map(int, cp)), (int(round(pt_sel[0])), int(round(pt_sel[1]))))})
                         else:
-                            dirs_local.append(v / n)
-
-                    # 计算“内侧”双角平分方向，用于微调射线方向
-                    m_dir = None
-                    if all(d is not None for d in dirs_local):
-                        m = dirs_local[0] + dirs_local[1]
-                        mn = float(np.linalg.norm(m))
-                        if mn > 1e-6:
-                            m_dir = m / mn
-
-                    # 角度内收（默认 1.8°）
+                            chosen_dirs.append(None)
+                    # 若双边均获得命中才继续
+                    if len(inter_hits) != 2 or any(d is None for d in chosen_dirs):
+                        continue
+                    # 可选内收微调：将方向向双角平分方向内收 Q_RAY_INWARD_DEG（默认1.8°），仅用于可视化射线，命中点沿原命中点保持
                     try:
                         inward_deg = float(params.get('DEFECT_DETECTION', {}).get('Q_RAY_INWARD_DEG', 1.8))
                     except Exception:
                         inward_deg = 1.8
-
                     def _rotate(vec: np.ndarray, deg: float) -> np.ndarray:
                         th = np.deg2rad(deg)
                         c, s = float(np.cos(th)), float(np.sin(th))
                         R = np.array([[c, -s], [s, c]], dtype=float)
                         return (R @ vec.reshape(2,)).reshape(2,)
-
-                    # 发射两条经过“向内 1.5° 微调”的射线
-                    for idx_ch, seg in enumerate(chosen):
-                        u = dirs_local[idx_ch]
-                        if u is None:
-                            continue
-                        u_cast = u.copy()
-                        if m_dir is not None:
-                            # 选择使 u 更贴近 m_dir 的旋转方向（±inward_deg 中选 dot 更大者）
-                            cand1 = _rotate(u, inward_deg)
-                            cand2 = _rotate(u, -inward_deg)
-                            u_cast = cand1 if float(np.dot(cand1, m_dir)) >= float(np.dot(cand2, m_dir)) else cand2
-                        # 使用细射线求交；适度降低起始门槛以捕捉近处边界
-                        hit = _ray_intersect_contour(cp, u_cast, cnt_pts, t_min=1.0)
-                        if hit is not None:
-                            t_hit, pt_hit, edge_idx_hit = hit
-                            inter_hits.append((pt_hit, edge_idx_hit))
-                            # 记录用于可视化的射线段（cp -> 命中点）
-                            ray_hits_dbg.append({'seg': (tuple(map(int, cp)), tuple(map(int, pt_hit)))})
-                    if len(inter_hits) != 2:
-                        continue
+                    if all(d is not None for d in chosen_dirs):
+                        m = chosen_dirs[0] + chosen_dirs[1]
+                        mn = float(np.linalg.norm(m))
+                        if mn > 1e-6:
+                            m_dir = m / mn
+                            ray_hits_dbg = []
+                            # 重建仅用于可视化的“内收”射线段
+                            for k, (pt_hit, _) in enumerate(inter_hits):
+                                u = chosen_dirs[k]
+                                cand1 = _rotate(u, inward_deg)
+                                cand2 = _rotate(u, -inward_deg)
+                                u_vis = cand1 if float(np.dot(cand1, m_dir)) >= float(np.dot(cand2, m_dir)) else cand2
+                                ray_hits_dbg.append({'seg': (tuple(map(int, cp)), (int(round(pt_hit[0])), int(round(pt_hit[1]))))})
                     (i1_pt, i1_idx), (i2_pt, i2_idx) = inter_hits[0], inter_hits[1]
 
                     # 任一交点与角点距离 < 5mm 则跳过此角的Q检测（避免微小切角被误判）
@@ -2857,12 +2849,10 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
     
-    # 绘制与打印：主边直线、角点
+    # 绘制主边直线、角点（移除调试打印）
     annotations_to_draw = []
     try:
-        # 打印主边信息并绘制主边（使用 edges_for_drawing，已包含延长/截断）
-        if edges_for_drawing:
-            print(f"[LINES][ROI {roi_idx}] count={len(edges_for_drawing)}")
+        # 绘制主边（使用 edges_for_drawing，已包含延长/截断）
         for i, seg in enumerate(edges_for_drawing or []):
             x1,y1,x2,y2 = map(float, seg)
             dx, dy = (x2-x1), (y2-y1)
@@ -2870,7 +2860,6 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             if ang > 90.0: ang = 180.0 - ang
             length_px = float(np.hypot(dx, dy))
             length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
-            print(f"[LINES][ROI {roi_idx}] #{i}: ({x1:.1f},{y1:.1f})-({x2:.1f},{y2:.1f}), angle={ang:.1f}°, len={length_px:.1f}px ({length_mm:.1f}mm)")
             # 颜色：近竖直=绿色，近水平=蓝色，其余=灰白
             color = (200,200,200)
             if ang >= 80.0:
@@ -2884,13 +2873,10 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
             except Exception:
                 pass
-        # 打印与绘制角点（使用 paired_corners；不依赖是否生成 X/Q 缺陷）
-        if paired_corners:
-            print(f"[CORNERS][ROI {roi_idx}] count={len(paired_corners)}")
+        # 绘制角点（使用 paired_corners；不依赖是否生成 X/Q 缺陷）
         for (ii, jj, cp_arr) in (paired_corners or []):
             try:
                 cx, cy = float(cp_arr[0]), float(cp_arr[1])
-                print(f"[CORNERS][ROI {roi_idx}] pair=({ii},{jj}) at ({cx:.1f},{cy:.1f})")
                 cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
                 cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
             except Exception:

@@ -97,7 +97,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         memory_max_shift_px = 6.0
     # 新增：预注入基线在“当前帧未检测到竖直边”时的顺延帧数（默认5）
     try:
-        memory_preseed_hold_frames = int(getattr(shared_settings, 'memory_preseed_hold_frames', 5) or 5)
+        memory_preseed_hold_frames = int(getattr(shared_settings, 'memory_preseed_hold_frames', 2) or 2)
     except Exception:
         memory_preseed_hold_frames = 5
 
