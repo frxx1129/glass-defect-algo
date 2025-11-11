@@ -1405,6 +1405,19 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         corner_inters.append((iv, ih, np.array([xi, yi], dtype=float)))
                         existing_corners.append(np.array([xi, yi], dtype=float))
 
+                # 计算玻璃主体轮廓质心，作为“内侧”参考方向
+                try:
+                    m_main = cv2.moments(main_cnt_qc)
+                    if float(m_main.get('m00', 0.0)) != 0.0:
+                        cnt_center = np.array([
+                            float(m_main.get('m10', 0.0)) / float(m_main.get('m00', 1.0)),
+                            float(m_main.get('m01', 0.0)) / float(m_main.get('m00', 1.0))
+                        ], dtype=float)
+                    else:
+                        cnt_center = (np.mean(cnt_pts, axis=0).astype(float) if cnt_pts.size > 0 else np.array([W_roi2/2.0, H_roi2/2.0], dtype=float))
+                except Exception:
+                    cnt_center = np.array([W_roi2/2.0, H_roi2/2.0], dtype=float)
+
                 for (idx_i, idx_j, cp) in corner_inters:
                     # 直接使用该交点对应的两条主边
                     chosen = [(idx_i, edges_for_drawing[idx_i]), (idx_j, edges_for_drawing[idx_j])]
@@ -1421,6 +1434,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     chosen_dirs = []
                     for _, seg in chosen:
                         p1 = np.array(seg[:2], dtype=float); p2 = np.array(seg[2:], dtype=float)
+                        # 候选方向：指向两个端点
                         cands = []
                         for tgt in (p1, p2):
                             v = tgt - cp
@@ -1431,9 +1445,32 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                             hit = _ray_intersect_contour(cp, u0, cnt_pts, t_min=1.0)
                             if hit is not None:
                                 cands.append((hit, u0))  # ((t, P, edge_idx), dir)
+                        # 若未命中，使用“加粗条带”相交作为退路
+                        if not cands:
+                            tmp_cands = []
+                            for tgt in (p1, p2):
+                                v = tgt - cp
+                                n = float(np.linalg.norm(v))
+                                if n <= 1e-6:
+                                    continue
+                                u0 = v / n
+                                hit2 = _ray_intersect_contour_thick(cp, u0, cnt_pts, t_min=1.0, stripe_half_px=2)
+                                if hit2 is not None:
+                                    tmp_cands.append((hit2, u0))
+                            cands = tmp_cands
+
                         if cands:
-                            cands.sort(key=lambda it: it[0][0])  # 取 t 最小者
-                            (t_sel, pt_sel, ei_sel), u_sel = cands[0]
+                            # 优先选择“指向轮廓质心的一侧”的候选；否则退回最短 t
+                            inward_ref = cnt_center - cp
+                            inward_norm = float(np.linalg.norm(inward_ref))
+                            if inward_norm > 1e-6:
+                                inward_dir = inward_ref / inward_norm
+                                inward_cands = [it for it in cands if float(np.dot(it[1], inward_dir)) > 0.0]
+                                selected = inward_cands if inward_cands else cands
+                            else:
+                                selected = cands
+                            selected.sort(key=lambda it: it[0][0])
+                            (t_sel, pt_sel, ei_sel), u_sel = selected[0]
                             inter_hits.append((pt_sel, ei_sel))
                             chosen_dirs.append(u_sel)
                             ray_hits_dbg.append({'seg': (tuple(map(int, cp)), (int(round(pt_sel[0])), int(round(pt_sel[1]))))})

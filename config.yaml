@@ -6,7 +6,7 @@
   "user_id_auto": 7,
   "user_id_manual": 9999,
   "system_params": {
-    "pixels_per_mm": 2.44,
+    "pixels_per_mm": 1.22,
     "queue_size_factor": 2,
     "http_client_max_workers": 4,
     "http_get_timeout_s": 5,
