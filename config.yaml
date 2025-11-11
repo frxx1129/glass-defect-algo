@@ -69,7 +69,7 @@
     }
   },
   "camera_rois": {
-    "0": "cam01_2025-11-10T11-08-41-177.webm_20251110_202454.671_roi_averaged_by_group.json",
+    "0": "cam5_0003_153410_annotated.mp4_20251022_123637.564_roi_averaged_by_group.json",
     "1": "cam2_roi_averaged_by_group.json",
     "2": "cam5_roi_averaged_by_group.json",
     "3": "cam4_roi_averaged_by_group.json",

@@ -42,6 +42,15 @@ def _get_font(font_size=36):
 ANNOTATION_FONT = _get_font(font_size=32)
 import math
 
+# ====================================================================================
+# --- 跨帧共享竖直基线 TTL 机制（默认 2 帧） ---
+# 若当前帧成功检测到新的竖直直线组，则立即覆盖旧基线并重置 TTL；
+# 若当前帧未检测到，但 TTL>0，则复用上一帧缓存并递减 TTL；
+# 一旦检测到新的竖直组，旧的“理想竖直边”不再继续使用（不合并、不叠加）。
+# ====================================================================================
+_VERTICAL_BASELINE_CACHE_GLOBAL = []  # 全局坐标系下的竖直边列表 [[x1,y1,x2,y2], ...]
+_VERTICAL_BASELINE_TTL_LEFT = 0       # 剩余复用帧数
+
 
 # ====================================================================================
 # --- 几何学与分析辅助函数 ---
@@ -3235,11 +3244,11 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
         cross_enabled = True
 
     shared_vertical_global = []
-    # 允许外部预注入的共享竖直边（跨帧基线复用）
+    # TTL 初始值：默认 2 帧，可通过配置覆盖 DEFECT_DETECTION.CROSS_ROI_VERTICAL_TTL_FRAMES
     try:
-        preseed_shared = hough_params.get('PRESEEDED_CROSS_ROI_SHARED_VERTICAL_GLOBAL_EDGES', []) or []
+        ttl_init_frames = int(hough_params.get('DEFECT_DETECTION', {}).get('CROSS_ROI_VERTICAL_TTL_FRAMES', 2))
     except Exception:
-        preseed_shared = []
+        ttl_init_frames = 2
     if cross_enabled and template_rois:
         # 角度容忍与最短长度
         try:
@@ -3347,36 +3356,28 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
                     y_max = max(y_max, float(max(s[1], s[3])))
                 if y_max - y_min >= 1.0:
                     shared_vertical_global.append([x_mean, y_min, x_mean, y_max])
-
-        # 与外部预注入的共享竖直边合并（按 x 接近去重）
-        try:
-            if preseed_shared:
-                def _x_mid(seg):
-                    try:
-                        return 0.5 * (float(seg[0]) + float(seg[2]))
-                    except Exception:
-                        return float('inf')
-                merged = list(shared_vertical_global)
-                for p in preseed_shared:
-                    px = _x_mid(p)
-                    if not np.isfinite(px):
-                        continue
-                    found_close = False
-                    for s in merged:
-                        sx = _x_mid(s)
-                        if abs(px - sx) <= cluster_x_px:
-                            found_close = True
-                            break
-                    if not found_close:
-                        # 直接追加预注入基线
-                        try:
-                            x1,y1,x2,y2 = map(float, p)
-                            merged.append([x1,y1,x2,y2])
-                        except Exception:
-                            continue
-                shared_vertical_global = merged
-        except Exception:
-            pass
+            # 成功得到新的竖直组：覆盖全局缓存并重置 TTL（不与旧基线合并）
+            try:
+                global _VERTICAL_BASELINE_CACHE_GLOBAL, _VERTICAL_BASELINE_TTL_LEFT
+                _VERTICAL_BASELINE_CACHE_GLOBAL = list(shared_vertical_global)
+                _VERTICAL_BASELINE_TTL_LEFT = int(max(0, ttl_init_frames))
+                # 打印一次获取事件（可注释）
+                print(f"[CROSS-ROI] new vertical groups acquired: {len(shared_vertical_global)}, ttl={_VERTICAL_BASELINE_TTL_LEFT}")
+            except Exception:
+                pass
+        else:
+            # 当前帧未能检测到竖直组：若 TTL 尚有剩余，则复用缓存并递减；否则清空
+            try:
+                global _VERTICAL_BASELINE_CACHE_GLOBAL, _VERTICAL_BASELINE_TTL_LEFT
+                if _VERTICAL_BASELINE_CACHE_GLOBAL and _VERTICAL_BASELINE_TTL_LEFT > 0:
+                    shared_vertical_global = list(_VERTICAL_BASELINE_CACHE_GLOBAL)
+                    _VERTICAL_BASELINE_TTL_LEFT -= 1
+                    print(f"[CROSS-ROI] reuse cached verticals: {len(shared_vertical_global)}, ttl_left={_VERTICAL_BASELINE_TTL_LEFT}")
+                else:
+                    _VERTICAL_BASELINE_CACHE_GLOBAL = []
+                    _VERTICAL_BASELINE_TTL_LEFT = 0
+            except Exception:
+                pass
 
     # 将共享竖直边放入参数供 ROI 线程读取
     try:
