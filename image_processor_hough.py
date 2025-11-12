@@ -1478,112 +1478,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                             chosen_dirs.append(None)
                     # 若双边均获得命中则走三角形法；否则尝试“单射线平移平行四边形”法
                     if len(inter_hits) != 2 or any(d is None for d in chosen_dirs):
-                        # 兜底：仅在主三角形/双射线Q未成功记录缺角时，为该 paired corner 生成一个平行四边形候选。
-                        # 使用全局坐标（ROI 偏移）进行构造与边缘验证，避免贴边导致局部坐标裁剪失败。
-                        try:
-                            # 识别两条主边中的竖直与水平（或近水平）
-                            seg0 = chosen[0][1]; seg1 = chosen[1][1]
-                            def _is_vertical_local(seg):
-                                ang = _angle_to_x_axis_deg(seg)
-                                return ang >= (90.0 - vertical_tol_deg)
-                            def _is_horizontal_local(seg):
-                                ang = _angle_to_x_axis_deg(seg)
-                                return ang <= float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', vertical_tol_deg))
-                            vertical_seg = None; horizontal_seg = None
-                            if _is_vertical_local(seg0):
-                                vertical_seg = seg0
-                            if _is_vertical_local(seg1):
-                                vertical_seg = seg1 if vertical_seg is None else vertical_seg
-                            if _is_horizontal_local(seg0):
-                                horizontal_seg = seg0
-                            if _is_horizontal_local(seg1):
-                                horizontal_seg = seg1 if horizontal_seg is None else horizontal_seg
-                            if vertical_seg is None or horizontal_seg is None:
-                                raise RuntimeError('fallback needs vertical+horizontal')
-                            # ROI 全局偏移
-                            roi_off_x = float(params.get('ROI_OFFSET_X', 0.0))
-                            roi_off_y = float(params.get('ROI_OFFSET_Y', 0.0))
-                            # 提取竖直边与水平边的端点（局部）并转为全局
-                            def _seg_to_global_pts(seg):
-                                return (np.array([seg[0] + roi_off_x, seg[1] + roi_off_y], dtype=float),
-                                        np.array([seg[2] + roi_off_x, seg[3] + roi_off_y], dtype=float))
-                            v_p1_g, v_p2_g = _seg_to_global_pts(vertical_seg)
-                            h_p1_g, h_p2_g = _seg_to_global_pts(horizontal_seg)
-                            cp_global = np.array([cp[0] + roi_off_x, cp[1] + roi_off_y], dtype=float)
-                            ve = v_p2_g - v_p1_g
-                            if len(inter_hits) >= 1:
-                                pt_hit_loc, _ = inter_hits[0]
-                                pt_hit_global = np.array([pt_hit_loc[0] + roi_off_x, pt_hit_loc[1] + roi_off_y], dtype=float)
-                                d_vec = pt_hit_global - cp_global
-                                intersections_list = [tuple(map(int, pt_hit_global))]
-                                ray_seg_list = [{'seg': (tuple(map(int, cp_global)), (int(round(pt_hit_global[0])), int(round(pt_hit_global[1]))))}]
-                            else:
-                                dist1 = np.linalg.norm(h_p1_g - cp_global)
-                                dist2 = np.linalg.norm(h_p2_g - cp_global)
-                                if dist1 <= dist2:
-                                    d_vec = h_p2_g - h_p1_g
-                                else:
-                                    d_vec = h_p1_g - h_p2_g
-                                intersections_list = []
-                                ray_seg_list = []
-                            # 构造全局平行四边形顶点
-                            g0 = cp_global
-                            g1 = g0 + d_vec
-                            g2 = g1 + ve
-                            g3 = g0 + ve
-                            poly_global = np.vstack([g0, g1, g2, g3]).astype(np.float32)
-                            poly_global_cnt = poly_global.reshape((-1,1,2)).astype(np.int32)
-                            area_px = float(cv2.contourArea(poly_global_cnt))
-                            if area_px <= 1.0:
-                                raise RuntimeError('area too small')
-                            # 选择全图边缘地图：需要参数传入或外层可访问；若无则退回局部
-                            full_edge_map = params.get('FULL_FRAME_EDGE_MAP') if isinstance(params.get('FULL_FRAME_EDGE_MAP'), np.ndarray) else None
-                            edge_map_use = full_edge_map if (full_edge_map is not None and full_edge_map.size > 0) else (edges_qc_dil if 'edges_qc_dil' in locals() else edges_qc)
-                            if edge_map_use is None or edge_map_use.size == 0:
-                                raise RuntimeError('no edge map use')
-                            # 在全图尺寸上创建掩膜；若 full_edge_map 不存在则仍使用局部尺寸作为退路
-                            if full_edge_map is not None:
-                                mask_band = np.zeros(full_edge_map.shape, dtype=np.uint8)
-                            else:
-                                mask_band = np.zeros(roi_gray.shape, dtype=np.uint8)
-                            cv2.fillPoly(mask_band, [poly_global_cnt], 255)
-                            edge_pix = int(cv2.countNonZero(cv2.bitwise_and(edge_map_use, mask_band)))
-                            try:
-                                fallback_min_edge = int(params.get('DEFECT_DETECTION', {}).get('FALLBACK_PARALLELOGRAM_MIN_EDGE_PX', 1))
-                            except Exception:
-                                fallback_min_edge = 1
-                            if edge_pix < fallback_min_edge:
-                                raise RuntimeError('edge pix insufficient')
-
-                            r3 = cv2.minAreaRect(poly_global_cnt)
-                            (cx3, cy3), (rw3, rh3), ang3 = r3
-                            width_mm3 = (min(rw3, rh3) / float(pixels_per_mm)) if pixels_per_mm else 0.0
-                            length_mm3 = (max(rw3, rh3) / float(pixels_per_mm)) if pixels_per_mm else 0.0
-                            area_mm2_3 = (rw3 * rh3) / float(pixels_per_mm * pixels_per_mm) if pixels_per_mm else 0.0
-                            try:
-                                q_cfg3 = float(params.get('DEFECT_DETECTION', {}).get('Q_MAX_SIDE_MM', 0.0))
-                            except Exception:
-                                q_cfg3 = 0.0
-                            if q_cfg3 is not None and q_cfg3 > 0.0:
-                                max_side_ok3 = (length_mm3 <= q_cfg3 and width_mm3 <= q_cfg3)
-                            else:
-                                max_side_ok3 = True
-                            if width_mm3 >= 5.0 and area_mm2_3 >= 25.0 and max_side_ok3:
-                                box3 = cv2.boxPoints(r3).astype(np.int32)
-                                corner_contour_q_defects.append({
-                                    'type': 'Q',
-                                    'origin': 'fallback_global_parallelogram',
-                                    'min_area_rect': r3,
-                                    'box_points': box3,
-                                    'region_contour': poly_global_cnt,
-                                    'center': (int(round(cx3)), int(round(cy3))),
-                                    'corner_point': tuple(map(int, cp_global)),
-                                    'intersections': intersections_list,
-                                    'ray_segments': ray_seg_list,
-                                    'edge_pixels_in_region': edge_pix
-                                })
-                        except Exception:
-                            pass
+                        # 之前的单射线/平行四边形兜底已移除，这里直接跳过
                         continue
                     # 可选内收微调：将方向向双角平分方向内收 Q_RAY_INWARD_DEG（默认1.8°），仅用于可视化射线，命中点沿原命中点保持
                     try:
@@ -1688,7 +1583,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     except Exception:
         pass
 
-    # 去重：基于质心距离（像素）避免重复 Q；若重叠，按需求以“第二种方法（corner_contour）”为准
     def _dedup_q(existing, new_list, dist_px: float = 20.0):
         kept = existing[:]
         for nd in new_list:
@@ -1711,91 +1605,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     # 仅使用角点 + 轮廓三角法作为缺角(Q)检测结果
     rect_q_defects = corner_contour_q_defects
 
-    # 计算某条主边“平行四边形扫描带”的平均亮度，选择相对于缺角三角形质心的内侧（与三角形相反侧）半带，剔除边线与端点
-    # 用作缺角(Q)亮度门控的对比基准
-    def _edge_baseline_parallelogram_mean(edge_line, tri_centroid):
-        try:
-            p = params["DEFECT_DETECTION"]
-            p1 = np.array(edge_line[:2], dtype=float)
-            p2 = np.array(edge_line[2:], dtype=float)
-            line_vec = p2 - p1
-            line_len = float(np.linalg.norm(line_vec))
-            if line_len <= 1e-6:
-                return float(cv2.mean(roi_gray)[0])
-
-            # 扫描带宽（mm 配置 → px）
-            scan_width = _get_dist_px(p, "LUMINOSITY_SCAN_WIDTH_MM", "LUMINOSITY_SCAN_WIDTH", None, pixels_per_mm)
-            scan_width = max(1, int(round(float(scan_width))))
-
-            unit_vec = line_vec / line_len
-            normal_vec = np.array([-unit_vec[1], unit_vec[0]], dtype=float)
-            half_width_vec = (scan_width / 2.0) * normal_vec
-
-            # 两侧半带四点（按 scan_edge_for_luminosity_defects 的构造方式）
-            c1 = p1 + half_width_vec; c2 = p2 + half_width_vec
-            c3 = p2 - half_width_vec; c4 = p1 - half_width_vec
-
-            mask_plus = np.zeros(roi_gray.shape, dtype=np.uint8)
-            poly_plus = np.array([c1, c2, p2, p1], dtype=np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(mask_plus, [poly_plus], 255)
-
-            mask_minus = np.zeros(roi_gray.shape, dtype=np.uint8)
-            poly_minus = np.array([p1, p2, c3, c4], dtype=np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(mask_minus, [poly_minus], 255)
-
-            # 根据三角形质心在边线哪一侧，选择与其相反侧作为“玻璃内侧”基准
-            # 侧性判定：法向量指向为 plus 侧，点到边线的有符号距离 s = dot((tri - p1), normal_vec)
-            # 若 s > 0，质心在 plus 侧，则取 minus 侧；反之取 plus 侧
-            s = float(np.dot((np.array(tri_centroid, dtype=float) - p1), normal_vec))
-            scan_mask = mask_minus if s > 0 else mask_plus
-
-            # 剔除边线本体与两端点圆形区域，以匹配崩边检测的有效区域
-            # 动态忽略宽度同 B 缺陷：基于边线中点到整图中心距离线性映射
-            edge_mid = (p1 + p2) / 2.0
-            frame_w = float(params.get('FRAME_WIDTH', roi_gray.shape[1]))
-            frame_h = float(params.get('FRAME_HEIGHT', roi_gray.shape[0]))
-            off_x = float(params.get('ROI_OFFSET_X', 0.0))
-            off_y = float(params.get('ROI_OFFSET_Y', 0.0))
-            edge_mid_global = edge_mid + np.array([off_x, off_y], dtype=float)
-            global_center = np.array([frame_w / 2.0, frame_h / 2.0], dtype=float)
-            dist_px_dynamic = float(np.linalg.norm(edge_mid_global - global_center))
-            ignore_width_mm = min(4.0, max(0.0, dist_px_dynamic * 0.002))
-            if pixels_per_mm and pixels_per_mm > 0:
-                edge_ignore_px = ignore_width_mm * pixels_per_mm
-            else:
-                edge_ignore_px = ignore_width_mm
-            try:
-                override_mm = params.get('DEFECT_DETECTION', {}).get('OVERRIDE_LUMINOSITY_EDGE_IGNORE_MM', None)
-                if override_mm is not None:
-                    ov_mm = float(override_mm)
-                    if ov_mm >= 0:
-                        edge_ignore_px = ov_mm * (pixels_per_mm if pixels_per_mm else 1.0)
-            except Exception:
-                pass
-            endpoint_exclude_r = _get_dist_px(p, "LUMINOSITY_ENDPOINT_EXCLUDE_RADIUS_MM", None, None, pixels_per_mm, default_px=0.0)
-            if endpoint_exclude_r is None or endpoint_exclude_r <= 0:
-                endpoint_exclude_r = max(3, int(min(0.3 * scan_width, 15)))
-
-            ignore_mask = np.zeros(roi_gray.shape, dtype=np.uint8)
-            if edge_ignore_px and edge_ignore_px > 0.5:
-                thickness_px = int(math.ceil(edge_ignore_px))
-                if thickness_px < 1:
-                    thickness_px = 1
-                if thickness_px > 256:
-                    thickness_px = 256
-                cv2.line(ignore_mask, tuple(map(int, p1)), tuple(map(int, p2)), 255, thickness=thickness_px)
-            cv2.circle(ignore_mask, tuple(map(int, p1)), int(round(endpoint_exclude_r)), 255, thickness=-1)
-            cv2.circle(ignore_mask, tuple(map(int, p2)), int(round(endpoint_exclude_r)), 255, thickness=-1)
-
-            eff_mask = cv2.subtract(scan_mask, ignore_mask)
-            if cv2.countNonZero(eff_mask) <= 0:
-                # 回退：用未剔除边线/端点的扫描带
-                eff_mask = scan_mask
-
-            return float(cv2.mean(roi_gray, mask=eff_mask)[0])
-        except Exception:
-            return float(cv2.mean(roi_gray)[0])
-
     def sort_key_func(pair_indices):
         i, j = pair_indices
         line1, line2 = true_edges[i], true_edges[j]
@@ -1808,48 +1617,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         potential_pairs = sorted([(i, j) for i, j in combinations(range(num_true_edges), 2)], key=sort_key_func)
     else:
         potential_pairs = []
-
-    # --- Canny 端点搜索辅助：沿主边方向的窄通道 run-length 检测 ---
-    def _search_endpoint_canny(start_pt, dir_unit_vec, edge_img, max_search_dist_px: float,
-                               stripe_half_w_px: int, min_edge_run_px: int, gap_min_px: int):
-        if edge_img is None:
-            return None
-        h, w = edge_img.shape[:2]
-        # 垂直方向单位向量（用于条带）
-        perp = np.array([-dir_unit_vec[1], dir_unit_vec[0]], dtype=float)
-        run_len = 0
-        gap_len = 0
-        last_edge_pos = None
-        steps = int(max(1, int(round(float(max_search_dist_px)))))
-        for i_step in range(1, steps + 1):
-            p = start_pt + dir_unit_vec * i_step
-            x, y = float(p[0]), float(p[1])
-            if not (0 <= x < w and 0 <= y < h):
-                break
-            # 采样条带：[-half, +half]，取任何白点即认为该位置有边
-            has_edge_here = False
-            for off in range(-stripe_half_w_px, stripe_half_w_px + 1):
-                q = p + perp * off
-                qx, qy = int(round(q[0])), int(round(q[1]))
-                if 0 <= qx < w and 0 <= qy < h:
-                    if edge_img[qy, qx] != 0:
-                        has_edge_here = True
-                        break
-            if has_edge_here:
-                run_len += 1
-                gap_len = 0
-                last_edge_pos = p
-            else:
-                if run_len >= min_edge_run_px:
-                    gap_len += 1
-                    if gap_len >= gap_min_px:
-                        # 在足够长的“完好边”之后出现连续缺失，即认为端点在缺失开始前的最后一处边
-                        if last_edge_pos is not None:
-                            return last_edge_pos
-                        else:
-                            return p
-                # 边尚未形成稳定 run，继续前进
-        return None
 
     for i, j in potential_pairs:
         if all(endpoint_paired_status.get(i, [True,True])) or all(endpoint_paired_status.get(j, [True,True])):
