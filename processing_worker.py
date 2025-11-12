@@ -202,9 +202,15 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                 should_reject_overall = should_reject_pane(pane_json, shared_settings, PIXELS_PER_MM)
 
                 jpg_q_main = int(config.get('system_params', {}).get('jpeg_quality_main', 85) or 85)
+                # 编码标注后的整帧（用于上传/预览）
                 success_original, original_buffer_encoded = cv2.imencode('.jpg', annotated_image, [cv2.IMWRITE_JPEG_QUALITY, jpg_q_main])
                 if not success_original:
                     continue
+                # 额外：编码未标注的原始整帧（灰度），用于本地保存“未标注原图”
+                try:
+                    success_raw, raw_buffer_encoded = cv2.imencode('.jpg', frame_data, [cv2.IMWRITE_JPEG_QUALITY, jpg_q_main])
+                except Exception:
+                    success_raw, raw_buffer_encoded = False, None
 
                 PREVIEW_WIDTH = int(config.get('system_params', {}).get('preview_width', 800) or 800)
                 height, width, _ = annotated_image.shape
@@ -225,6 +231,9 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                     "should_reject": should_reject_overall,
                     "annotated_image_buffer": original_buffer_encoded.tobytes(),
                 }
+                if success_raw and raw_buffer_encoded is not None:
+                    # 提供未标注原图的 JPEG 字节给状态机线程做本地保存
+                    result["raw_image_buffer"] = raw_buffer_encoded.tobytes()
                 # 采集模式下不保存 inspection_results 目录（主逻辑已有 storage_path，但这里只控制结果入队即可）
                 results_queue.put(result)
         except Exception:

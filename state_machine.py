@@ -386,6 +386,23 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     rpt['rejection_time'] = rejection_details['rejection_time'].strftime('%Y-%m-%d %H:%M:%S')
             reports_for_upload.append(rpt)
             images_for_upload.append(res.get('annotated_image_buffer'))
+            # 同步：在本地保存未标注的原始整帧（仅在NG上传时保存）
+            try:
+                raw_buf = res.get('raw_image_buffer')
+                if raw_buf:
+                    ts = float(res.get('timestamp', time.time()) or time.time())
+                    cam_idx = int(res.get('camera_index', -1) or -1)
+                    day_dir = time.strftime('%Y%m%d', time.localtime(ts))
+                    out_dir = os.path.join(STORAGE_PATH, day_dir, 'original')
+                    os.makedirs(out_dir, exist_ok=True)
+                    ms = int(ts * 1000)
+                    out_name = f"cam{cam_idx}_ts{ms}.jpg"
+                    out_path = os.path.join(out_dir, out_name)
+                    # 直接写入 JPEG 字节
+                    with open(out_path, 'wb') as f:
+                        f.write(raw_buf)
+            except Exception as e:
+                print(f"[状态机]: 保存未标注原图失败: {e}")
         send_reports_batch_to_server(reports_for_upload, images_for_upload, shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
         print(f"    [状态机]: 本片玻璃上传完成，共 {len(reports_for_upload)} 张 NG 图像。")
 
