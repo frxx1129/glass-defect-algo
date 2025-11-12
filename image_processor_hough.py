@@ -2393,23 +2393,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 corrected_deviation_final = abs(corrected_angle - 90.0)
                 angle_tolerance = p_defect.get("ANGLE_DEVIATION_TOLERANCE", 4.0)
                 if corrected_deviation_final > angle_tolerance:
-                    # 为 X 增加“混合尺寸”：使用两条边的角点到交点的距离作为长宽（px）
-                    try:
-                        d1_px = float(np.linalg.norm(np.array(p1_far, dtype=float) - np.array(intersection, dtype=float)))
-                        d2_px = float(np.linalg.norm(np.array(p2_far, dtype=float) - np.array(intersection, dtype=float)))
-                        length_px = float(max(d1_px, d2_px))
-                        width_px  = float(min(d1_px, d2_px))
-                        size_label = f"{int(round(length_px))}x{int(round(width_px))}"
-                        corner_defects.append({
-                            "type": "X",
-                            "center": tuple(map(int, intersection)),
-                            "angle": corrected_angle,
-                            "length_px": length_px,
-                            "width_px": width_px,
-                            "size_label": size_label
-                        })
-                    except Exception:
-                        corner_defects.append({"type": "X", "center": tuple(map(int, intersection)), "angle": corrected_angle})
+                    # X 型缺陷仅保留角度信息，不输出尺寸/size_label
+                    corner_defects.append({"type": "X", "center": tuple(map(int, intersection)), "angle": corrected_angle})
 
             # 删除 Harris 缺角检测：统一仅按角度偏差尝试判定 X，不再生成 Q
             _handle_as_x_defect()
@@ -3141,29 +3126,28 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             location['angle'] = float(round(defect.get('skew_angle_deg', 0.0), 2))
                         except Exception:
                             location['angle'] = float(round(defect.get('angle', 0.0), 2))
-                    # 计算尺寸：
-                    # - 对 E：使用 axis-aligned AABB 宽高；
-                    # - 对 X（若也携带 box_points 的情况）：同样计算，以便形成统一的 length/width。
-                    try:
-                        length_px, width_px = 0.0, 0.0
-                        # 优先用已有 box_points 的 AABB
-                        if isinstance(box_np, np.ndarray) and box_np.size >= 8:
-                            xbb, ybb, wbb, hbb = cv2.boundingRect(box_np.astype(np.int32))
-                            length_px, width_px = float(max(wbb, hbb)), float(min(wbb, hbb))
-                        else:
-                            # 回退：若仅有 min_area_rect，则先还原四点再取 AABB
-                            r = defect.get('min_area_rect')
-                            if r is not None and isinstance(r, tuple) and len(r) >= 2:
-                                pts = cv2.boxPoints(r).astype(np.int32)
-                                xbb, ybb, wbb, hbb = cv2.boundingRect(pts)
+                    # 仅对 E 类型计算并填充尺寸与 size_label
+                    if defect.get('type') == 'E':
+                        try:
+                            length_px, width_px = 0.0, 0.0
+                            # 优先用已有 box_points 的 AABB
+                            if isinstance(box_np, np.ndarray) and box_np.size >= 8:
+                                xbb, ybb, wbb, hbb = cv2.boundingRect(box_np.astype(np.int32))
                                 length_px, width_px = float(max(wbb, hbb)), float(min(wbb, hbb))
-                        if pixels_per_mm and pixels_per_mm > 0 and (length_px > 0 or width_px > 0):
-                            location['length_mm'] = float(round(length_px / pixels_per_mm, 2))
-                            location['width_mm']  = float(round(width_px  / pixels_per_mm, 2))
-                        # size_label（像素）
-                        location['size_label'] = defect.get('size_label', f"{int(round(length_px))}x{int(round(width_px))}")
-                    except Exception:
-                        pass
+                            else:
+                                # 回退：若仅有 min_area_rect，则先还原四点再取 AABB
+                                r = defect.get('min_area_rect')
+                                if r is not None and isinstance(r, tuple) and len(r) >= 2:
+                                    pts = cv2.boxPoints(r).astype(np.int32)
+                                    xbb, ybb, wbb, hbb = cv2.boundingRect(pts)
+                                    length_px, width_px = float(max(wbb, hbb)), float(min(wbb, hbb))
+                            if pixels_per_mm and pixels_per_mm > 0 and (length_px > 0 or width_px > 0):
+                                location['length_mm'] = float(round(length_px / pixels_per_mm, 2))
+                                location['width_mm']  = float(round(width_px  / pixels_per_mm, 2))
+                            # size_label（像素）
+                            location['size_label'] = defect.get('size_label', f"{int(round(length_px))}x{int(round(width_px))}")
+                        except Exception:
+                            pass
                 else:
                     location['x'] = x
                     location['y'] = y
@@ -3177,18 +3161,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 location['x'] = int(center[0] + x)
                 location['y'] = int(center[1] + y)
                 location['angle'] = float(round(defect.get('angle', 0.0), 2))
-                # X（交点型）增加长宽（基于两腿长度）及 size_label
-                if defect.get('type') == 'X':
-                    try:
-                        lpx = float(defect.get('length_px', 0.0) or 0.0)
-                        wpx = float(defect.get('width_px', 0.0) or 0.0)
-                        if pixels_per_mm and pixels_per_mm > 0 and (lpx > 0 or wpx > 0):
-                            location['length_mm'] = float(round(lpx / pixels_per_mm, 2))
-                            location['width_mm']  = float(round(wpx / pixels_per_mm, 2))
-                        if 'size_label' in defect or (lpx > 0 or wpx > 0):
-                            location['size_label'] = defect.get('size_label', f"{int(round(lpx))}x{int(round(wpx))}")
-                    except Exception:
-                        pass
+                # X 型不输出尺寸/size_label（仅角度）
         else:
             length_px, width_px = 0.0, 0.0
             if defect['type'] == 'Q':
