@@ -1069,7 +1069,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     except Exception:
         pass
 
-    # 新增：按角度将主边分类为 平行 / 垂直 / 斜边，并为斜边生成基于 boundingRect 的缺陷
+    # 新增：按角度将主边分类为 平行 / 垂直 / 斜边，并为斜边生成覆盖条带+Canny白点范围的缺陷
     skew_line_defects = []
     try:
         # 默认容忍角度改为 10°（可通过 DEFECT_DETECTION.VERTICAL_ANGLE_TOL_DEG 覆盖）
@@ -1125,12 +1125,66 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             is_vertical = (abs(a_deg - vertical_ref_deg) <= vertical_tol_deg)
             if not is_parallel and not is_vertical:
                 angle_to_vertical = float(abs(a_deg - vertical_ref_deg))
-                box_pts = _axis_aligned_box_points_for_line(e, pad=3)
-                skew_line_defects.append({
-                    'type': 'E',
-                    'box_points': box_pts,
-                    'skew_angle_deg': angle_to_vertical
-                })
+                # 构建沿斜边的“拓宽+延长”条带，并用该条带内的 Canny 白点作为完整覆盖范围
+                p1 = np.array(e[:2], dtype=float); p2 = np.array(e[2:], dtype=float)
+                v = p2 - p1; L = float(np.linalg.norm(v))
+                if L < 1e-6:
+                    continue
+                u = v / L
+                n = np.array([-u[1], u[0]], dtype=float)
+                # 宽度与延长长度（毫米配置转像素）
+                try:
+                    half_w_px = 0.5 * _get_dist_px(params.get('DEFECT_DETECTION', {}), 'E_STRIPE_WIDTH_MM', None, 6.0, pixels_per_mm)
+                except Exception:
+                    half_w_px = max(3.0, 3.0 * float(pixels_per_mm if pixels_per_mm else 1.0))
+                try:
+                    extend_px = _get_dist_px(params.get('DEFECT_DETECTION', {}), 'E_EXTEND_MARGIN_MM', None, 10.0, pixels_per_mm)
+                except Exception:
+                    extend_px = 10.0 * float(pixels_per_mm if pixels_per_mm else 1.0)
+                # 生成扩展后的四点条带
+                s = p1 - u * float(extend_px)
+                t = p2 + u * float(extend_px)
+                q1 = s + n * float(half_w_px)
+                q2 = t + n * float(half_w_px)
+                q3 = t - n * float(half_w_px)
+                q4 = s - n * float(half_w_px)
+                band_poly = np.array([q1, q2, q3, q4], dtype=np.int32).reshape((-1,1,2))
+
+                # 在条带内取 Canny 白点；如无 Canny，回退到细长框
+                min_rect = None; box_pts = None
+                if binary_edges is not None and isinstance(binary_edges, np.ndarray) and binary_edges.size > 0:
+                    try:
+                        mask = np.zeros(roi_gray.shape, dtype=np.uint8)
+                        cv2.fillPoly(mask, [band_poly], 255)
+                        band_edges = cv2.bitwise_and(binary_edges, mask)
+                        # 提取条带内白点集合
+                        ys, xs = np.where(band_edges > 0)
+                        if xs.size >= 10:
+                            pts = np.vstack([xs, ys]).T.astype(np.float32)
+                            # 可选：凸包再取 minAreaRect，避免噪点外逸
+                            hull = cv2.convexHull(pts)
+                            if isinstance(hull, np.ndarray) and hull.shape[0] >= 3:
+                                min_rect = cv2.minAreaRect(hull)
+                            else:
+                                min_rect = cv2.minAreaRect(pts)
+                            box_pts = cv2.boxPoints(min_rect).astype(np.int32)
+                    except Exception:
+                        min_rect = None; box_pts = None
+                # 回退：若 Canny 未覆盖，使用原有细窄外接框
+                if min_rect is None or box_pts is None:
+                    box_pts = _axis_aligned_box_points_for_line(e, pad=3)
+                    skew_line_defects.append({
+                        'type': 'E',
+                        'box_points': box_pts,
+                        'skew_angle_deg': angle_to_vertical
+                    })
+                else:
+                    skew_line_defects.append({
+                        'type': 'E',
+                        'box_points': box_pts,
+                        'min_area_rect': min_rect,
+                        'skew_angle_deg': angle_to_vertical
+                    })
         except Exception:
             continue
 
@@ -1254,10 +1308,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 H_roi2, W_roi2 = roi_gray.shape[:2]
                 for (ii, jj, cp_arr) in paired_corners:
                     try:
-                        print(f"[Corner] 检测到角点: edges=({ii},{jj}), cp=({int(round(cp_arr[0]))},{int(round(cp_arr[1]))})")
-                    except Exception:
-                        pass
-                    try:
                         xi, yi = float(cp_arr[0]), float(cp_arr[1])
                         if 0 <= xi < W_roi2 and 0 <= yi < H_roi2:
                             corner_inters.append((ii, jj, np.array([xi, yi], dtype=float)))
@@ -1325,10 +1375,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     cnt_center = np.array([W_roi2/2.0, H_roi2/2.0], dtype=float)
 
                 for (idx_i, idx_j, cp) in corner_inters:
-                    try:
-                        print(f"[Q-TRY] 尝试缺角检测: edges=({idx_i},{idx_j}), corner=({int(round(cp[0]))},{int(round(cp[1]))})")
-                    except Exception:
-                        pass
                     # 直接使用该交点对应的两条主边
                     chosen = [(idx_i, edges_for_drawing[idx_i]), (idx_j, edges_for_drawing[idx_j])]
                     # 新增规则：若角点在玻璃主体轮廓上或距离轮廓<=6px，则跳过该角的Q检测，避免边缘轻微毛刺被误判为缺角
@@ -1387,10 +1433,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                             ray_hits_dbg.append({'seg': (tuple(map(int, cp)), (int(round(pt_sel[0])), int(round(pt_sel[1]))))})
                         else:
                             chosen_dirs.append(None)
-                    try:
-                        print(f"[Q-TRY] 命中统计: hits={len(inter_hits)}, any_dir_none={any(d is None for d in chosen_dirs)}")
-                    except Exception:
-                        pass
                     # 若双边均获得命中则走三角形法；否则尝试“单射线平移平行四边形”法
                     if len(inter_hits) != 2 or any(d is None for d in chosen_dirs):
                         # 新方法：当竖直边方向的射线未命中而水平边命中时，
@@ -1441,10 +1483,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                         v_dn = vm_p2 if v_up is vm_p1 else vm_p1
                                         if c_up != c_dn:
                                             v_clip = v_up if c_up > c_dn else v_dn
-                                        try:
-                                            print(f"[DIR] up_edges={c_up}, down_edges={c_dn}, choose={'up' if (c_up>c_dn) else ('down' if c_dn>c_up else 'tie')}")
-                                        except Exception:
-                                            pass
                                 if v_clip is None:
                                     # 退回面积更大端点
                                     def _tri_area(cp_pt, a, b):
@@ -1488,10 +1526,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                         'intersections': [tuple(map(int, pt_hit))],
                                         'ray_segments': [ {'seg': (tuple(map(int, cp)), (int(round(pt_hit[0])), int(round(pt_hit[1]))))} ]
                                     })
-                                    try:
-                                        print(f"[Q-OK] tri_vertical_clip: corner=({int(round(cp[0]))},{int(round(cp[1]))}), area_px={area_px:.1f}")
-                                    except Exception:
-                                        pass
                         except Exception:
                             pass
                         continue
@@ -1572,10 +1606,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                             'intersections': [tuple(map(int, i1_pt)), tuple(map(int, i2_pt))],
                             'ray_segments': [rh['seg'] for rh in ray_hits_dbg]
                         })
-                        try:
-                            print(f"[Q-OK] corner_contour: corner=({int(round(cp[0]))},{int(round(cp[1]))}), area_px={tri_area_px:.1f}")
-                        except Exception:
-                            pass
                 # 去重：同一角点附近的 Q 仅保留一个（按中心距离阈值选三角像素面积较大者）
                 try:
                     if corner_contour_q_defects:
@@ -2281,6 +2311,78 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             main_edges.append(cseg)
         except Exception:
             pass
+
+    # 额外增强：为崩边检测补充“理想竖直边”（基于本 ROI 内的 Canny 白点列峰），
+    # 仅当当前主边中“近竖直”数量不足 2 条时才尝试生成；避免重复
+    try:
+        p_def_evb = params.get('DEFECT_DETECTION', {})
+        enable_ev = bool(p_def_evb.get('B_USE_IDEAL_VERTICAL_FROM_CANNY', True))
+    except Exception:
+        enable_ev = True
+    if enable_ev and binary_edges is not None and binary_edges.size > 0:
+        try:
+            # 统计当前近竖直主边数量
+            def _is_near_vertical(seg, tol_deg=10.0):
+                x1,y1,x2,y2 = map(float, seg)
+                ang = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+                if ang > 90.0:
+                    ang = 180.0 - ang
+                return ang >= (90.0 - tol_deg)
+            tol_v = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+            current_v = sum(1 for e in (main_edges or []) if _is_near_vertical(e, tol_v))
+            if current_v < 2:
+                H_be, W_be = binary_edges.shape[:2]
+                col_sum = np.sum((binary_edges > 0).astype(np.uint16), axis=0).astype(np.float32)
+                # 简单平滑
+                k = int(max(3, round(0.03 * W_be)))
+                if k % 2 == 0:
+                    k += 1
+                if k > 1:
+                    pad = k // 2
+                    col_pad = np.pad(col_sum, (pad, pad), mode='edge')
+                    ker = np.ones(k, dtype=np.float32) / float(k)
+                    col_smooth = np.convolve(col_pad, ker, mode='valid')
+                else:
+                    col_smooth = col_sum
+                # 阈值：列白点数量需达到高度的一定比例
+                min_ratio = float(params.get('DEFECT_DETECTION', {}).get('B_IDEAL_VERTICAL_MIN_COL_SUM_RATIO', 0.15))
+                thr = max(1.0, min_ratio * float(H_be))
+                # 选择两个相距足够远的峰值
+                min_sep = float(params.get('DEFECT_DETECTION', {}).get('B_IDEAL_VERTICAL_MIN_SEPARATION_PX', max(8.0, 0.2 * W_be)))
+                idx_sorted = list(np.argsort(-col_smooth))  # 降序
+                picks = []
+                for idx in idx_sorted:
+                    if col_smooth[int(idx)] < thr:
+                        break
+                    if not picks:
+                        picks.append(int(idx))
+                    else:
+                        far = True
+                        for p in picks:
+                            if abs(int(idx) - int(p)) < min_sep:
+                                far = False
+                                break
+                        if far:
+                            picks.append(int(idx))
+                    if len(picks) >= 2:
+                        break
+                # 将挑选到的列转为本 ROI 内的竖直段，并去重加入 main_edges
+                if picks:
+                    # 去重：若与已有主边近似重合（按 x 距离 < 2px）则跳过
+                    def _x_mid(seg):
+                        return 0.5 * (float(seg[0]) + float(seg[2]))
+                    existing_xs = []
+                    for e in (main_edges or []):
+                        if _is_near_vertical(e, tol_v):
+                            existing_xs.append(_x_mid(e))
+                    for px_i in picks:
+                        x_new = float(px_i)
+                        if any(abs(float(ex) - x_new) <= 2.0 for ex in existing_xs):
+                            continue
+                        seg_new = np.array([x_new, 0.0, x_new, float(H_be - 1)], dtype=float)
+                        main_edges.append(seg_new)
+        except Exception:
+            pass
     # 计算本帧（该 ROI）主边之间的有效相交点（仅在本 ROI 范围内）
     intersections_frame = []
     if main_edges and len(main_edges) >= 2:
@@ -2708,21 +2810,21 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 color = (0,255,0)
             elif ang <= 10.0:
                 color = (255,0,0)
-            cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
+            #cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
             # 在中点标注线段索引
             mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
-            try:
-                cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-            except Exception:
-                pass
+            #try:
+            #    cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+            #except Exception:
+            #    pass
         # 绘制角点（使用 paired_corners；不依赖是否生成 X/Q 缺陷）
-        for (ii, jj, cp_arr) in (paired_corners or []):
-            try:
-                cx, cy = float(cp_arr[0]), float(cp_arr[1])
-                cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
-                cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
-            except Exception:
-                continue
+        #for (ii, jj, cp_arr) in (paired_corners or []):
+            #try:
+            #    cx, cy = float(cp_arr[0]), float(cp_arr[1])
+            #    cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
+            #    cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
+            #except Exception:
+            #    continue
 
         # 已移除演示射线，仅保留真实命中射线在缺陷绘制阶段显示
     except Exception:
@@ -2737,21 +2839,21 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         type_str = defect_type_map.get(defect_report['type'], '未知')
 
         # 仅绘制真实命中射线（Q 缺陷且 defect 中包含 ray_segments）
-        try:
-            if defect_report['type'] == 'Q' and isinstance(defect.get('ray_segments'), (list, tuple)):
-                for seg_entry in defect.get('ray_segments'):
-                    try:
-                        if isinstance(seg_entry, dict) and 'seg' in seg_entry:
-                            p0, p1 = seg_entry['seg']
-                        else:
-                            p0, p1 = seg_entry
-                        x0,y0 = int(p0[0]), int(p0[1])
-                        x1,y1 = int(p1[0]), int(p1[1])
-                        cv2.arrowedLine(roi_color, (x0,y0), (x1,y1), (0,255,255), 1, tipLength=0.25)
-                    except Exception:
-                        continue
-        except Exception:
-            pass
+        #try:
+        #    if defect_report['type'] == 'Q' and isinstance(defect.get('ray_segments'), (list, tuple)):
+        #        for seg_entry in defect.get('ray_segments'):
+        #            try:
+        #                if isinstance(seg_entry, dict) and 'seg' in seg_entry:
+        #                    p0, p1 = seg_entry['seg']
+        #                else:
+        #                    p0, p1 = seg_entry
+        #                x0,y0 = int(p0[0]), int(p0[1])
+        #                x1,y1 = int(p1[0]), int(p1[1])
+        #                cv2.arrowedLine(roi_color, (x0,y0), (x1,y1), (0,255,255), 1, tipLength=0.25)
+        #            except Exception:
+        #                continue
+        #except Exception:
+        #    pass
 
         if defect_report['type'] in ('E', 'X'):
             # 若为曲边，展示曲度（曲率角）；否则展示与垂直参考的夹角
@@ -2832,7 +2934,8 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 except Exception:
                     center_pt = None
             if center_pt is not None:
-                cv2.circle(roi_color, center_pt, 6, (0,255,0), -1)
+            #    cv2.circle(roi_color, center_pt, 6, (0,255,0), -1)
+                pass
     except Exception:
         pass
 
@@ -2980,11 +3083,11 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             area_mm2 = float(area_px2) / float(pixels_per_mm * pixels_per_mm) if pixels_per_mm else 0.0
 
                             # 绘制理想直线边（平行四边形边界）为白色虚线
-                            if draw_ideal:
-                                for k in range(4):
-                                    p0 = tuple(map(int, quad_pts[k]))
-                                    p1 = tuple(map(int, quad_pts[(k+1)%4]))
-                                    draw_dashed_line(roi_color, p0, p1, (255,255,255), thickness=1, dash_length=8)
+                            #if draw_ideal:
+                            #    for k in range(4):
+                            #        p0 = tuple(map(int, quad_pts[k]))
+                            #        p1 = tuple(map(int, quad_pts[(k+1)%4]))
+                            #        draw_dashed_line(roi_color, p0, p1, (255,255,255), thickness=1, dash_length=8)
                         else:
                             # 主边直线不足以闭合平行四边形：仅记录状态，不绘制、不使用 fallback
                             # 不写入 envelope 信息
