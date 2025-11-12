@@ -392,7 +392,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 if raw_buf:
                     ts = float(res.get('timestamp', time.time()) or time.time())
                     cam_idx = int(res.get('camera_index', -1) or -1)
-                    day_dir = time.strftime('%Y%m%d', time.localtime(ts))
+                    day_dir = time.strftime('%Y-%m-%d', time.localtime(ts))
                     out_dir = os.path.join(STORAGE_PATH, day_dir, 'original')
                     os.makedirs(out_dir, exist_ok=True)
                     ms = int(ts * 1000)
@@ -524,7 +524,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
 
         try:
             cam_index = result["camera_index"]
-            ws_data = {k: v for k, v in result.items() if k != 'annotated_image_buffer'}
+            # 避免广播二进制缓冲区
+            ws_data = {k: v for k, v in result.items() if k not in ('annotated_image_buffer', 'raw_image_buffer')}
             try:
                 asyncio.run_coroutine_threadsafe(connection_manager.broadcast(json.dumps(ws_data), cam_index), loop)
             except Exception:
@@ -839,6 +840,23 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         print("    [状态机]: 即时手动剔废触发！")
                         # 可选上传：只有当当前片有NG缓存时才上传
                         if current_pane_ng_buffer and current_pane_reports:
+                            # 在即时上传前，保存当前片中所有 NG 帧的未标注原图
+                            try:
+                                for res_item in current_pane_ng_buffer:
+                                    raw_buf = res_item.get('raw_image_buffer')
+                                    if not raw_buf:
+                                        continue
+                                    ts = float(res_item.get('timestamp', time.time()) or time.time())
+                                    cam_idx = int(res_item.get('camera_index', -1) or -1)
+                                    day_dir = time.strftime('%Y-%m-%d', time.localtime(ts))
+                                    out_dir = os.path.join(STORAGE_PATH, day_dir, 'original')
+                                    os.makedirs(out_dir, exist_ok=True)
+                                    ms = int(ts * 1000)
+                                    out_name = f"cam{cam_idx}_ts{ms}.jpg"
+                                    with open(os.path.join(out_dir, out_name), 'wb') as f:
+                                        f.write(raw_buf)
+                            except Exception as e:
+                                print(f"[状态机]: 手动剔废即时上传前保存未标注原图失败: {e}")
                             send_reports_batch_to_server(current_pane_reports, [r.get('annotated_image_buffer') for r in current_pane_ng_buffer], shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
 
             elif machine_state == "WAITING_FOR_PANE":

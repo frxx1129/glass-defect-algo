@@ -206,11 +206,13 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                 success_original, original_buffer_encoded = cv2.imencode('.jpg', annotated_image, [cv2.IMWRITE_JPEG_QUALITY, jpg_q_main])
                 if not success_original:
                     continue
-                # 额外：编码未标注的原始整帧（灰度），用于本地保存“未标注原图”
-                try:
-                    success_raw, raw_buffer_encoded = cv2.imencode('.jpg', frame_data, [cv2.IMWRITE_JPEG_QUALITY, jpg_q_main])
-                except Exception:
-                    success_raw, raw_buffer_encoded = False, None
+                # 额外：仅当本帧为 NG 时，编码未标注的原始整帧（灰度），用于本地保存“未标注原图”
+                success_raw, raw_buffer_encoded = False, None
+                if str(pane_json.get('image_status', 'OK')).upper() == 'NG':
+                    try:
+                        success_raw, raw_buffer_encoded = cv2.imencode('.jpg', frame_data, [cv2.IMWRITE_JPEG_QUALITY, jpg_q_main])
+                    except Exception:
+                        success_raw, raw_buffer_encoded = False, None
 
                 PREVIEW_WIDTH = int(config.get('system_params', {}).get('preview_width', 800) or 800)
                 height, width, _ = annotated_image.shape
@@ -231,6 +233,9 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                     "should_reject": should_reject_overall,
                     "annotated_image_buffer": original_buffer_encoded.tobytes(),
                 }
+                # 提供 ROI 精简信息用于状态机的竖直线统计与进入判定
+                if isinstance(pane_json.get('rois'), list):
+                    result['rois'] = pane_json.get('rois')
                 if success_raw and raw_buffer_encoded is not None:
                     # 提供未标注原图的 JPEG 字节给状态机线程做本地保存
                     result["raw_image_buffer"] = raw_buffer_encoded.tobytes()
