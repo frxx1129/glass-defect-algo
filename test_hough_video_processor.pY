@@ -4,6 +4,7 @@ import yaml
 import time
 import os
 import argparse
+import math
 from datetime import datetime
 import base64
 import numpy as np
@@ -84,6 +85,7 @@ def main():
     parser.add_argument('-o', '--output', default='hough_results', help="保存结果的输出文件夹路径。")
     default_cfg = 'config.yaml' if os.path.exists('config.yaml') else 'config.json'
     parser.add_argument('--config', default=default_cfg, help="配置文件的路径（支持 YAML/JSON，默认优先读取 config.yaml）。")
+    parser.add_argument('--output-fps', type=float, default=None, help='覆盖输出视频的帧率；不指定则尽量使用输入视频FPS，失败回退到30.0')
     args = parser.parse_args()
 
     # 1. 规范化输入路径（去掉可能的反引号/引号/空格），然后检查是否存在
@@ -165,82 +167,108 @@ def main():
 
     elif os.path.isfile(input_path):
         print(f"\n--- 开始处理视频: {args.input} ---")
-        cap = cv2.VideoCapture(input_path)
+        # 预先解析扩展名以判断是否为 WebM，并尽量使用 FFMPEG 后端以提升兼容性
+        base_filename, input_ext = os.path.splitext(os.path.basename(input_path))
+        input_ext = input_ext.strip().strip('`"\'')
+        is_webm = (input_ext.lower() == '.webm') or base_filename.lower().endswith('.webm')
+
+        if is_webm:
+            cap = cv2.VideoCapture(input_path, cv2.CAP_FFMPEG)
+            if not cap.isOpened():
+                # 回退到默认后端再试一次
+                cap = cv2.VideoCapture(input_path)
+        else:
+            cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
             print(f"错误: 无法打开视频文件 '{args.input}'。")
             return
-        
-        # --- FIX: 设置视频编写器 (VideoWriter)，并根据输入格式选择编码器 ---
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        try:
-            # 某些容器上 FPS 可能为 0 或 NaN，回退为 25fps
-            if not fps or fps <= 0 or (isinstance(fps, float) and (fps != fps)):
-                fps = 25.0
-        except Exception:
-            fps = 25.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        base_filename, input_ext = os.path.splitext(os.path.basename(input_path))
-        # 清理可能残留的反引号/引号
-        input_ext = input_ext.strip().strip('`"\'')
-        is_webm = (input_ext.lower() == '.webm') or base_filename.lower().endswith('.webm')
-        if is_webm:
-            # 使用 VP8 编码器输出 WebM 格式
-            fourcc = cv2.VideoWriter_fourcc(*'VP80')
-            output_video_path = os.path.join(args.output, f"{base_filename}_annotated.webm")
-        else:
-            # 默认使用 mp4v 编码器输出 MP4 格式
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            output_video_path = os.path.join(args.output, f"{base_filename}_annotated.mp4")
 
-        out_video = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
-        if not out_video.isOpened():
-            # 尝试回退编码器/封装，提升可播放性
-            if is_webm:
-                # 尝试 VP9
-                fourcc = cv2.VideoWriter_fourcc(*'VP90')
-                out_video = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
-            if not out_video.isOpened():
-                # 最后回退到 MJPG/AVI
-                fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-                output_video_path = os.path.join(args.output, f"{base_filename}_annotated.avi")
-                out_video = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
-        if not out_video.isOpened():
-            print("错误: 无法创建可写的视频文件（尝试 VP80/VP90/MJPG 失败）。")
+        # 先读取第一帧以确定尺寸（WebM 上部分属性可能为 0）
+        first_ok, first_frame = cap.read()
+        if not first_ok or first_frame is None:
+            print("错误: 读取视频第一帧失败，无法确定尺寸。")
             cap.release()
             return
-        print(f"输出视频将保存至: {output_video_path}")
+        height, width = first_frame.shape[:2]
 
-    # 视频模式下改为逐帧输出 Canny 图片（仅 ROI）
+        # 目标 FPS：优先命令行；否则尽量沿用输入FPS；失败回退到 30.0
+        if args.output_fps and args.output_fps > 0:
+            fps = float(args.output_fps)
+            fps = max(1.0, min(120.0, fps))
+            print(f"指定输出FPS: {fps}")
+        else:
+            in_fps = cap.get(cv2.CAP_PROP_FPS)
+            try:
+                if not in_fps or in_fps <= 0 or (isinstance(in_fps, float) and math.isnan(in_fps)):
+                    fps = 30.0
+                    print("输入FPS不可用，回退到 30.0")
+                else:
+                    # 限定合理范围，避免异常值
+                    fps = max(1.0, min(120.0, float(in_fps)))
+                    print(f"沿用输入FPS: {in_fps} -> 输出 {fps}")
+            except Exception:
+                fps = 30.0
+                print("读取输入FPS异常，回退到 30.0")
 
-        # 某些容器（尤其是 WebM）上，CAP_PROP_FRAME_COUNT 可能严重不准（例如夸大 100 倍）。
-        # 为避免误导，将其作为“参考总数”，若判断不可靠，则在日志中不显示分母，处理完后用实际计数覆盖。
+        # --- 设置视频编写器 (VideoWriter) ---
+        # 按你的需求，强制输出为 AVI 容器，优先 MJPG 编码，失败再尝试 XVID/DIVX
+        fourcc_candidates = [
+            ('XVID', '.avi'),
+            ('MJPG', '.avi'),
+            ('DIVX', '.avi'),
+        ]
+        out_video = None
+        chosen = None
+        for cc, ext in fourcc_candidates:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*cc)
+                output_video_path = os.path.join(args.output, f"{base_filename}_annotated{ext}")
+                out_video = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+                if out_video.isOpened():
+                    chosen = (cc, ext)
+                    break
+            except Exception:
+                pass
+        if not out_video.isOpened():
+            print("错误: 无法创建可写的 AVI 视频文件（尝试 MJPG/XVID/DIVX 失败）。")
+            cap.release()
+            return
+        print(f"输出视频将保存至: {output_video_path} (编码器: {chosen[0] if chosen else '未知'})")
+
+        # 某些容器（尤其是 WebM）上，CAP_PROP_FRAME_COUNT 可能严重不准。
         cap_reported_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        # 简单可靠性判断：
-        # - 0 或负数：不可靠；
-        # - WebM：默认视为不可靠（opencv 对 webm 的帧数统计常失真）。
-        # 其余格式保留显示，仅用于进度参考。
         show_total = (cap_reported_total > 0 and not is_webm)
         if show_total:
             total_items = cap_reported_total
         else:
-            total_items = 0  # 将在读完后被 frame_count 覆盖，用于汇总
-        frame_count = 0
+            total_items = 0
+
+        # 处理第一帧（已读取）
+        frame_count = 1
+        print(f"处理帧 {frame_count}/{cap_reported_total}..." if show_total else f"处理帧 {frame_count}...")
+        gray_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
+        result, annotated_image = process_frame_task(gray_frame, cam_index, config, shared_settings, roi_cache)
+        if annotated_image is None:
+            annotated_image = first_frame
+        if annotated_image.ndim == 2:
+            annotated_image = cv2.cvtColor(annotated_image, cv2.COLOR_GRAY2BGR)
+        h2, w2 = annotated_image.shape[:2]
+        if (w2 != width) or (h2 != height):
+            annotated_image = cv2.resize(annotated_image, (width, height), interpolation=cv2.INTER_AREA)
+        out_video.write(annotated_image)
+        print(f"  报告: 状态={result['image_status']}, state_code={result['state_code']}, 缺陷数={len(result['defects'])}")
+        report_output_path = os.path.join(args.output, f"frame_{frame_count:05d}_report.json")
+        with open(report_output_path, 'w', encoding='utf-8') as f: json.dump(result, f, indent=2, ensure_ascii=False)
+
+        # 继续处理剩余帧
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-
             frame_count += 1
-            if show_total:
-                print(f"处理帧 {frame_count}/{cap_reported_total}...")
-            else:
-                print(f"处理帧 {frame_count}...")
-            
+            print(f"处理帧 {frame_count}/{cap_reported_total}..." if show_total else f"处理帧 {frame_count}...")
             gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             result, annotated_image = process_frame_task(gray_frame, cam_index, config, shared_settings, roi_cache)
-            # 确保输出帧为 BGR 三通道，尺寸匹配视频
             if annotated_image is None:
                 annotated_image = frame
             if annotated_image.ndim == 2:
@@ -248,22 +276,13 @@ def main():
             h2, w2 = annotated_image.shape[:2]
             if (w2 != width) or (h2 != height):
                 annotated_image = cv2.resize(annotated_image, (width, height), interpolation=cv2.INTER_AREA)
-            
-            # --- FIX: 将处理后的帧写入输出视频 ---
             out_video.write(annotated_image)
-
-            # 不再输出 Canny 图片
-            
             print(f"  报告: 状态={result['image_status']}, state_code={result['state_code']}, 缺陷数={len(result['defects'])}")
-            
-            # (可选) 仍然可以为每一帧保存JSON报告
             report_output_path = os.path.join(args.output, f"frame_{frame_count:05d}_report.json")
             with open(report_output_path, 'w', encoding='utf-8') as f: json.dump(result, f, indent=2, ensure_ascii=False)
-        
-        # --- FIX: 释放视频读取和写入对象 ---
+
         cap.release()
         out_video.release()
-        # 用实际处理的帧数覆盖统计结果，避免被不可靠的 CAP_PROP_FRAME_COUNT 误导
         total_items = frame_count
         print("\n视频处理完成。")
     
