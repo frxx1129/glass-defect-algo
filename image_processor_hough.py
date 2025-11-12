@@ -2469,6 +2469,26 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             location['angle'] = float(round(defect.get('skew_angle_deg', 0.0), 2))
                         except Exception:
                             location['angle'] = float(round(defect.get('angle', 0.0), 2))
+                    # 若为 E，则使用 axis-aligned boundingBox 计算尺寸（宽高）
+                    if defect.get('type') == 'E':
+                        try:
+                            length_px, width_px = 0.0, 0.0
+                            # 优先用已有 box_points 的 AABB
+                            if isinstance(box_np, np.ndarray) and box_np.size >= 8:
+                                xbb, ybb, wbb, hbb = cv2.boundingRect(box_np.astype(np.int32))
+                                length_px, width_px = float(max(wbb, hbb)), float(min(wbb, hbb))
+                            else:
+                                # 回退：若仅有 min_area_rect，则先还原四点再取 AABB
+                                r = defect.get('min_area_rect')
+                                if r is not None and isinstance(r, tuple) and len(r) >= 2:
+                                    pts = cv2.boxPoints(r).astype(np.int32)
+                                    xbb, ybb, wbb, hbb = cv2.boundingRect(pts)
+                                    length_px, width_px = float(max(wbb, hbb)), float(min(wbb, hbb))
+                            if pixels_per_mm and pixels_per_mm > 0:
+                                location['length_mm'] = float(round(length_px / pixels_per_mm, 2))
+                                location['width_mm']  = float(round(width_px  / pixels_per_mm, 2))
+                        except Exception:
+                            pass
                 else:
                     location['x'] = x
                     location['y'] = y
