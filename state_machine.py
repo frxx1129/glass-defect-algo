@@ -61,11 +61,11 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         pass
     
     # 进入/离开 去抖（帧）——避免算法偶发抖动导致反复进入/离开
-    # 默认帧数略降到3，在引入“进入最短时间”门槛后整体更稳且响应更快
+    # 判定依据恢复为：聚合的 state_code（>0 视为“在玻璃上”，==0 视为“离开”）
     ENTER_CONFIRM_FRAMES = int(getattr(shared_settings, 'enter_confirm_frames', 3))
     LEAVE_CONFIRM_FRAMES = int(getattr(shared_settings, 'leave_confirm_frames', 3))
-    presence_streak = 0           # 连续“进入”条件满足的帧计数（这里改为：连续水平组缺失）
-    absence_streak = 0            # 连续“离开”条件满足的帧计数（这里改为：连续水平+竖直组同时出现）
+    presence_streak = 0           # 连续“进入”条件满足的帧计数（聚合 state_code > 0）
+    absence_streak = 0            # 连续“离开”条件满足的帧计数（聚合 state_code == 0）
     presence_start_time_s = None  # 不再用于进入判定，仅用于可能的扩展/调试
     # 新增：玻璃进入后的最大持续时间（秒），超时强制退出
     try:
@@ -740,17 +740,13 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             except Exception:
                 pass
 
-            # 跨相机聚合：估算“竖直组总数”“水平组总数”
-            agg_edges = int(sum(v[0] for v in last_groups_by_cam.values())) if last_groups_by_cam else 0
-            agg_vertical = int(sum(v[1] for v in last_groups_by_cam.values())) if last_groups_by_cam else 0
-            agg_horizontal = max(0, agg_edges - agg_vertical)
-            has_both_groups = (agg_vertical >= group_min_vertical and agg_horizontal >= group_min_horizontal)
-            # 水平组缺失（或极少）作为“在玻璃上”的主要指示；竖直组有时会不清晰，因此不强制要求
-            horizontal_missing = (agg_horizontal < group_min_horizontal)
+            # 旧逻辑恢复：依据聚合的 state_code 判定是否“在玻璃上”
+            presence_condition = (current_total_panes > 0)
+            absence_condition = (current_total_panes == 0)
 
             if machine_state == "PANE_DETECTED":
-                # 检测离开：当“水平+竖直组同时出现”连续满足一定帧数，且已满足进入后的最短停留时间
-                if has_both_groups:
+                # 检测离开：当“聚合 state_code==0”连续满足一定帧数，且已满足进入后的最短停留时间
+                if absence_condition:
                     absence_streak += 1
                     try:
                         dwell_s = (time.time() - pane_enter_time_s) if pane_enter_time_s is not None else 0.0
@@ -807,7 +803,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         pane_enter_time_s = None
                         continue
                 else:
-                    # 没有同时出现水平+竖直组：重置离开去抖
+                    # 仍检测到在玻璃上：重置离开去抖
                     absence_streak = 0
 
                 # 超时强制退出：玻璃处于检测状态超过 pane_max_duration_s
@@ -1033,8 +1029,9 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             send_reports_batch_to_server(current_pane_reports, [r.get('annotated_image_buffer') for r in current_pane_ng_buffer], shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
 
             elif machine_state == "WAITING_FOR_PANE":
-                # 进入不去抖：一旦检测到“水平组缺失”，立刻进入检测状态
-                if horizontal_missing:
+                # 进入去抖：检测到“聚合 state_code>0”累计 ENTER_CONFIRM_FRAMES 帧进入
+                if presence_condition:
+                    presence_streak += 1
                     # 记录首次出现 state_code>0 的相机与其触发 ROI（只记录一次）
                     try:
                         if first_presence_cam_idx is None and int(result.get('state_code', 0) or 0) > 0:
@@ -1057,50 +1054,51 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             first_presence_roi_idx = int(trig_roi)
                     except Exception:
                         pass
-                    # 立即进入检测
-                    machine_state = "PANE_DETECTED"
-                    machine_state_shared.value = 1
-                    # 采集模式下：进入时统一递增 pane 序号并置为激活
-                    try:
-                        if getattr(shared_settings, 'data_collection_mode', False):
-                            try:
-                                cur_seq = int(getattr(shared_settings, 'collection_pane_seq', 0) or 0)
-                            except Exception:
-                                cur_seq = 0
-                            shared_settings.collection_pane_seq = cur_seq + 1
-                            shared_settings.collection_pane_active = True
-                            shared_settings.collection_day_dir = datetime.now().strftime('%Y%m%d')
-                            print(f"    [状态机]: 采集会话开启 -> pane{shared_settings.collection_pane_seq}")
-                    except Exception:
-                        pass
-                    current_pane_ng_buffer.clear()
-                    current_pane_reports.clear()
-                    current_pane_folder = None
-                    pane_ng_frame_counter = 0
-                    max_complexity_snapshot.fill(0)
-                    is_current_event_rejected = False
-                    rejection_details = {}
-                    saved_for_this_pane = False
-                    can_late_reject.value = False
-                    presence_streak = 0
-                    absence_streak = 0
-                    # 重置自动分路聚合状态
-                    auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
-                    pane_max_total_vertical_count = 0
-                    if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                    if presence_streak >= ENTER_CONFIRM_FRAMES:
+                        # 进入检测
+                        machine_state = "PANE_DETECTED"
+                        machine_state_shared.value = 1
+                        # 采集模式下：进入时统一递增 pane 序号并置为激活
                         try:
-                            alarm_light_controller.set_normal_state()
+                            if getattr(shared_settings, 'data_collection_mode', False):
+                                try:
+                                    cur_seq = int(getattr(shared_settings, 'collection_pane_seq', 0) or 0)
+                                except Exception:
+                                    cur_seq = 0
+                                shared_settings.collection_pane_seq = cur_seq + 1
+                                shared_settings.collection_pane_active = True
+                                shared_settings.collection_day_dir = datetime.now().strftime('%Y%m%d')
+                                print(f"    [状态机]: 采集会话开启 -> pane{shared_settings.collection_pane_seq}")
                         except Exception:
                             pass
-                    pane_enter_time_s = time.time()
-                    if first_presence_cam_idx is not None:
-                        print(f"--- [状态机]: 玻璃进入事件 (触发: 相机{first_presence_cam_idx + 1} ROI{first_presence_roi_idx}) ---")
-                    else:
-                        print("--- [状态机]: 玻璃进入事件 (触发: 未捕获) ---")
-                    # 新片开始：清空跨帧基线预注入
-                    _clear_preseed_for_all_cams()
+                        current_pane_ng_buffer.clear()
+                        current_pane_reports.clear()
+                        current_pane_folder = None
+                        pane_ng_frame_counter = 0
+                        max_complexity_snapshot.fill(0)
+                        is_current_event_rejected = False
+                        rejection_details = {}
+                        saved_for_this_pane = False
+                        can_late_reject.value = False
+                        presence_streak = 0
+                        absence_streak = 0
+                        # 重置自动分路聚合状态
+                        auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
+                        pane_max_total_vertical_count = 0
+                        if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                            try:
+                                alarm_light_controller.set_normal_state()
+                            except Exception:
+                                pass
+                        pane_enter_time_s = time.time()
+                        if first_presence_cam_idx is not None:
+                            print(f"--- [状态机]: 玻璃进入事件 (触发: 相机{first_presence_cam_idx + 1} ROI{first_presence_roi_idx}) ---")
+                        else:
+                            print("--- [状态机]: 玻璃进入事件 (触发: 未捕获) ---")
+                        # 新片开始：清空跨帧基线预注入
+                        _clear_preseed_for_all_cams()
                 else:
-                    # 水平组未缺失：保持等待
+                    # 未检测到在玻璃上：保持等待并重置去抖
                     presence_streak = 0
         except Exception as e:
             print(f"[状态机]: 处理结果时出错: {e}")
