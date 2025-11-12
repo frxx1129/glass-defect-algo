@@ -1134,104 +1134,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         except Exception:
             continue
 
-
-    # 新增：基于“最小外接矩形与玻璃边缘轮廓差”的缺角(Q)检测
-    def _detect_q_by_rect_diff(roi_gray_img, ppm, param_all):
-        try:
-            h, w = roi_gray_img.shape[:2]
-            # 使用与主流程一致的预处理（Canny）获取边缘
-            edges = preprocess_for_hough_enhanced(roi_gray_img, param_all)
-            # 适度膨胀，便于形成封闭轮廓
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            edges_dil = cv2.dilate(edges, kernel, iterations=1)
-            # 取外轮廓
-            contours, _ = cv2.findContours(edges_dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                return []
-            # 选择面积最大的轮廓，视作玻璃边缘所在的主体轮廓
-            main_cnt = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(main_cnt) < 1.0:
-                return []
-            # 面积阈值（mm^2）：对轮廓包围的最小面积做要求（默认 1600 mm^2）
-            try:
-                min_glass_area_mm2 = float(param_all.get('DEFECT_DETECTION', {}).get('GLASS_MIN_CONTOUR_AREA_MM2', 1600.0))
-            except Exception:
-                min_glass_area_mm2 = 1600.0
-            if ppm and ppm > 0:
-                main_area_mm2 = cv2.contourArea(main_cnt) / float(ppm * ppm)
-                if main_area_mm2 < min_glass_area_mm2:
-                    return []
-            # 最小外接矩形（允许倾斜）
-            rect = cv2.minAreaRect(main_cnt)
-            rect_box = cv2.boxPoints(rect).astype(np.int32)
-            # 生成掩膜：矩形掩膜与主体轮廓掩膜
-            mask_rect = np.zeros((h, w), dtype=np.uint8)
-            cv2.fillPoly(mask_rect, [rect_box], 255)
-            mask_cnt = np.zeros((h, w), dtype=np.uint8)
-            cv2.drawContours(mask_cnt, [main_cnt], -1, 255, thickness=-1)
-            # 差分：矩形中但不在主体轮廓内的区域，候选“缺角”区域
-            diff = cv2.subtract(mask_rect, mask_cnt)
-            # 形状修约：移除过细的“须状/细长”区域，得到更合理的块状形状
-            try:
-                p_def = param_all.get('DEFECT_DETECTION', {})
-                min_thick_px = _get_dist_px(p_def, 'Q_REGION_MIN_THICKNESS_MM', 'Q_REGION_MIN_THICKNESS', 1.5, ppm)
-                k = max(3, int(round(float(min_thick_px))))
-                if k % 2 == 0:
-                    k += 1  # 保证奇数核
-                kernel_smooth = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-                # 开运算：先腐蚀后膨胀，去掉比核更细的突出物
-                diff = cv2.morphologyEx(diff, cv2.MORPH_OPEN, kernel_smooth, iterations=1)
-                # 轻微闭运算：平滑边界并填补小凹陷
-                kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                diff = cv2.morphologyEx(diff, cv2.MORPH_CLOSE, kernel_close, iterations=1)
-            except Exception:
-                # 回退最小方案：小核开运算
-                diff = cv2.morphologyEx(diff, cv2.MORPH_OPEN, kernel, iterations=1)
-            # 连通域/轮廓分析
-            cand_cnts, _ = cv2.findContours(diff, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            results = []
-            for c in cand_cnts:
-                area_px = cv2.contourArea(c)
-                if area_px <= 1.0:
-                    continue
-                # 计算候选区域的最小外接矩形，得到长宽
-                r2 = cv2.minAreaRect(c)
-                (cx, cy), (rw, rh), ang = r2
-                # 换算尺寸到 mm
-                width_mm = (min(rw, rh) / float(ppm)) if ppm else 0.0
-                length_mm = (max(rw, rh) / float(ppm)) if ppm else 0.0
-                area_mm2 = (rw * rh) / float(ppm * ppm) if ppm else 0.0
-                # 过滤规则：块状且尺寸通过门槛（最短边>=5mm，面积>=25mm^2；可选最大边上限 Q_MAX_SIDE_MM）
-                try:
-                    p_def_local = param_all.get('DEFECT_DETECTION', {})
-                    q_cfg = float(p_def_local.get('Q_MAX_SIDE_MM', 0.0))
-                except Exception:
-                    q_cfg = 0.0
-                # 删除 50mm 硬性上限：若配置 Q_MAX_SIDE_MM>0 则按配置限制，否则不限制最大边
-                if q_cfg is not None and q_cfg > 0.0:
-                    max_side_ok = (length_mm <= q_cfg and width_mm <= q_cfg)
-                else:
-                    max_side_ok = True
-                if width_mm >= 5.0 and area_mm2 >= 25.0 and max_side_ok:
-                    box2 = cv2.boxPoints(r2).astype(np.int32)
-                    # 生成用于高亮的像素块轮廓（而不是画 minAreaRect）：简化原始连通域轮廓
-                    eps = max(2.0, 0.02 * float(cv2.arcLength(c, True)))
-                    approx = cv2.approxPolyDP(c, eps, True)
-                    if approx is None or len(approx) < 3:
-                        approx = c  # 退回原始轮廓
-                    results.append({
-                        'type': 'Q',
-                        'min_area_rect': r2,
-                        'box_points': box2,
-                        'region_contour': approx.astype(np.int32),
-                        'center': (int(round(cx)), int(round(cy))),
-                        'origin': 'rect_diff'
-                    })
-            return results
-        except Exception:
-            return []
-
-    # 方法一（矩形差分法）已停用：不再使用四边形与轮廓差来检测 Q
     rect_q_defects = []
 
     # 新逻辑A（保留）：利用已获得角部交点与两条主边，与玻璃轮廓求最近交点生成三角形缺角区域
@@ -1352,6 +1254,10 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 H_roi2, W_roi2 = roi_gray.shape[:2]
                 for (ii, jj, cp_arr) in paired_corners:
                     try:
+                        print(f"[Corner] 检测到角点: edges=({ii},{jj}), cp=({int(round(cp_arr[0]))},{int(round(cp_arr[1]))})")
+                    except Exception:
+                        pass
+                    try:
                         xi, yi = float(cp_arr[0]), float(cp_arr[1])
                         if 0 <= xi < W_roi2 and 0 <= yi < H_roi2:
                             corner_inters.append((ii, jj, np.array([xi, yi], dtype=float)))
@@ -1419,6 +1325,10 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     cnt_center = np.array([W_roi2/2.0, H_roi2/2.0], dtype=float)
 
                 for (idx_i, idx_j, cp) in corner_inters:
+                    try:
+                        print(f"[Q-TRY] 尝试缺角检测: edges=({idx_i},{idx_j}), corner=({int(round(cp[0]))},{int(round(cp[1]))})")
+                    except Exception:
+                        pass
                     # 直接使用该交点对应的两条主边
                     chosen = [(idx_i, edges_for_drawing[idx_i]), (idx_j, edges_for_drawing[idx_j])]
                     # 新增规则：若角点在玻璃主体轮廓上或距离轮廓<=6px，则跳过该角的Q检测，避免边缘轻微毛刺被误判为缺角
@@ -1454,7 +1364,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                 if n <= 1e-6:
                                     continue
                                 u0 = v / n
-                                hit2 = _ray_intersect_contour_thick(cp, u0, cnt_pts, t_min=1.0, stripe_half_px=2)
+                                # 加宽射线条带到 11px
+                                hit2 = _ray_intersect_contour_thick(cp, u0, cnt_pts, t_min=1.0, stripe_half_px=11)
                                 if hit2 is not None:
                                     tmp_cands.append((hit2, u0))
                             cands = tmp_cands
@@ -1476,9 +1387,113 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                             ray_hits_dbg.append({'seg': (tuple(map(int, cp)), (int(round(pt_sel[0])), int(round(pt_sel[1]))))})
                         else:
                             chosen_dirs.append(None)
+                    try:
+                        print(f"[Q-TRY] 命中统计: hits={len(inter_hits)}, any_dir_none={any(d is None for d in chosen_dirs)}")
+                    except Exception:
+                        pass
                     # 若双边均获得命中则走三角形法；否则尝试“单射线平移平行四边形”法
                     if len(inter_hits) != 2 or any(d is None for d in chosen_dirs):
-                        # 之前的单射线/平行四边形兜底已移除，这里直接跳过
+                        # 新方法：当竖直边方向的射线未命中而水平边命中时，
+                        # 使用理想竖直边从角点出发裁剪一段固定长度，结合水平命中点与角点构成三角形作为缺角候选。
+                        try:
+                            if len(inter_hits) == 1 and any(d is not None for d in chosen_dirs):
+                                hit_idx_local = 0 if (chosen_dirs[0] is not None) else 1
+                                miss_idx_local = 1 - hit_idx_local
+                                seg_hit = chosen[hit_idx_local][1]
+                                seg_miss = chosen[miss_idx_local][1]
+
+                                def _is_vertical_local(seg):
+                                    ang = _angle_to_x_axis_deg(seg)
+                                    return ang >= (90.0 - vertical_tol_deg)
+                                def _is_horizontal_local(seg):
+                                    ang = _angle_to_x_axis_deg(seg)
+                                    return ang <= float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', vertical_tol_deg))
+
+                                # 仅处理“未命中为竖直，命中为水平”的情况
+                                if not (_is_vertical_local(seg_miss) and _is_horizontal_local(seg_hit)):
+                                    raise RuntimeError('new-tri: pattern not matched (need vertical-miss & horizontal-hit)')
+
+                                # 命中点（水平射线）
+                                pt_hit, _ = inter_hits[0]
+                                pt_hit = np.array(pt_hit, dtype=float)
+
+                                # 基于 Canny 的“全 ROI 上/下”判断：以角点 cp 和竖直方向 v_dir 将 ROI 划分为两半，
+                                # 统计 Canny 边缘在 v_dir 正向(上)与负向(下)的数量，选择边缘更多一侧对应的竖直端点。
+                                vm_p1 = np.array(seg_miss[:2], dtype=float)
+                                vm_p2 = np.array(seg_miss[2:], dtype=float)
+                                v_vec = vm_p2 - vm_p1
+                                v_norm = float(np.linalg.norm(v_vec))
+                                v_dir = (v_vec / v_norm) if v_norm > 1e-6 else np.array([0.0, 1.0], dtype=float)
+                                edge_map_loc = edges_qc_dil if 'edges_qc_dil' in locals() else edges_qc
+                                v_clip = None
+                                if edge_map_loc is not None and edge_map_loc.size > 0:
+                                    ys, xs = np.nonzero(edge_map_loc)
+                                    if ys.size > 0:
+                                        dx = xs.astype(np.float32) - float(cp[0])
+                                        dy = ys.astype(np.float32) - float(cp[1])
+                                        dots = dx * float(v_dir[0]) + dy * float(v_dir[1])
+                                        c_up = int((dots > 0.0).sum())
+                                        c_dn = int((dots < 0.0).sum())
+                                        # 端点投影，用于确定哪端在"上"或"下"
+                                        t1 = float(np.dot(vm_p1 - cp, v_dir))
+                                        t2 = float(np.dot(vm_p2 - cp, v_dir))
+                                        v_up = vm_p1 if t1 >= t2 else vm_p2
+                                        v_dn = vm_p2 if v_up is vm_p1 else vm_p1
+                                        if c_up != c_dn:
+                                            v_clip = v_up if c_up > c_dn else v_dn
+                                        try:
+                                            print(f"[DIR] up_edges={c_up}, down_edges={c_dn}, choose={'up' if (c_up>c_dn) else ('down' if c_dn>c_up else 'tie')}")
+                                        except Exception:
+                                            pass
+                                if v_clip is None:
+                                    # 退回面积更大端点
+                                    def _tri_area(cp_pt, a, b):
+                                        tri = np.vstack([cp_pt, a, b]).astype(np.float32)
+                                        tri_cnt = tri.reshape((-1,1,2)).astype(np.int32)
+                                        return float(cv2.contourArea(tri_cnt))
+                                    area1 = _tri_area(cp, pt_hit, vm_p1)
+                                    area2 = _tri_area(cp, pt_hit, vm_p2)
+                                    v_clip = vm_p1 if area1 >= area2 else vm_p2
+
+                                # 构造三角形：cp, pt_hit(水平命中), v_clip(竖直裁剪)
+                                tri = np.vstack([cp, pt_hit, v_clip]).astype(np.float32)
+                                tri_cnt = tri.reshape((-1,1,2)).astype(np.int32)
+                                area_px = float(cv2.contourArea(tri_cnt))
+                                if area_px <= 1.0:
+                                    raise RuntimeError('new-tri: area too small')
+
+                                r3 = cv2.minAreaRect(tri_cnt)
+                                (cx3, cy3), (rw3, rh3), ang3 = r3
+                                width_mm3 = (min(rw3, rh3) / float(pixels_per_mm)) if pixels_per_mm else 0.0
+                                length_mm3 = (max(rw3, rh3) / float(pixels_per_mm)) if pixels_per_mm else 0.0
+                                area_mm2_3 = (rw3 * rh3) / float(pixels_per_mm * pixels_per_mm) if pixels_per_mm else 0.0
+                                try:
+                                    q_cfg3 = float(params.get('DEFECT_DETECTION', {}).get('Q_MAX_SIDE_MM', 0.0))
+                                except Exception:
+                                    q_cfg3 = 0.0
+                                if q_cfg3 is not None and q_cfg3 > 0.0:
+                                    max_side_ok3 = (length_mm3 <= q_cfg3 and width_mm3 <= q_cfg3)
+                                else:
+                                    max_side_ok3 = True
+                                if width_mm3 >= 5.0 and area_mm2_3 >= 25.0 and max_side_ok3:
+                                    box3 = cv2.boxPoints(r3).astype(np.int32)
+                                    corner_contour_q_defects.append({
+                                        'type': 'Q',
+                                        'origin': 'tri_vertical_clip',
+                                        'min_area_rect': r3,
+                                        'box_points': box3,
+                                        'region_contour': tri_cnt,
+                                        'center': (int(round(cx3)), int(round(cy3))),
+                                        'corner_point': tuple(map(int, cp)),
+                                        'intersections': [tuple(map(int, pt_hit))],
+                                        'ray_segments': [ {'seg': (tuple(map(int, cp)), (int(round(pt_hit[0])), int(round(pt_hit[1]))))} ]
+                                    })
+                                    try:
+                                        print(f"[Q-OK] tri_vertical_clip: corner=({int(round(cp[0]))},{int(round(cp[1]))}), area_px={area_px:.1f}")
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
                         continue
                     # 可选内收微调：将方向向双角平分方向内收 Q_RAY_INWARD_DEG（默认1.8°），仅用于可视化射线，命中点沿原命中点保持
                     try:
@@ -1557,6 +1572,10 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                             'intersections': [tuple(map(int, i1_pt)), tuple(map(int, i2_pt))],
                             'ray_segments': [rh['seg'] for rh in ray_hits_dbg]
                         })
+                        try:
+                            print(f"[Q-OK] corner_contour: corner=({int(round(cp[0]))},{int(round(cp[1]))}), area_px={tri_area_px:.1f}")
+                        except Exception:
+                            pass
                 # 去重：同一角点附近的 Q 仅保留一个（按中心距离阈值选三角像素面积较大者）
                 try:
                     if corner_contour_q_defects:
@@ -2509,7 +2528,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         if new_defect['type'] == 'Q':
             length_mm = location.get('length_mm', 0); width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm; aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
-            if area_mm2 < 2.25 or aspect_ratio > 3.6: continue
+            if area_mm2 < 2.25: continue
             if min(length_mm, width_mm) < 2.0: continue
             if length_mm < min_size_mm: continue
             
