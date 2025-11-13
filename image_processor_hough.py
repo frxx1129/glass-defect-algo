@@ -1335,6 +1335,43 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             def _is_vertical(seg):
                 ang = _angle_to_x_axis_deg_local(seg)
                 return ang >= (90.0 - vertical_tol_deg_local)
+            # 缺角交点对齐容差（px）用于处理 1px 边稍错位导致的未相交问题
+            try:
+                q_align_tol_px = int(params.get('DEFECT_DETECTION', {}).get('Q_CORNER_ALIGNMENT_TOL_PX', 3))
+            except Exception:
+                q_align_tol_px = 3
+
+            def _fuzzy_hv_intersection(hseg, vseg, tol_px: int):
+                """在严格直线求交失败时，为水平与竖直近似线段提供基于像素容差的交点补偿。
+                仅在 hseg 近水平且 vseg 近竖直时尝试，tol_px 默认 3。
+                返回 np.array([x,y]) 或 None。"""
+                try:
+                    hx1, hy1, hx2, hy2 = map(float, hseg)
+                    vx1, vy1, vx2, vy2 = map(float, vseg)
+                    # 快速角度判定（使用本地函数）
+                    if _angle_to_x_axis_deg_local(hseg) > 15.0:
+                        return None
+                    ang_v = _angle_to_x_axis_deg_local(vseg)
+                    if not (ang_v >= 75.0):  # 近竖直
+                        return None
+                    # 水平段 y 范围与竖直段 x 范围
+                    hy = (hy1 + hy2) / 2.0
+                    vx = (vx1 + vx2) / 2.0
+                    # 判定是否有“近似交点”：
+                    # 1) vx 位于水平段投影范围 x[min,max] 扩展±tol
+                    h_xmin = min(hx1, hx2) - tol_px
+                    h_xmax = max(hx1, hx2) + tol_px
+                    if not (h_xmin <= vx <= h_xmax):
+                        return None
+                    # 2) hy 位于竖直段投影范围 y[min,max] 扩展±tol
+                    v_ymin = min(vy1, vy2) - tol_px
+                    v_ymax = max(vy1, vy2) + tol_px
+                    if not (v_ymin <= hy <= v_ymax):
+                        return None
+                    # 生成“修正交点”并限制在 ROI 有效区域（调用处外层保证）
+                    return np.array([vx, hy], dtype=float)
+                except Exception:
+                    return None
             # 携带索引，便于按 cluster 过滤
             vertical_ideals = [(vi, seg.copy()) for vi, seg in enumerate(true_edges) if _is_vertical(seg)]
             if vertical_ideals:
@@ -1383,7 +1420,10 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         vx1, vy1, vx2, vy2 = map(float, vseg)
                         inter = find_line_intersection(seg, vseg)
                         if inter is None:
-                            continue
+                            # 回退：尝试模糊交点（处理 1px 边轻微错位）
+                            inter = _fuzzy_hv_intersection(seg, vseg, q_align_tol_px)
+                            if inter is None:
+                                continue
                         # 要求交点 y 在竖直边段范围内（±1px 缓冲）
                         vy_min = min(vy1, vy2) - 1.0; vy_max = max(vy1, vy2) + 1.0
                         if vy_min <= inter[1] <= vy_max:
@@ -1899,7 +1939,10 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                             continue
                         inter_pt = find_line_intersection(vseg, hseg)
                         if inter_pt is None:
-                            continue
+                            # 容差补偿：以水平线段在前调用模糊交点（内部进行角度判定）
+                            inter_pt = _fuzzy_hv_intersection(hseg, vseg, q_align_tol_px)
+                            if inter_pt is None:
+                                continue
                         xi, yi = float(inter_pt[0]), float(inter_pt[1])
                         if not (0.0 <= xi < float(Wc) and 0.0 <= yi < float(Hc)):
                             continue
@@ -3309,8 +3352,8 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         if new_defect['type'] == 'Q':
             length_mm = location.get('length_mm', 0); width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm; aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
-            # 新增：过滤长宽比过大的 Q（> 2.67）
-            if aspect_ratio > 2.67: continue
+            # 新增：过滤长宽比过大的 Q（> 4.0）
+            if aspect_ratio > 4.0: continue
             if area_mm2 < 2.25: continue
             if min(length_mm, width_mm) < 2.0: continue
             if length_mm < min_size_mm: continue
