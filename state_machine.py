@@ -333,10 +333,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         if max_defect_size > 0:
             size_label_parts.append(f"{int(round(max_defect_size))}mm")
         if has_edge_anomaly:
-            # 若存在新标签 'E' 则标注 'E'，否则保留 'X'
-            if any(d.get('type') == 'E' for d in defects):
-                size_label_parts.append('E')
-            else:
+            if any(d.get('type') == 'X' for d in defects):
                 size_label_parts.append('X')
         final_size_label = ','.join(size_label_parts) if size_label_parts else ''
         raw_cid = shared_collection_id.value

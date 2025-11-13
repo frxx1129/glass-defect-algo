@@ -1720,7 +1720,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 skew_line_defects = others_e + merged
         except Exception:
             pass
-    # 为 E 类型添加尺寸与 size_label，供后续输出
+    # 为 E 类型添加尺寸，供后续输出（size_label 不在算法侧生成）
     try:
         for ed in (skew_line_defects or []):
             if ed.get('type')!='E' or ed.get('box_points') is None:
@@ -1728,7 +1728,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             box = np.array(ed.get('box_points'), dtype=np.int32)
             x,y,w,h = cv2.boundingRect(box)
             ed['length_px'] = float(max(w,h)); ed['width_px'] = float(min(w,h))
-            ed['size_label'] = f"{int(round(max(w,h)))}x{int(round(min(w,h)))}"
     except Exception:
         pass
 
@@ -3144,8 +3143,6 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             if pixels_per_mm and pixels_per_mm > 0 and (length_px > 0 or width_px > 0):
                                 location['length_mm'] = float(round(length_px / pixels_per_mm, 2))
                                 location['width_mm']  = float(round(width_px  / pixels_per_mm, 2))
-                            # size_label（像素）
-                            location['size_label'] = defect.get('size_label', f"{int(round(length_px))}x{int(round(width_px))}")
                         except Exception:
                             pass
                 else:
