@@ -3159,6 +3159,8 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 location['y'] = int(center[1] + y)
                 location['angle'] = float(round(defect.get('angle', 0.0), 2))
                 # X 型不输出尺寸/size_label（仅角度）
+
+            # 按需求：取消对 E 类型的 ROI 级过滤（不在此处基于主边/距离/尺寸过滤）
         else:
             length_px, width_px = 0.0, 0.0
             if defect['type'] == 'Q':
@@ -3907,7 +3909,16 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
         slim_report = {k: roi_report.get(k) for k in ("roi_idx","x","y","w","h","edges_found","near_vertical_line_count")}
         report['rois'].append(slim_report)
 
-    report["state_code"] = 1 if max_edges_found > 0 else 0
+    # 进入判定加强：默认要求至少出现一条近竖直主边，避免由非竖直噪声触发进入
+    try:
+        presence_require_vertical = bool(hough_params.get('DEFECT_DETECTION', {}).get('PRESENCE_REQUIRE_VERTICAL', True))
+    except Exception:
+        presence_require_vertical = True
+    try:
+        near_vertical_total = int(sum(int(r.get('near_vertical_line_count', 0) or 0) for r in report.get('rois', [])))
+    except Exception:
+        near_vertical_total = 0
+    report["state_code"] = 1 if (max_edges_found > 0 and ((near_vertical_total > 0) if presence_require_vertical else True)) else 0
     # 将共享竖直边作为输出的一部分，便于上层做跨帧基线稳定判定/复用
     try:
         report['shared_vertical_edges'] = [list(map(float, s)) for s in (shared_vertical_global or [])]
