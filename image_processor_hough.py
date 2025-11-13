@@ -2332,6 +2332,121 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     # 仅使用角点 + 轮廓三角法作为缺角(Q)检测结果
     rect_q_defects = corner_contour_q_defects
 
+    # 新增：对 Q 缺陷进行“平行四边形 + 边缘点集群”验证过滤
+    try:
+        def _parallelogram_from_triangle(tri_pts: np.ndarray):
+            # tri_pts: (3,2) float32 in ROI coords
+            A, B, C = tri_pts[0].astype(float), tri_pts[1].astype(float), tri_pts[2].astype(float)
+            # 找到最长边与第三点
+            dAB = float(np.linalg.norm(A - B))
+            dBC = float(np.linalg.norm(B - C))
+            dCA = float(np.linalg.norm(C - A))
+            if dAB >= dBC and dAB >= dCA:
+                P, Q, R = A, B, C
+            elif dBC >= dAB and dBC >= dCA:
+                P, Q, R = B, C, A
+            else:
+                P, Q, R = C, A, B
+            M = (P + Q) / 2.0
+            D = (2.0 * M) - R  # 关于对角线中点的对称点
+            pts = np.vstack([P, Q, R, D]).astype(np.float32)
+            # 以质心排序，确保顶点顺序形成简单多边形
+            cen = np.mean(pts, axis=0)
+            ang = np.arctan2(pts[:,1] - cen[1], pts[:,0] - cen[0])
+            order = np.argsort(ang)
+            return pts[order]
+
+        def _q_parallelogram_cluster_ok(q_def: dict, edges_img: np.ndarray) -> bool:
+            # 从 q_def['region_contour'] 还原三角形顶点
+            tri_cnt = q_def.get('region_contour', None)
+            if tri_cnt is None or not isinstance(tri_cnt, np.ndarray) or tri_cnt.size < 6:
+                return True  # 无法验证则放行
+            tri_pts = tri_cnt.reshape(-1,2).astype(np.float32)
+            if tri_pts.shape[0] != 3:
+                return True
+            H, W = edges_img.shape[:2]
+            pg = _parallelogram_from_triangle(tri_pts)
+            # 构造内区掩码（排除边界，使用腐蚀1px）
+            mask = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(mask, [pg.astype(np.int32)], 255)
+            kernel = np.ones((3,3), dtype=np.uint8)
+            inner = cv2.erode(mask, kernel, iterations=1)
+            # 取内区的边缘点
+            cand = cv2.bitwise_and(edges_img, edges_img, mask=inner)
+            # 可选形态学连接（轻度）
+            try:
+                use_dilate = bool(params.get('DEFECT_DETECTION', {}).get('Q_PARALLELOGRAM_USE_DILATE', True))
+            except Exception:
+                use_dilate = True
+            if use_dilate:
+                cand = cv2.dilate(cand, kernel, iterations=1)
+            # 连通域分析
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats((cand>0).astype(np.uint8), connectivity=8)
+            if num_labels <= 1:
+                return False
+            # 阈值
+            try:
+                min_pixels = int(params.get('DEFECT_DETECTION', {}).get('Q_PARALLELOGRAM_MIN_EDGE_PIXELS', 25))
+            except Exception:
+                min_pixels = 25
+            # 沿对角线的投影跨度要求
+            P, Q = None, None
+            # 取与三角形最长边一致的对角线方向
+            A, B, C = tri_pts[0], tri_pts[1], tri_pts[2]
+            dAB = float(np.linalg.norm(A - B))
+            dBC = float(np.linalg.norm(B - C))
+            dCA = float(np.linalg.norm(C - A))
+            if dAB >= dBC and dAB >= dCA:
+                P, Q = A, B
+            elif dBC >= dAB and dBC >= dCA:
+                P, Q = B, C
+            else:
+                P, Q = C, A
+            diag_vec = (Q - P).astype(float)
+            diag_len = float(np.linalg.norm(diag_vec))
+            if diag_len <= 1.0:
+                return False
+            u = diag_vec / diag_len
+            try:
+                span_frac = float(params.get('DEFECT_DETECTION', {}).get('Q_PARALLELOGRAM_MIN_SPAN_FRAC', 0.25))
+            except Exception:
+                span_frac = 0.25
+            need_span = float(span_frac * diag_len)
+            # 遍历每个连通域，检查像素数与跨度
+            for lbl in range(1, num_labels):
+                cnt = int(stats[lbl, cv2.CC_STAT_AREA])
+                if cnt < min_pixels:
+                    continue
+                ys, xs = np.where(labels == lbl)
+                if xs.size == 0:
+                    continue
+                pts = np.vstack([xs.astype(float), ys.astype(float)]).T
+                proj = np.dot(pts - P.reshape(1,2), u.reshape(2,))
+                span = float(np.max(proj) - np.min(proj))
+                if span >= need_span:
+                    return True
+            return False
+
+        # 准备边缘图
+        edges_pf = preprocess_for_hough_enhanced(roi_gray, params)
+        filtered = []
+        for nd in (rect_q_defects or []):
+            try:
+                if nd.get('type') != 'Q':
+                    filtered.append(nd)
+                    continue
+                if _q_parallelogram_cluster_ok(nd, edges_pf):
+                    filtered.append(nd)
+                else:
+                    # 过滤该 Q
+                    pass
+            except Exception:
+                filtered.append(nd)
+        rect_q_defects = filtered
+    except Exception:
+        # 任意错误不影响主流程，保守放行
+        pass
+
     def sort_key_func(pair_indices):
         i, j = pair_indices
         line1, line2 = true_edges[i], true_edges[j]
