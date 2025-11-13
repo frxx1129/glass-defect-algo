@@ -3307,9 +3307,12 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         if new_defect['type'] == 'Q':
             length_mm = location.get('length_mm', 0); width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm; aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
+            # 新增：过滤长宽比过大的 Q（>7.0）
+            if aspect_ratio > 7.0: continue
             if area_mm2 < 2.25: continue
             if min(length_mm, width_mm) < 2.0: continue
             if length_mm < min_size_mm: continue
+            if length_mm >300.0 or width_mm >300.0: continue
             
         elif new_defect['type'] in ['B']:
             if location.get('length_mm', 0) < min_size_mm:
