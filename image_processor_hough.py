@@ -2386,9 +2386,9 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 return False
             # 阈值
             try:
-                min_pixels = int(params.get('DEFECT_DETECTION', {}).get('Q_PARALLELOGRAM_MIN_EDGE_PIXELS', 25))
+                min_pixels = int(params.get('DEFECT_DETECTION', {}).get('Q_PARALLELOGRAM_MIN_EDGE_PIXELS', 50))
             except Exception:
-                min_pixels = 25
+                min_pixels = 50
             # 沿对角线的投影跨度要求
             P, Q = None, None
             # 取与三角形最长边一致的对角线方向
