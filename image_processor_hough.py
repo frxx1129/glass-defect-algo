@@ -3475,40 +3475,40 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     # 绘制主边直线、角点（移除调试打印）
     annotations_to_draw = []
-    try:
+    #try:
         # 绘制主边（使用 edges_for_drawing，已包含延长/截断）
-        for i, seg in enumerate(edges_for_drawing or []):
-            x1,y1,x2,y2 = map(float, seg)
-            dx, dy = (x2-x1), (y2-y1)
-            ang = abs(np.degrees(np.arctan2(dy, dx)))
-            if ang > 90.0: ang = 180.0 - ang
-            length_px = float(np.hypot(dx, dy))
-            length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
-            # 颜色：近竖直=绿色，近水平=蓝色，其余=灰白
-            color = (200,200,200)
-            if ang >= 80.0:
-                color = (0,255,0)
-            elif ang <= 10.0:
-                color = (255,0,0)
-            cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
+        #for i, seg in enumerate(edges_for_drawing or []):
+        #    x1,y1,x2,y2 = map(float, seg)
+        #    dx, dy = (x2-x1), (y2-y1)
+        #    ang = abs(np.degrees(np.arctan2(dy, dx)))
+        #    if ang > 90.0: ang = 180.0 - ang
+        #    length_px = float(np.hypot(dx, dy))
+        #    length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
+        #    # 颜色：近竖直=绿色，近水平=蓝色，其余=灰白
+        #    color = (200,200,200)
+        #    if ang >= 80.0:
+        #        color = (0,255,0)
+        #    elif ang <= 10.0:
+        #        color = (255,0,0)
+        #    cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
             # 在中点标注线段索引
-            mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
-            try:
-                cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-            except Exception:
-                pass
+            #mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
+            #try:
+            #    cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+            #except Exception:
+            #    pass
         # 绘制角点（使用 paired_corners；不依赖是否生成 X/Q 缺陷）
-        for (ii, jj, cp_arr) in (paired_corners or []):
-            try:
-                cx, cy = float(cp_arr[0]), float(cp_arr[1])
-                cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
-                cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
-            except Exception:
-                continue
+        #for (ii, jj, cp_arr) in (paired_corners or []):
+        #    try:
+        #        cx, cy = float(cp_arr[0]), float(cp_arr[1])
+        #        cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
+        #        cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
+        #    except Exception:
+        #        continue
 
         # 已移除演示射线，仅保留真实命中射线在缺陷绘制阶段显示
-    except Exception:
-        pass
+    #except Exception:
+    #    pass
     
     for defect_report in final_defects_for_report:
         defect = defect_report['raw_defect']
@@ -3519,22 +3519,22 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         type_str = defect_type_map.get(defect_report['type'], '未知')
 
         # 仅绘制真实命中射线（Q 缺陷且 defect 中包含 ray_segments）
-        try:
-            if defect_report['type'] == 'Q' and isinstance(defect.get('ray_segments'), (list, tuple)):
-                for seg_entry in defect.get('ray_segments'):
-                    try:
-                        if isinstance(seg_entry, dict) and 'seg' in seg_entry:
-                            p0, p1 = seg_entry['seg']
-                        else:
-                            p0, p1 = seg_entry
-                        x0,y0 = int(p0[0]), int(p0[1])
-                        x1,y1 = int(p1[0]), int(p1[1])
-                        cv2.arrowedLine(roi_color, (x0,y0), (x1,y1), (0,255,255), 1, tipLength=0.25)
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
+        #try:
+        #    if defect_report['type'] == 'Q' and isinstance(defect.get('ray_segments'), (list, tuple)):
+        #        for seg_entry in defect.get('ray_segments'):
+        #            try:
+        #                if isinstance(seg_entry, dict) and 'seg' in seg_entry:
+        #                    p0, p1 = seg_entry['seg']
+        #                else:
+        #                    p0, p1 = seg_entry
+        #                x0,y0 = int(p0[0]), int(p0[1])
+        #                x1,y1 = int(p1[0]), int(p1[1])
+        #                cv2.arrowedLine(roi_color, (x0,y0), (x1,y1), (0,255,255), 1, tipLength=0.25)
+        #            except Exception:
+        #                continue
+        #except Exception:
+        #    pass
+#
         if defect_report['type'] in ('E', 'X'):
             # 区分 E 与 X 的标注：均显示角度；E 还需显示长宽；X 为“混合型”也显示长宽
             if loc.get('subtype') == 'curved' or (defect.get('skew_subtype', '') == 'curved'):
