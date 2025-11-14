@@ -580,7 +580,59 @@ def preprocess_for_hough_enhanced(roi_gray, params):
     blurred = cv2.medianBlur(roi_gray, p["MEDIAN_BLUR_KSIZE"])
     clahe = cv2.createCLAHE(clipLimit=p["CLAHE_CLIP_LIMIT"], tileGridSize=grid_size)
     enhanced_contrast = clahe.apply(blurred)
-    return cv2.Canny(enhanced_contrast, p["CANNY_THRESHOLD_LOW"], p["CANNY_THRESHOLD_HIGH"])
+    edges = cv2.Canny(enhanced_contrast, p["CANNY_THRESHOLD_LOW"], p["CANNY_THRESHOLD_HIGH"])
+    return denoise_edge_map(edges, params)
+
+def denoise_edge_map(edge_img: np.ndarray, params) -> np.ndarray:
+    """快速对 Canny 边缘图进行降噪：移除孤立像素与极小簇，减少离群点对后续检测干扰。
+    可配置 DEFECT_DETECTION 下参数：
+      CANNY_DENOISE_ENABLE (bool, 默认 True)
+      CANNY_DENOISE_MIN_NEIGHBORS (含自身的3x3邻域最少白点数, 默认 2)
+      CANNY_DENOISE_MIN_CLUSTER_PIXELS (连通域像素下限, 默认 5)
+      CANNY_DENOISE_MAX_ITER (最大迭代次数, 默认 1)
+    过程：
+      1) 3x3 邻域计数过滤孤立或过稀疏的点。
+      2) 连通域分析剔除过小簇。
+      3) 可迭代一次（避免频繁重计算）。
+    保持速度：全部操作在二值图上，卷积与 connectedComponentsO(像素数)。"""
+    try:
+        pdef = params.get('DEFECT_DETECTION', {})
+        if not bool(pdef.get('CANNY_DENOISE_ENABLE', True)):
+            return edge_img
+        min_neighbors = int(pdef.get('CANNY_DENOISE_MIN_NEIGHBORS', 2))  # 3x3包含自身的白点数阈值
+        min_cluster = int(pdef.get('CANNY_DENOISE_MIN_CLUSTER_PIXELS', 15))
+        max_iter = int(pdef.get('CANNY_DENOISE_MAX_ITER', 1))
+    except Exception:
+        return edge_img
+
+    if edge_img is None or edge_img.size == 0:
+        return edge_img
+    # 转为二值（0/1）
+    bin_img = (edge_img > 0).astype(np.uint8)
+    H, W = bin_img.shape[:2]
+    if H*W <= 0:
+        return edge_img
+    kernel3 = np.ones((3,3), dtype=np.uint8)
+    work = bin_img.copy()
+    for _ in range(max(1, max_iter)):
+        # 邻域计数：保留计数>min_neighbors的点
+        neigh_counts = cv2.filter2D(work, -1, kernel3, borderType=cv2.BORDER_CONSTANT)
+        work = ((neigh_counts > min_neighbors) & (work > 0)).astype(np.uint8)
+        # 连通域剔除小簇
+        try:
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(work, connectivity=8)
+            if num_labels > 1:
+                mask_keep = np.zeros_like(work)
+                for lbl in range(1, num_labels):
+                    area = int(stats[lbl, cv2.CC_STAT_AREA])
+                    if area >= min_cluster:
+                        mask_keep[labels == lbl] = 1
+                work = mask_keep
+        except Exception:
+            pass
+    # 恢复到 0/255 形式
+    out = (work * 255).astype(np.uint8)
+    return out
 
 def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img=None):
     if lines is None or len(lines) < 1: return []
@@ -4067,16 +4119,8 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
         slim_report = {k: roi_report.get(k) for k in ("roi_idx","x","y","w","h","edges_found","near_vertical_line_count")}
         report['rois'].append(slim_report)
 
-    # 进入判定加强：默认要求至少出现一条近竖直主边，避免由非竖直噪声触发进入
-    try:
-        presence_require_vertical = bool(hough_params.get('DEFECT_DETECTION', {}).get('PRESENCE_REQUIRE_VERTICAL', True))
-    except Exception:
-        presence_require_vertical = True
-    try:
-        near_vertical_total = int(sum(int(r.get('near_vertical_line_count', 0) or 0) for r in report.get('rois', [])))
-    except Exception:
-        near_vertical_total = 0
-    report["state_code"] = 1 if (max_edges_found > 0 and ((near_vertical_total > 0) if presence_require_vertical else True)) else 0
+    # 取消针对 E 类型的帧级竖直主边进入判定：恢复为仅依据是否有主边
+    report["state_code"] = 1 if max_edges_found > 0 else 0
     # 将共享竖直边作为输出的一部分，便于上层做跨帧基线稳定判定/复用
     try:
         report['shared_vertical_edges'] = [list(map(float, s)) for s in (shared_vertical_global or [])]
