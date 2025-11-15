@@ -1712,18 +1712,55 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     try:
                         mask = np.zeros(roi_gray.shape, dtype=np.uint8)
                         cv2.fillPoly(mask, [band_poly], 255)
+                        # 条带内边缘
                         band_edges = cv2.bitwise_and(binary_edges, mask)
-                        # 提取条带内白点集合
-                        ys, xs = np.where(band_edges > 0)
-                        if xs.size >= 10:
-                            pts = np.vstack([xs, ys]).T.astype(np.float32)
-                            # 可选：凸包再取 minAreaRect，避免噪点外逸
-                            hull = cv2.convexHull(pts)
-                            if isinstance(hull, np.ndarray) and hull.shape[0] >= 3:
-                                min_rect = cv2.minAreaRect(hull)
-                            else:
-                                min_rect = cv2.minAreaRect(pts)
-                            box_pts = cv2.boxPoints(min_rect).astype(np.int32)
+                        # 1) 条带内膨胀，尽量闭合
+                        try:
+                            k_band = int(params.get('DEFECT_DETECTION', {}).get('E_BAND_DILATE_KSIZE', 3))
+                        except Exception:
+                            k_band = 3
+                        k_band = max(1, k_band | 1)  # 确保奇数
+                        try:
+                            it_band = int(params.get('DEFECT_DETECTION', {}).get('E_BAND_DILATE_ITERS', 1))
+                        except Exception:
+                            it_band = 1
+                        kernel_band = np.ones((k_band, k_band), dtype=np.uint8)
+                        band_dil = cv2.dilate(band_edges, kernel_band, iterations=max(1, it_band))
+                        # 2) 连接条带外部：对全局边缘轻度膨胀，找与 band_dil 连通的整块
+                        try:
+                            k_conn = int(params.get('DEFECT_DETECTION', {}).get('E_CONNECT_DILATE_KSIZE', 3))
+                        except Exception:
+                            k_conn = 3
+                        k_conn = max(1, k_conn | 1)
+                        try:
+                            it_conn = int(params.get('DEFECT_DETECTION', {}).get('E_CONNECT_DILATE_ITERS', 1))
+                        except Exception:
+                            it_conn = 1
+                        kernel_conn = np.ones((k_conn, k_conn), dtype=np.uint8)
+                        global_conn = cv2.dilate(binary_edges, kernel_conn, iterations=max(1, it_conn))
+                        # 连通域标签
+                        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((global_conn > 0).astype(np.uint8), connectivity=8)
+                        if num_labels > 1:
+                            # 找与 band_dil 有重叠的标签集合（去除背景0）
+                            overlap_labels = np.unique(labels[(band_dil > 0)])
+                            overlap_labels = overlap_labels[overlap_labels != 0]
+                            union_mask = (band_dil > 0).astype(np.uint8)
+                            for lbl in overlap_labels:
+                                union_mask |= (labels == int(lbl)).astype(np.uint8)
+                        else:
+                            union_mask = (band_dil > 0).astype(np.uint8)
+                        # 生成区域轮廓并取凸包→最小外接矩形
+                        if int(cv2.countNonZero(union_mask)) >= 10:
+                            contours, _ = cv2.findContours((union_mask * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            if contours:
+                                biggest = max(contours, key=cv2.contourArea)
+                                hull = cv2.convexHull(biggest)
+                                if isinstance(hull, np.ndarray) and hull.shape[0] >= 3:
+                                    min_rect = cv2.minAreaRect(hull)
+                                    box_pts = cv2.boxPoints(min_rect).astype(np.int32)
+                                else:
+                                    min_rect = None; box_pts = None
+                        # 无法构建则回退
                     except Exception:
                         min_rect = None; box_pts = None
                 # 回退：若 Canny 未覆盖，使用原有细窄外接框
@@ -3688,37 +3725,37 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     # 绘制主边直线、角点（移除调试打印）
     annotations_to_draw = []
     #try:
-        # 绘制主边（使用 edges_for_drawing，已包含延长/截断）
-        #for i, seg in enumerate(edges_for_drawing or []):
-        #    x1,y1,x2,y2 = map(float, seg)
-        #    dx, dy = (x2-x1), (y2-y1)
-        #    ang = abs(np.degrees(np.arctan2(dy, dx)))
-        #    if ang > 90.0: ang = 180.0 - ang
-        #    length_px = float(np.hypot(dx, dy))
-        #    length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
-        #    # 颜色：近竖直=绿色，近水平=蓝色，其余=灰白
-        #    color = (200,200,200)
-        #    if ang >= 80.0:
-        #        color = (0,255,0)
-        #    elif ang <= 10.0:
-        #        color = (255,0,0)
-        #    cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
-            # 在中点标注线段索引
-            #mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
-            #try:
-            #    cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-            #except Exception:
-            #    pass
-        # 绘制角点（使用 paired_corners；不依赖是否生成 X/Q 缺陷）
-        #for (ii, jj, cp_arr) in (paired_corners or []):
-        #    try:
-        #        cx, cy = float(cp_arr[0]), float(cp_arr[1])
-        #        cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
-        #        cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
-        #    except Exception:
-        #        continue
-
-        # 已移除演示射线，仅保留真实命中射线在缺陷绘制阶段显示
+    #    #绘制主边（使用 edges_for_drawing，已包含延长/截断）
+    #    for i, seg in enumerate(edges_for_drawing or []):
+    #        x1,y1,x2,y2 = map(float, seg)
+    #        dx, dy = (x2-x1), (y2-y1)
+    #        ang = abs(np.degrees(np.arctan2(dy, dx)))
+    #        if ang > 90.0: ang = 180.0 - ang
+    #        length_px = float(np.hypot(dx, dy))
+    #        length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
+    #        # 颜色：近竖直=绿色，近水平=蓝色，其余=灰白
+    #        color = (200,200,200)
+    #        if ang >= 80.0:
+    #            color = (0,255,0)
+    #        elif ang <= 10.0:
+    #            color = (255,0,0)
+    #        cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
+    #        #在中点标注线段索引
+    #        mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
+    #        try:
+    #            cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    #        except Exception:
+    #            pass
+    #    # 绘制角点（使用 paired_corners；不依赖是否生成 X/Q 缺陷）
+    #    #for (ii, jj, cp_arr) in (paired_corners or []):
+    #    #    try:
+    #    #        cx, cy = float(cp_arr[0]), float(cp_arr[1])
+    #    #        cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
+    #    #        cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
+    #    #    except Exception:
+    #    #        continue
+#
+    #    # 已移除演示射线，仅保留真实命中射线在缺陷绘制阶段显示
     #except Exception:
     #    pass
     
