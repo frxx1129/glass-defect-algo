@@ -4014,11 +4014,7 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
         cross_enabled = True
 
     shared_vertical_global = []
-    # 允许外部预注入的共享竖直边（跨帧基线复用）
-    try:
-        preseed_shared = hough_params.get('PRESEEDED_CROSS_ROI_SHARED_VERTICAL_GLOBAL_EDGES', []) or []
-    except Exception:
-        preseed_shared = []
+    # 移除跨帧预注入的共享竖直边（不再支持跨帧基线复用）
     if cross_enabled and template_rois:
         # 角度容忍与最短长度
         try:
@@ -4127,35 +4123,7 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
                 if y_max - y_min >= 1.0:
                     shared_vertical_global.append([x_mean, y_min, x_mean, y_max])
 
-        # 与外部预注入的共享竖直边合并（按 x 接近去重）
-        try:
-            if preseed_shared:
-                def _x_mid(seg):
-                    try:
-                        return 0.5 * (float(seg[0]) + float(seg[2]))
-                    except Exception:
-                        return float('inf')
-                merged = list(shared_vertical_global)
-                for p in preseed_shared:
-                    px = _x_mid(p)
-                    if not np.isfinite(px):
-                        continue
-                    found_close = False
-                    for s in merged:
-                        sx = _x_mid(s)
-                        if abs(px - sx) <= cluster_x_px:
-                            found_close = True
-                            break
-                    if not found_close:
-                        # 直接追加预注入基线
-                        try:
-                            x1,y1,x2,y2 = map(float, p)
-                            merged.append([x1,y1,x2,y2])
-                        except Exception:
-                            continue
-                shared_vertical_global = merged
-        except Exception:
-            pass
+        # 不再与外部预注入的共享竖直边合并（删除跨帧逻辑）
 
     # 将共享竖直边放入参数供 ROI 线程读取
     try:
@@ -4191,10 +4159,6 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
 
     # 取消针对 E 类型的帧级竖直主边进入判定：恢复为仅依据是否有主边
     report["state_code"] = 1 if max_edges_found > 0 else 0
-    # 将共享竖直边作为输出的一部分，便于上层做跨帧基线稳定判定/复用
-    try:
-        report['shared_vertical_edges'] = [list(map(float, s)) for s in (shared_vertical_global or [])]
-    except Exception:
-        report['shared_vertical_edges'] = []
+    # 移除跨帧输出：不再在报告中携带共享竖直边
     
     return report, final_image

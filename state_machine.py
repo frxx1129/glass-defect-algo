@@ -186,10 +186,19 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             return None
     
     def get_defect_size(defect):
-        defect_type = defect.get('type')
-        if defect_type in ['B', 'L']:
-            rect = defect.get('location', {})
-            return max(rect.get('length_mm', 0), rect.get('width_mm', 0))
+        """用于挑选代表帧：按缺陷的尺寸（最短边或已提供的长/短边）估算大小。
+        将 E/Q/B/L 一并纳入（E 与 Q 与 B/L 一样，依据 location 中的 mm 尺寸）。"""
+        try:
+            defect_type = str(defect.get('type', '')).upper()
+            if defect_type in ['B', 'L', 'E', 'Q']:
+                loc = defect.get('location', {}) if isinstance(defect.get('location'), dict) else {}
+                length = float(loc.get('length_mm', 0) or 0)
+                width  = float(loc.get('width_mm', 0) or 0)
+                # 代表帧挑选上，倾向用较大的度量；若两者皆有，取 max
+                if length > 0 or width > 0:
+                    return max(length, width)
+        except Exception:
+            pass
         return 0
     
     def find_best_ng_result(ng_buffer):
@@ -327,14 +336,12 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             return min(length, width)
         # 汇总：取所有缺陷“最短边”的最大值，作为 size_label 的数值
         max_defect_size = max([primary_size(d) for d in defects] or [0])
-        # 支持新标签 'E'（边缘异常）；兼容历史 'X'
-        has_edge_anomaly = any(d.get('type') in ('E', 'X') for d in defects)
+        # 仅在存在 X 型时追加 'X' 标签；E 不追加字母，仅以尺寸参与 size_label
         size_label_parts = []
         if max_defect_size > 0:
             size_label_parts.append(f"{int(round(max_defect_size))}mm")
-        if has_edge_anomaly:
-            if any(d.get('type') == 'X' for d in defects):
-                size_label_parts.append('X')
+        if any(d.get('type') == 'X' for d in defects):
+            size_label_parts.append('X')
         final_size_label = ','.join(size_label_parts) if size_label_parts else ''
         raw_cid = shared_collection_id.value
         try:
