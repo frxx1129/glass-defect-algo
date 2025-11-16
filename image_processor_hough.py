@@ -1756,9 +1756,9 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                             except Exception:
                                 h_tol_deg_local = 10.0
                             try:
-                                stripe_w_px = int(params.get('DEFECT_DETECTION', {}).get('E_HORIZONTAL_MASK_STRIPE_PX', 7))
+                                stripe_w_px = int(params.get('DEFECT_DETECTION', {}).get('E_HORIZONTAL_MASK_STRIPE_PX', 5))
                             except Exception:
-                                stripe_w_px = 7
+                                stripe_w_px = 5
                             stripe_half = max(1.0, float(stripe_w_px) / 2.0)
                             hmask = np.zeros_like(union_mask, dtype=np.uint8)
                             for he in (true_edges or []):
