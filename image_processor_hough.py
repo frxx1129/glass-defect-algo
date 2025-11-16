@@ -1749,6 +1749,39 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                 union_mask |= (labels == int(lbl)).astype(np.uint8)
                         else:
                             union_mask = (band_dil > 0).astype(np.uint8)
+                        # 若 ROI 存在水平边，则先构造水平带状屏蔽掩码，并从联合掩码中剔除
+                        try:
+                            try:
+                                h_tol_deg_local = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', 10.0))
+                            except Exception:
+                                h_tol_deg_local = 10.0
+                            try:
+                                stripe_w_px = int(params.get('DEFECT_DETECTION', {}).get('E_HORIZONTAL_MASK_STRIPE_PX', 7))
+                            except Exception:
+                                stripe_w_px = 7
+                            stripe_half = max(1.0, float(stripe_w_px) / 2.0)
+                            hmask = np.zeros_like(union_mask, dtype=np.uint8)
+                            for he in (true_edges or []):
+                                ang_h = _angle_to_x_axis_deg(he)
+                                if ang_h <= h_tol_deg_local:
+                                    hp1 = np.array(he[:2], dtype=float); hp2 = np.array(he[2:], dtype=float)
+                                    hv = hp2 - hp1
+                                    hL = float(np.linalg.norm(hv))
+                                    if hL <= 1e-6:
+                                        continue
+                                    hu = hv / hL
+                                    hn = np.array([-hu[1], hu[0]], dtype=float)
+                                    hq1 = hp1 + hn * stripe_half
+                                    hq2 = hp2 + hn * stripe_half
+                                    hq3 = hp2 - hn * stripe_half
+                                    hq4 = hp1 - hn * stripe_half
+                                    hpoly = np.array([hq1, hq2, hq3, hq4], dtype=np.int32).reshape((-1,1,2))
+                                    cv2.fillPoly(hmask, [hpoly], 1)
+                            if int(np.sum(hmask)) > 0:
+                                union_mask = (union_mask & (1 - hmask)).astype(np.uint8)
+                        except Exception:
+                            pass
+
                         # 生成区域轮廓并取凸包→最小外接矩形
                         if int(cv2.countNonZero(union_mask)) >= 10:
                             contours, _ = cv2.findContours((union_mask * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
