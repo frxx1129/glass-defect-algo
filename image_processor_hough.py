@@ -42,6 +42,105 @@ def _get_font(font_size=36):
 ANNOTATION_FONT = _get_font(font_size=32)
 import math
 
+# ====================================================================================
+# --- 水平延长“栅栏”历史缓存 (基于前若干帧竖直边位置) ---
+# ====================================================================================
+# 目标: 当当前帧缺失某块玻璃的竖直主边时, 避免水平主边过度延长并跨到另一块玻璃的竖直边形成伪角。
+# 策略:
+#   1. 前 N(默认10) 帧内, 记录每个 ROI 内所有近竖直主边的 x 中点位置。
+#   2. 在达到 N 帧时, 对累计的 x 位置进行简单聚类(阈值像素内归并)形成稳定“栅栏”集合, 每个栅栏代表一条可能的竖直分界线。
+#   3. 后续水平延长时, 若尝试延长方向存在栅栏, 则限制延长不跨越该栅栏(保留少量 margin)。
+# 变量:
+#   _roi_vertical_history[(roi_w, roi_h)] -> list[list[x_positions]]
+#   _roi_frame_count[(roi_w, roi_h)] -> int 已记录帧数
+#   _roi_fences[(roi_w, roi_h)] -> sorted list[float] 稳定栅栏 x 坐标
+# 注意: 以 (roi_w, roi_h) 作为简化的 ROI key; 若存在同尺寸多 ROI 则会共享栅栏, 如需更细粒度可以在调用层传入 ROI ID 并改为 (roi_id, roi_w, roi_h).
+
+_roi_vertical_history = {}
+_roi_frame_count = {}
+_roi_fences = {}
+_roi_glass_boundary_history = {}
+_roi_glass_boundaries = {}
+
+def _update_glass_boundaries(roi_key, vertical_x_list, params):
+    """记录多玻璃之间的候选分隔线(边界), 与栅栏不同: 边界是两块玻璃之间的中线。
+    当帧内存在至少两条近竖直边且最大间隙>=配置阈值时, 取该最大间隙的中点作为候选边界。累积若干帧后取中位数稳定化。
+    """
+    try:
+        need_frames = int(params.get('DEFECT_DETECTION', {}).get('GLASS_BOUNDARY_STABLE_FRAMES', 5))
+    except Exception:
+        need_frames = 5
+    try:
+        gap_thr = float(params.get('DEFECT_DETECTION', {}).get('GLASS_BOUNDARY_MIN_GAP_PX', 60.0))
+    except Exception:
+        gap_thr = 60.0
+    xs = sorted(float(x) for x in vertical_x_list if np.isfinite(x))
+    if len(xs) < 2:
+        return
+    gaps = []
+    for i in range(len(xs)-1):
+        g = xs[i+1] - xs[i]
+        gaps.append((g, 0.5*(xs[i+1]+xs[i])))
+    if not gaps:
+        return
+    max_gap, mid_pt = max(gaps, key=lambda t: t[0])
+    if max_gap < gap_thr:
+        return
+    hist = _roi_glass_boundary_history.setdefault(roi_key, [])
+    hist.append(mid_pt)
+    if len(hist) >= need_frames and roi_key not in _roi_glass_boundaries:
+        try:
+            _roi_glass_boundaries[roi_key] = float(np.median(np.array(hist, dtype=float)))
+        except Exception:
+            _roi_glass_boundaries[roi_key] = mid_pt
+
+def _get_glass_boundary(roi_key):
+    return _roi_glass_boundaries.get(roi_key, None)
+
+def _update_vertical_fences(roi_key, vertical_x_list, params):
+    """更新竖直边历史并在达到设定帧数后生成栅栏。"""
+    try:
+        fence_frames = int(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_EXTEND_FENCE_INIT_FRAMES', 10))
+    except Exception:
+        fence_frames = 10
+    try:
+        cluster_tol = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_EXTEND_FENCE_CLUSTER_TOL_PX', 18.0))
+    except Exception:
+        cluster_tol = 18.0
+    xs = [float(x) for x in vertical_x_list if np.isfinite(x)]
+    if not xs:
+        # 仍递增帧计数, 但没有新数据
+        _roi_frame_count[roi_key] = _roi_frame_count.get(roi_key, 0) + 1
+        return
+    hist = _roi_vertical_history.setdefault(roi_key, [])
+    hist.append(xs)
+    fc = _roi_frame_count.get(roi_key, 0) + 1
+    _roi_frame_count[roi_key] = fc
+    # 仅在首次达到 fence_frames 时生成栅栏 (保持稳定, 不滚动窗口)
+    if fc == fence_frames:
+        try:
+            all_x = np.concatenate([np.array(h, dtype=float) for h in hist])
+            all_x.sort()
+            clusters = []
+            for x in all_x:
+                placed = False
+                for cl in clusters:
+                    # 用聚类中心的当前均值做距离阈值判定
+                    center = float(np.mean(cl))
+                    if abs(x - center) <= cluster_tol:
+                        cl.append(x); placed = True; break
+                if not placed:
+                    clusters.append([x])
+            fences = [float(np.median(cl)) for cl in clusters]
+            fences.sort()
+            _roi_fences[roi_key] = fences
+        except Exception:
+            _roi_fences[roi_key] = []
+
+def _get_fences_for_roi(roi_key):
+    return _roi_fences.get(roi_key, [])
+
+
 
 # ====================================================================================
 # --- 几何学与分析辅助函数 ---
@@ -1434,6 +1533,34 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         except Exception:
             pass
 
+    # ========= 收集竖直边 x 中点, 用于水平延长的“栅栏”推断 =========
+    try:
+        fence_enable = bool(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_EXTEND_FENCE_ENABLED', True))
+    except Exception:
+        fence_enable = True
+    vertical_x_for_history = []
+    if fence_enable:
+        try:
+            v_tol_for_hist = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+        except Exception:
+            v_tol_for_hist = 10.0
+        for seg in true_edges:
+            x1,y1,x2,y2 = map(float, seg)
+            ang_hist = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+            if ang_hist > 90.0: ang_hist = 180.0 - ang_hist
+            if ang_hist >= (90.0 - v_tol_for_hist):
+                vertical_x_for_history.append(0.5 * (x1 + x2))
+        roi_id = params.get('ROI_ID', None)
+        roi_key = (roi_id, roi_w, roi_h) if roi_id is not None else (roi_w, roi_h)
+        _update_vertical_fences(roi_key, vertical_x_for_history, params)
+        # 记录多玻璃分隔线候选
+        _update_glass_boundaries(roi_key, vertical_x_for_history, params)
+        fences = _get_fences_for_roi(roi_key)
+        glass_boundary = _get_glass_boundary(roi_key)
+    else:
+        fences = []
+        glass_boundary = None
+
     # 新增：当存在“理想竖直边”（近竖直主边）时，将近水平主边延长到与这些竖直边相交（仅限同主体 cluster 且采用最近邻策略）
     # - ENABLE_HORIZONTAL_EXTENSION_TO_VERTICAL (默认 True)
     # - HORIZONTAL_EXTEND_MAX_GAP_MM (默认 40mm)
@@ -1523,6 +1650,33 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     dx = x2 - x1; dy = y2 - y1
                     if abs(dx) < 1e-6:
                         continue
+                    # 读取栅栏, 计算当前水平线可延长的左右最大边界
+                    try:
+                        fence_margin = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_EXTEND_FENCE_MARGIN_PX', 4.0))
+                    except Exception:
+                        fence_margin = 4.0
+                    fence_left_bound = None
+                    fence_right_bound = None
+                    if fences:
+                        seg_xmin = min(x1, x2); seg_xmax = max(x1, x2)
+                        # 找最近左侧和右侧栅栏
+                        left_candidates = [fx for fx in fences if fx < seg_xmin]
+                        right_candidates = [fx for fx in fences if fx > seg_xmax]
+                        if left_candidates:
+                            fence_left_bound = max(left_candidates) - fence_margin
+                        if right_candidates:
+                            fence_right_bound = min(right_candidates) + fence_margin
+                    # 多玻璃边界: 若存在稳定分隔线, 根据水平线中点判断所属玻璃, 设置对侧禁止跨越的边界
+                    if glass_boundary is not None:
+                        mid_x = 0.5 * (x1 + x2)
+                        if mid_x <= glass_boundary:  # 属于左玻璃, 不跨右侧边界
+                            if fence_right_bound is None or fence_right_bound > glass_boundary:
+                                fence_right_bound = glass_boundary + fence_margin
+                        else:  # 属于右玻璃
+                            if fence_left_bound is None or fence_left_bound < glass_boundary:
+                                fence_left_bound = glass_boundary - fence_margin
+                    if _DBG_PRINT and _DBG_LEVEL >= 2 and (glass_boundary is not None):
+                        _dprint(f"  - glass_boundary={glass_boundary:.1f} left_bound={fence_left_bound} right_bound={fence_right_bound}")
                     # 构造无限延长后的水平直线，与候选竖直边求交点（使用竖直边的延长线）
                     intersections = []  # (pt, vi, vseg)
                     for (vi, vseg) in cand_verticals:
@@ -1536,6 +1690,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         # 要求交点 y 在竖直边段范围内（±1px 缓冲）
                         vy_min = min(vy1, vy2) - 1.0; vy_max = max(vy1, vy2) + 1.0
                         if vy_min <= inter[1] <= vy_max:
+                            # 栅栏过滤: 若有边界限制则不得跨越
+                            if fence_left_bound is not None and inter[0] < fence_left_bound:
+                                continue
+                            if fence_right_bound is not None and inter[0] > fence_right_bound:
+                                continue
                             intersections.append((inter.astype(float), vi, vseg))
                     if _DBG_PRINT and _DBG_LEVEL >= 2:
                         _dprint(f"  - candV={len(cand_verticals)} inter_inseg={len(intersections)}")
@@ -1560,6 +1719,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     if left_ext is not None:
                         pt_left = left_ext[0]
                         gap_len_px = float(seg_xmin - pt_left[0])
+                        if fence_left_bound is not None and pt_left[0] < fence_left_bound:
+                            # 超越栅栏, 忽略此延长
+                            left_ext = None
+                        if left_ext is None:
+                            pass
                         if gap_len_px <= max_gap_px:
                             ok_conn = True
                             if isinstance(binary_edges, np.ndarray) and binary_edges.size > 0:
@@ -1589,6 +1753,10 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     if right_ext is not None:
                         pt_right = right_ext[0]
                         gap_len_px = float(pt_right[0] - seg_xmax)
+                        if fence_right_bound is not None and pt_right[0] > fence_right_bound:
+                            right_ext = None
+                        if right_ext is None:
+                            pass
                         if gap_len_px <= max_gap_px:
                             ok_conn = True
                             if isinstance(binary_edges, np.ndarray) and binary_edges.size > 0:
@@ -2656,6 +2824,65 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 continue
         except Exception:
             pass
+        # 栅栏/分隔线逻辑适配：若存在稳定 glass_boundary 或 fences，防止跨玻璃或越界配对形成伪角
+        def _is_vertical_for_pair(seg):
+            try:
+                ang = abs(np.degrees(np.arctan2(float(seg[3]-seg[1]), float(seg[2]-seg[0]))))
+                if ang > 90.0: ang = 180.0 - ang
+                v_tol = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+                return ang >= (90.0 - v_tol)
+            except Exception:
+                return False
+        def _is_horizontal_for_pair(seg):
+            try:
+                ang = abs(np.degrees(np.arctan2(float(seg[3]-seg[1]), float(seg[2]-seg[0]))))
+                if ang > 90.0: ang = 180.0 - ang
+                h_tol = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0)))
+                return ang <= h_tol
+            except Exception:
+                return False
+        # 仅在一条水平+一条竖直组合时应用边界约束
+        seg_i = true_edges[i]; seg_j = true_edges[j]
+        hv_combo = (_is_horizontal_for_pair(seg_i) and _is_vertical_for_pair(seg_j)) or (_is_horizontal_for_pair(seg_j) and _is_vertical_for_pair(seg_i))
+        if hv_combo:
+            # 获取边界参考
+            fence_margin_local = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_EXTEND_FENCE_MARGIN_PX', 4.0)) if params.get('DEFECT_DETECTION', {}) else 4.0
+            # 针对水平线所在玻璃, 计算禁止跨越的边界区间
+            # 取水平线
+            if _is_horizontal_for_pair(seg_i):
+                h_seg = seg_i; v_seg_other = seg_j
+            else:
+                h_seg = seg_j; v_seg_other = seg_i
+            xh1, yh1, xh2, yh2 = map(float, h_seg)
+            h_mid_x = 0.5 * (xh1 + xh2)
+            # fences 和 glass_boundary 若存在
+            # 变量可能在上游定义: fences, glass_boundary；若不存在使用空或 None
+            try:
+                current_fences = fences if 'fences' in locals() else []
+            except Exception:
+                current_fences = []
+            try:
+                gb = glass_boundary if 'glass_boundary' in locals() else None
+            except Exception:
+                gb = None
+            # 计算水平线所属侧并设置允许的 x 范围
+            allow_min = -1e9; allow_max = 1e9
+            if gb is not None:
+                if h_mid_x <= gb:  # 左玻璃
+                    allow_max = gb + fence_margin_local
+                else:              # 右玻璃
+                    allow_min = gb - fence_margin_local
+            # 使用 fences 进一步收紧(只取距离水平线最近的内侧栅栏)
+            if current_fences:
+                seg_xmin = min(xh1, xh2); seg_xmax = max(xh1, xh2)
+                left_cand = [fx for fx in current_fences if fx < seg_xmin]
+                right_cand = [fx for fx in current_fences if fx > seg_xmax]
+                if left_cand:
+                    allow_min = max(allow_min, max(left_cand) - fence_margin_local)
+                if right_cand:
+                    allow_max = min(allow_max, min(right_cand) + fence_margin_local)
+        else:
+            allow_min = -1e9; allow_max = 1e9
         if all(endpoint_paired_status.get(i, [True,True])) or all(endpoint_paired_status.get(j, [True,True])):
             continue
         # 使用最新坐标的线段参与角点计算：优先采用 edges_for_drawing
@@ -2673,6 +2900,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
 
         intersection = find_line_intersection(line1, line2)
         if intersection is None:
+            continue
+        # 栅栏/边界过滤：若交点超出允许范围直接丢弃
+        if not (allow_min - 1e-6 <= intersection[0] <= allow_max + 1e-6):
+            if _DBG_PRINT and _DBG_LEVEL >= 2:
+                _dprint(f"[DBG] skip pair i={i} j={j} intersection x={intersection[0]:.1f} outside [{allow_min:.1f},{allow_max:.1f}]")
             continue
 
         try:
@@ -3818,40 +4050,40 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     # 绘制主边直线、角点（移除调试打印）
     annotations_to_draw = []
-    #try:
-    #    #绘制主边（使用 edges_for_drawing，已包含延长/截断）
-    #    for i, seg in enumerate(edges_for_drawing or []):
-    #        x1,y1,x2,y2 = map(float, seg)
-    #        dx, dy = (x2-x1), (y2-y1)
-    #        ang = abs(np.degrees(np.arctan2(dy, dx)))
-    #        if ang > 90.0: ang = 180.0 - ang
-    #        length_px = float(np.hypot(dx, dy))
-    #        length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
-    #        # 颜色：近竖直=绿色，近水平=蓝色，其余=灰白
-    #        color = (200,200,200)
-    #        if ang >= 80.0:
-    #            color = (0,255,0)
-    #        elif ang <= 10.0:
-    #            color = (255,0,0)
-    #        cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
-    #        #在中点标注线段索引
-    #        mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
-    #        try:
-    #            cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-    #        except Exception:
-    #            pass
-    #    # 绘制角点（使用 paired_corners；不依赖是否生成 X/Q 缺陷）
-    #    #for (ii, jj, cp_arr) in (paired_corners or []):
-    #    #    try:
-    #    #        cx, cy = float(cp_arr[0]), float(cp_arr[1])
-    #    #        cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
-    #    #        cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
-    #    #    except Exception:
-    #    #        continue
-#
-    #    # 已移除演示射线，仅保留真实命中射线在缺陷绘制阶段显示
-    #except Exception:
-    #    pass
+    try:
+       #绘制主边（使用 edges_for_drawing，已包含延长/截断）
+       for i, seg in enumerate(edges_for_drawing or []):
+           x1,y1,x2,y2 = map(float, seg)
+           dx, dy = (x2-x1), (y2-y1)
+           ang = abs(np.degrees(np.arctan2(dy, dx)))
+           if ang > 90.0: ang = 180.0 - ang
+           length_px = float(np.hypot(dx, dy))
+           length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
+           # 颜色：近竖直=绿色，近水平=蓝色，其余=灰白
+           color = (200,200,200)
+           if ang >= 80.0:
+               color = (0,255,0)
+           elif ang <= 10.0:
+               color = (255,0,0)
+           cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
+           #在中点标注线段索引
+           mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
+           try:
+               cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+           except Exception:
+               pass
+       #绘制角点（使用 paired_corners；不依赖是否生成 X/Q 缺陷）
+       for (ii, jj, cp_arr) in (paired_corners or []):
+          try:
+              cx, cy = float(cp_arr[0]), float(cp_arr[1])
+              cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
+              cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
+          except Exception:
+              continue
+
+       # 已移除演示射线，仅保留真实命中射线在缺陷绘制阶段显示
+    except Exception:
+       pass
     
     for defect_report in final_defects_for_report:
         defect = defect_report['raw_defect']
