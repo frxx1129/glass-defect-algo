@@ -1185,7 +1185,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     # 记录修改前的主边拷贝，用于后续判断“水平边的延长部分”（相对原坐标）
     true_edges_before_ext = [edge.copy() for edge in true_edges]
 
-    # ================= 新增：基于主边中点的一次性主体(cluster)划分 =================
+    # ================= 恢复：基于主边中点的主体(cluster)划分（中点间隙法） =================
     # 仍沿用 merge 阶段的 GLASS_CLUSTER_GAP_MM 阈值；若 gap 不足则视为单主体
     cluster_gap_px_cfg = 0.0
     try:
@@ -1223,8 +1223,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 gaps = np.diff(xs_sorted)
                 if gaps.size > 0 and float(np.max(gaps)) >= eff_gap_px:
                     k = int(np.argmax(gaps))
-                    left_set = set([vert_idx[i] for i in order[:k+1]])
-                    right_set = set([vert_idx[i] for i in order[k+1:]])
                     # 依据 x 中位数划分所有边
                     x_thresh = 0.5 * (xs_sorted[k] + xs_sorted[k+1])
                     for i in range(len(true_edges)):
@@ -1256,9 +1254,68 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         try:
             uniq = list(map(int, np.unique(cluster_labels))) if len(cluster_labels) > 0 else []
             counts = [(int(c), int((cluster_labels==c).sum())) for c in uniq]
-            _dprint(f"[DBG] clusters={counts} eff_gap_px={int(round(eff_gap_px)) if 'eff_gap_px' in locals() else -1} edges={len(true_edges)}")
+            _dprint(f"[DBG] clusters(gap)={counts} edges={len(true_edges)}")
         except Exception:
             pass
+
+    # ========== 条件性凸包验证：仅在同时存在多个竖直和多个水平主边时启用 ==========
+    qx_blocked = False
+    try:
+        # 统计近竖直与近水平条数
+        try:
+            v_tol_deg_chk = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+        except Exception:
+            v_tol_deg_chk = 10.0
+        try:
+            h_tol_deg_chk = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', v_tol_deg_chk))
+        except Exception:
+            h_tol_deg_chk = v_tol_deg_chk
+        def _ang_x(seg):
+            x1,y1,x2,y2 = map(float, seg)
+            a = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+            return a if a <= 90.0 else 180.0 - a
+        cnt_v = sum(1 for e in true_edges if _ang_x(e) >= (90.0 - v_tol_deg_chk))
+        cnt_h = sum(1 for e in true_edges if _ang_x(e) <= h_tol_deg_chk)
+        enable_hull_check = (cnt_v >= 2 and cnt_h >= 2)
+        if enable_hull_check and (len(np.unique(cluster_labels)) >= 2):
+            clusters_points = {}
+            for idx, seg in enumerate(true_edges):
+                cid = int(cluster_labels[idx]) if len(cluster_labels) > idx else 0
+                a = np.array(seg[:2], dtype=float); b = np.array(seg[2:], dtype=float)
+                if not (np.isfinite(a).all() and np.isfinite(b).all()):
+                    continue
+                clusters_points.setdefault(cid, []).append(a)
+                clusters_points[cid].append(b)
+            hulls = {}
+            for cid, pts in clusters_points.items():
+                if len(pts) < 3:
+                    continue
+                P = np.vstack(pts).astype(np.float32)
+                try:
+                    hull = cv2.convexHull(P)
+                except Exception:
+                    hull = None
+                if hull is not None and isinstance(hull, np.ndarray) and hull.shape[0] >= 3:
+                    hulls[cid] = hull.astype(np.float32)
+            keys = sorted(hulls.keys())
+            for i_k in range(len(keys)):
+                for j_k in range(i_k+1, len(keys)):
+                    h1 = hulls[keys[i_k]]; h2 = hulls[keys[j_k]]
+                    try:
+                        area, _ = cv2.intersectConvexConvex(h1, h2)
+                        if area is not None and float(area) > 0.0:
+                            qx_blocked = True
+                            raise StopIteration
+                    except StopIteration:
+                        raise
+                    except Exception:
+                        continue
+        if _DBG_PRINT:
+            _dprint(f"[DBG] hull-check enable={enable_hull_check} cntV={cnt_v} cntH={cnt_h} qx_blocked={bool(qx_blocked)}")
+    except StopIteration:
+        pass
+    except Exception:
+        qx_blocked = False
     
     corner_defects = []; num_true_edges = len(true_edges)
     edges_for_drawing = [edge.copy() for edge in true_edges]
@@ -2453,6 +2510,9 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
 
     # 仅使用角点 + 轮廓三角法作为缺角(Q)检测结果
     rect_q_defects = corner_contour_q_defects
+    # 若聚类凸包相交，则阻断 Q 生成
+    if 'qx_blocked' in locals() and bool(qx_blocked):
+        rect_q_defects = []
 
     # 新增：对 Q 缺陷进行“平行四边形 + 边缘点集群”验证过滤
     try:
@@ -2676,7 +2736,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     corner_defects.append({"type": "X", "center": tuple(map(int, intersection)), "angle": corrected_angle})
 
             # 删除 Harris 缺角检测：统一仅按角度偏差尝试判定 X，不再生成 Q
-            _handle_as_x_defect()
+            if 'qx_blocked' not in locals() or not bool(qx_blocked):
+                _handle_as_x_defect()
             try:
                 # 记录该交点用于后续过滤其附近的 B 误检
                 non_q_intersections.append((float(intersection[0]), float(intersection[1])))
