@@ -7,6 +7,7 @@ import traceback
 from queue import Empty
 import time
 import fused_image_processor
+import copy
 
 def should_reject_pane(pane_json, shared_settings, pixels_per_mm):
     """根据缺陷类型与尺寸判定是否剔废。
@@ -118,8 +119,54 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                     algo_mode = int(getattr(shared_settings, 'algorithm_mode', 1))
                 except Exception:
                     algo_mode = 1
+                # 在进入处理器前，根据“仅头尾相机启用 Q”策略，为本次调用构造局部配置副本并注入运行时开关
+                conf_local = copy.deepcopy(config) if isinstance(config, dict) else config
+                try:
+                    cam_setup = conf_local.get('camera_setup', {}) or {}
+                    total_cams_rt = int(cam_setup.get('expected_cameras', 0) or 0)
+                    if total_cams_rt <= 0:
+                        try:
+                            total_cams_rt = int(len(cam_setup.get('camera_bindings', []) or []))
+                        except Exception:
+                            total_cams_rt = 0
+                    if total_cams_rt <= 0:
+                        try:
+                            cro = conf_local.get('camera_rois', {}) or {}
+                            if isinstance(cro, dict):
+                                total_cams_rt = len(cro.keys())
+                            elif isinstance(cro, list):
+                                total_cams_rt = len(cro)
+                        except Exception:
+                            total_cams_rt = 0
+                    q_enabled_rt = True
+                    if total_cams_rt >= 1:
+                        first_idx_rt = 0
+                        last_idx_rt = max(0, total_cams_rt - 1)
+                        q_enabled_rt = (cam_idx in (first_idx_rt, last_idx_rt))
+                    # 将运行时开关写入浅色与深色参数节
+                    try:
+                        hip = conf_local.setdefault('hough_inspector_params', {})
+                        dd  = hip.setdefault('DEFECT_DETECTION', {})
+                        dd['Q_ENABLED'] = bool(q_enabled_rt)
+                    except Exception:
+                        pass
+                    try:
+                        hid = conf_local.setdefault('hough_inspector_dark_params', {})
+                        ddd = hid.setdefault('DEFECT_DETECTION', {})
+                        ddd['Q_ENABLED'] = bool(q_enabled_rt)
+                    except Exception:
+                        pass
+                    # 记录当前相机索引，便于下游按需使用
+                    try:
+                        rt = conf_local.setdefault('__runtime__', {})
+                        rt['current_cam_idx'] = cam_idx
+                    except Exception:
+                        pass
+                except Exception:
+                    conf_local = config
+
                 pane_json, annotated_image = fused_image_processor.process_image(
-                    frame_data, roi_cache[cam_idx], config, algo_mode)
+                    frame_data, roi_cache[cam_idx], conf_local, algo_mode)
 
                 # 会话逻辑：只有检测到玻璃(state_code>0)才开启文件夹；玻璃离开(state_code==0 且之前active)结束。
                 is_collection = bool(getattr(shared_settings, 'data_collection_mode', False))
@@ -199,6 +246,40 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                 except Exception:
                     pass
 
+                # 新策略：仅“头尾”两个逻辑相机启用缺角(Q)检测，其余相机剔除所有 Q 缺陷；若无其他缺陷则判 OK。
+                try:
+                    cam_setup = config.get('camera_setup', {}) or {}
+                    total_cams = int(cam_setup.get('expected_cameras', 0) or 0)
+                    if total_cams <= 0:
+                        # 回退：优先按 camera_bindings 数量，再按 camera_rois 键数量
+                        try:
+                            total_cams = int(len(cam_setup.get('camera_bindings', []) or []))
+                        except Exception:
+                            total_cams = 0
+                    if total_cams <= 0:
+                        try:
+                            cro = config.get('camera_rois', {}) or {}
+                            if isinstance(cro, dict):
+                                total_cams = len(cro.keys())
+                            elif isinstance(cro, list):
+                                total_cams = len(cro)
+                        except Exception:
+                            total_cams = 0
+                    # 仅当能确定总相机数>=2时，执行“只保留头尾相机的Q”策略
+                    if total_cams >= 1:
+                        first_idx = 0
+                        last_idx = max(0, total_cams - 1)
+                        if cam_idx not in (first_idx, last_idx):
+                            defs = pane_json.get('defects')
+                            if isinstance(defs, list):
+                                kept = [d for d in defs if str(d.get('type', '')).upper() != 'Q']
+                                pane_json['defects'] = kept
+                                if not kept:
+                                    pane_json['image_status'] = 'OK'
+                except Exception:
+                    pass
+
+                # 判定是否剔废需要基于剔除 Q 后的结果
                 should_reject_overall = should_reject_pane(pane_json, shared_settings, PIXELS_PER_MM)
 
                 jpg_q_main = int(config.get('system_params', {}).get('jpeg_quality_main', 85) or 85)
@@ -223,21 +304,7 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
 
                 base64_image_string = base64.b64encode(preview_buffer_encoded if success_preview else original_buffer_encoded).decode('utf-8')
 
-                # 在进入状态机前，先基于 ROI 中的近竖直线数量过滤 Q 缺陷；
-                # 若某相机的任一 ROI 有 near_vertical_line_count>=2，则剔除其所有 Q 缺陷，且若无其他缺陷则将 image_status 置为 OK。
-                try:
-                    rois_for_cam = pane_json.get('rois', []) or []
-                    if isinstance(rois_for_cam, list) and rois_for_cam:
-                        has_multi_vert = any(int(r.get('near_vertical_line_count', 0) or 0) >= 2 for r in rois_for_cam)
-                        if has_multi_vert:
-                            defs = pane_json.get('defects')
-                            if isinstance(defs, list):
-                                kept = [d for d in defs if str(d.get('type', '')).upper() != 'Q']
-                                pane_json['defects'] = kept
-                                if not kept:
-                                    pane_json['image_status'] = 'OK'
-                except Exception:
-                    pass
+                # 取消基于“近竖直线数量>=2”的 Q 过滤逻辑（已由“仅头尾相机启用 Q”策略取代）
 
                 result = {
                     "camera_index": cam_idx,

@@ -3494,6 +3494,12 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     main_edges = merge_lines_and_get_main_edges(raw_lines, params, pixels_per_mm, edge_img=binary_edges)
 
+    # 运行时：根据上层注入的 DEFECT_DETECTION.Q_ENABLED 控制是否生成/绘制 Q
+    try:
+        _q_enabled_runtime = bool(params.get('DEFECT_DETECTION', {}).get('Q_ENABLED', True))
+    except Exception:
+        _q_enabled_runtime = True
+
     # 接入“跨 ROI 统一竖直虚拟边”：将全局共享竖直边裁剪到本 ROI 并并入主边
     try:
         p_def_sh = params.get('DEFECT_DETECTION', {})
@@ -3729,6 +3735,12 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     final_defects_for_report = []
     for defect in all_defects:
+        # 若当前相机禁用 Q，则直接跳过所有 Q 缺陷（不进入后续绘制与上报）
+        try:
+            if (not _q_enabled_runtime) and str(defect.get('type','')).upper() == 'Q':
+                continue
+        except Exception:
+            pass
         new_defect = {'type': defect['type']}
         location = {}
         
@@ -3940,6 +3952,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 pass
 
         if new_defect['type'] == 'Q':
+            # 双重保险：若禁用 Q，提前跳过
+            if not _q_enabled_runtime:
+                continue
             length_mm = location.get('length_mm', 0); width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm; aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
             # 新增：过滤长宽比过大的 Q（> 4.0）
