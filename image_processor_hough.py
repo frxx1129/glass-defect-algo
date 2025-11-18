@@ -1281,6 +1281,22 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     crack_indices = set()
 
     true_edges = [edge for i, edge in enumerate(edges) if i not in crack_indices]
+    # 统计“原始近竖直直线”数量（在任何水平/聚类合并之前），用于 Q 缺陷全局过滤
+    try:
+        v_tol_raw = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+    except Exception:
+        v_tol_raw = 10.0
+    raw_vertical_cnt = 0
+    for e in true_edges:
+        try:
+            x1, y1, x2, y2 = map(float, e)
+            ang = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+            if ang > 90.0:
+                ang = 180.0 - ang
+            if ang >= (90.0 - v_tol_raw):
+                raw_vertical_cnt += 1
+        except Exception:
+            continue
     # 记录修改前的主边拷贝，用于后续判断“水平边的延长部分”（相对原坐标）
     true_edges_before_ext = [edge.copy() for edge in true_edges]
 
@@ -2361,7 +2377,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                     continue
                                 u0 = v / n
                                 # 加宽射线条带到 11px
-                                hit2 = _ray_intersect_contour_thick(cp, u0, cnt_pts, t_min=1.0, stripe_half_px=11)
+                                hit2 = _ray_intersect_contour_thick(cp, u0, cnt_pts, t_min=1.0, stripe_half_px=7)
                                 if hit2 is not None:
                                     tmp_cands.append((hit2, u0))
                             cands = tmp_cands
@@ -2678,6 +2694,15 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
 
     # 仅使用角点 + 轮廓三角法作为缺角(Q)检测结果
     rect_q_defects = corner_contour_q_defects
+    # 若本 ROI 中“原始近竖直直线”数量>=2，则过滤掉该相机在本 ROI 内产生的所有 Q 缺陷
+    # 说明：这里在 Q 级别直接清空，后续 E/B 等不受影响；进入/离开逻辑仍由状态机根据 rois 统计
+    try:
+        if int(raw_vertical_cnt) >= 2:
+            if _DBG_PRINT and _DBG_LEVEL >= 1:
+                _dprint(f"[DBG] suppress Q-defects in ROI: raw_vertical_cnt={raw_vertical_cnt}>=2")
+            rect_q_defects = []
+    except Exception:
+        pass
     # 若聚类凸包相交，则阻断 Q 生成
     if 'qx_blocked' in locals() and bool(qx_blocked):
         rect_q_defects = []
@@ -4051,7 +4076,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     # 绘制主边直线、角点（移除调试打印）
     annotations_to_draw = []
     # try:
-    #    #绘制主边（使用 edges_for_drawing，已包含延长/截断）
+    #    绘制主边（使用 edges_for_drawing，已包含延长/截断）
     #    for i, seg in enumerate(edges_for_drawing or []):
     #        x1,y1,x2,y2 = map(float, seg)
     #        dx, dy = (x2-x1), (y2-y1)
@@ -4059,20 +4084,20 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     #        if ang > 90.0: ang = 180.0 - ang
     #        length_px = float(np.hypot(dx, dy))
     #        length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
-    #        #颜色：近竖直=绿色，近水平=蓝色，其余=灰白
+    #        颜色：近竖直=绿色，近水平=蓝色，其余=灰白
     #        color = (200,200,200)
     #        if ang >= 80.0:
     #            color = (0,255,0)
     #        elif ang <= 10.0:
     #            color = (255,0,0)
     #        cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
-    #        #在中点标注线段索引
+    #        在中点标注线段索引
     #        mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
     #        try:
     #            cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
     #        except Exception:
     #            pass
-    #    #绘制角点（使用 paired_corners；不依赖是否生成 X/Q 缺陷）
+    #    绘制角点（使用 paired_corners；不依赖是否生成 X/Q 缺陷）
     #    for (ii, jj, cp_arr) in (paired_corners or []):
     #       try:
     #           cx, cy = float(cp_arr[0]), float(cp_arr[1])
@@ -4081,7 +4106,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     #       except Exception:
     #           continue
 
-    #    #已移除演示射线，仅保留真实命中射线在缺陷绘制阶段显示
+    #    已移除演示射线，仅保留真实命中射线在缺陷绘制阶段显示
     # except Exception:
     #    pass
     
@@ -4109,7 +4134,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         #                continue
         #except Exception:
         #    pass
-        
+#
         if defect_report['type'] in ('E', 'X'):
             # 区分 E 与 X 的标注：均显示角度；E 还需显示长宽；X 为“混合型”也显示长宽
             if loc.get('subtype') == 'curved' or (defect.get('skew_subtype', '') == 'curved'):
