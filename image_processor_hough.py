@@ -2332,7 +2332,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         dist_min = float(np.min(np.linalg.norm(cnt_pts - cp, axis=1))) if cnt_pts.size > 0 else 9999.0
                     except Exception:
                         dist_min = 9999.0
-                    if dist_min <= 6.0:
+                    if dist_min <= 14.4:
                         continue
                     # 方向判定改为“基于轮廓的双向试探”：对每条主边，分别沿端点方向发射射线，选择命中距离更近的一侧
                     inter_hits = []  # (point, edge_index)
