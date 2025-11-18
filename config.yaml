@@ -69,7 +69,7 @@
     }
   },
   "camera_rois": {
-    "0": "cam-1_ts1763404693603_roi_averaged_by_group.json",
+    "0": "cam01_2025-11-10T11-08-41-177.webm_20251110_202454.671_roi_averaged_by_group.json",
     "1": "cam2_roi_averaged_by_group.json",
     "2": "cam5_roi_averaged_by_group.json",
     "3": "cam4_roi_averaged_by_group.json",
@@ -92,7 +92,7 @@
   "rejection_controller": {"port": "COM5", "baud": 115200},
   "rejection_params": {"max_defect_size_mm": 20, "REJECTION_PULSE_MS": 100, "REJECTION_DELAY_S": 2},
   "hough_inspector_params": {
-    "PREPROCESSING": {"MEDIAN_BLUR_KSIZE": 17, "CLAHE_CLIP_LIMIT": 3.0, "CLAHE_GRID_SIZE": [8, 8], "CANNY_THRESHOLD_LOW": 10, "CANNY_THRESHOLD_HIGH": 70},
+    "PREPROCESSING": {"MEDIAN_BLUR_KSIZE": 7, "CLAHE_CLIP_LIMIT": 2.5, "CLAHE_GRID_SIZE": [8, 8], "CANNY_THRESHOLD_LOW": 16, "CANNY_THRESHOLD_HIGH": 76},
     "HOUGH_TRANSFORM": {"THRESHOLD": 30, "MIN_LINE_LENGTH_RATIO": 0.05, "MAX_LINE_GAP_MM": 5, "MAX_LINE_GAP": 40},
     "LINE_MERGING": {"ANGLE_TOLERANCE": 1.5, "MAX_LATERAL_DISTANCE_MM": 5, "MAX_LATERAL_DISTANCE": 20, "TOP_N_EDGES": 5},
     "CRACK_CLASSIFICATION": {"ENDPOINT_SHIELD_RATIO": 0.1, "ENDPOINT_PROXIMITY_THRESHOLD_MM": 5.49},
