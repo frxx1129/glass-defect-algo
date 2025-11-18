@@ -49,7 +49,7 @@ class ROIAnnotator:
             self.ref_point_end = None
 
     def run_annotator(self, image_path):
-        if not os.path.isfile(image_path) or not image_path.lower().endswith('.bmp'):
+        if not os.path.isfile(image_path) or not image_path.lower().endswith(('.bmp','.jpg','.jpeg','.png')):
             print(f"无效的图片路径: {image_path}")
             return None
 
@@ -162,7 +162,7 @@ def main():
     try:
         root = tk.Tk()
         root.withdraw()
-        image_path = filedialog.askopenfilename(title="选择要标注的图片", filetypes=[("BMP files", "*.bmp")])
+        image_path = filedialog.askopenfilename(title="选择要标注的图片", filetypes=[("BMP files", "*.bmp"), ("JPEG files", "*.jpg;*.jpeg"), ("PNG files", "*.png"), ("All files", "*.*")])
         if not image_path:
             print("未选择文件，程序退出。")
             return

@@ -223,6 +223,22 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
 
                 base64_image_string = base64.b64encode(preview_buffer_encoded if success_preview else original_buffer_encoded).decode('utf-8')
 
+                # 在进入状态机前，先基于 ROI 中的近竖直线数量过滤 Q 缺陷；
+                # 若某相机的任一 ROI 有 near_vertical_line_count>=2，则剔除其所有 Q 缺陷，且若无其他缺陷则将 image_status 置为 OK。
+                try:
+                    rois_for_cam = pane_json.get('rois', []) or []
+                    if isinstance(rois_for_cam, list) and rois_for_cam:
+                        has_multi_vert = any(int(r.get('near_vertical_line_count', 0) or 0) >= 2 for r in rois_for_cam)
+                        if has_multi_vert:
+                            defs = pane_json.get('defects')
+                            if isinstance(defs, list):
+                                kept = [d for d in defs if str(d.get('type', '')).upper() != 'Q']
+                                pane_json['defects'] = kept
+                                if not kept:
+                                    pane_json['image_status'] = 'OK'
+                except Exception:
+                    pass
+
                 result = {
                     "camera_index": cam_idx,
                     "timestamp": time.time(),

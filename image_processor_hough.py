@@ -1281,22 +1281,6 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     crack_indices = set()
 
     true_edges = [edge for i, edge in enumerate(edges) if i not in crack_indices]
-    # 统计“原始近竖直直线”数量（在任何水平/聚类合并之前），用于 Q 缺陷全局过滤
-    try:
-        v_tol_raw = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
-    except Exception:
-        v_tol_raw = 10.0
-    raw_vertical_cnt = 0
-    for e in true_edges:
-        try:
-            x1, y1, x2, y2 = map(float, e)
-            ang = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
-            if ang > 90.0:
-                ang = 180.0 - ang
-            if ang >= (90.0 - v_tol_raw):
-                raw_vertical_cnt += 1
-        except Exception:
-            continue
     # 记录修改前的主边拷贝，用于后续判断“水平边的延长部分”（相对原坐标）
     true_edges_before_ext = [edge.copy() for edge in true_edges]
 
@@ -2703,7 +2687,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             rect_q_defects = []
     except Exception:
         pass
-    # 若聚类凸包相交，则阻断 Q 生成
+    # 若聚类凸包相交，则阻断 Q 生成（相机级别过滤在上层进行）
     if 'qx_blocked' in locals() and bool(qx_blocked):
         rect_q_defects = []
 
@@ -2746,6 +2730,57 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             cv2.fillPoly(mask, [pg.astype(np.int32)], 255)
             kernel = np.ones((3,3), dtype=np.uint8)
             inner = cv2.erode(mask, kernel, iterations=1)
+            # 在验证内区连通域前，剔除“靠近水平/竖直边（延长后）的条带区域”以避免边界噪声干扰
+            try:
+                stripe_half = int(params.get('DEFECT_DETECTION', {}).get('Q_PARALLELOGRAM_EXCLUDE_STRIPE_HALF_PX', 11))
+            except Exception:
+                stripe_half = 11
+            stripe_half = max(0, int(stripe_half))
+            if stripe_half > 0:
+                exclude = np.zeros((H, W), dtype=np.uint8)
+                # 优先使用 q_def['ray_segments']（两条射线，方向分别近水平/近竖直）
+                rays = q_def.get('ray_segments', None)
+                norm_rays = []
+                if isinstance(rays, (list, tuple)) and len(rays) > 0:
+                    for r in rays:
+                        try:
+                            if isinstance(r, dict) and 'seg' in r:
+                                p1, p2 = r['seg']
+                            else:
+                                p1, p2 = r  # 形如((x1,y1),(x2,y2))
+                            x1, y1 = float(p1[0]), float(p1[1])
+                            x2, y2 = float(p2[0]), float(p2[1])
+                            norm_rays.append(((x1, y1), (x2, y2)))
+                        except Exception:
+                            continue
+                # 若没有射线，则用 corner_point → intersections 构造两条近似射线
+                if not norm_rays:
+                    try:
+                        cp = q_def.get('corner_point', None)
+                        inters = q_def.get('intersections', []) or []
+                        if cp is not None and len(inters) >= 1:
+                            for ip in inters[:2]:
+                                norm_rays.append(((float(cp[0]), float(cp[1])), (float(ip[0]), float(ip[1]))))
+                    except Exception:
+                        pass
+                # 画“延长后”的加粗条带
+                if norm_rays:
+                    L = float(max(H, W) * 2.0)
+                    thick = int(2 * stripe_half + 1)
+                    for (x1, y1), (x2, y2) in norm_rays[:2]:  # 仅取两条
+                        dx, dy = float(x2 - x1), float(y2 - y1)
+                        nrm = float(np.hypot(dx, dy))
+                        if nrm < 1e-3:
+                            continue
+                        ux, uy = dx / nrm, dy / nrm
+                        cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+                        sx, sy = cx - ux * L, cy - uy * L
+                        ex, ey = cx + ux * L, cy + uy * L
+                        p1e = (int(round(sx)), int(round(sy)))
+                        p2e = (int(round(ex)), int(round(ey)))
+                        cv2.line(exclude, p1e, p2e, 255, thickness=thick, lineType=cv2.LINE_AA)
+                # 将条带从内区中剔除
+                inner = cv2.bitwise_and(inner, cv2.bitwise_not(exclude))
             # 取内区的边缘点
             cand = cv2.bitwise_and(edges_img, edges_img, mask=inner)
             # 可选形态学连接（轻度）
@@ -4075,40 +4110,40 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     # 绘制主边直线、角点（移除调试打印）
     annotations_to_draw = []
-    # try:
-    #    绘制主边（使用 edges_for_drawing，已包含延长/截断）
-    #    for i, seg in enumerate(edges_for_drawing or []):
-    #        x1,y1,x2,y2 = map(float, seg)
-    #        dx, dy = (x2-x1), (y2-y1)
-    #        ang = abs(np.degrees(np.arctan2(dy, dx)))
-    #        if ang > 90.0: ang = 180.0 - ang
-    #        length_px = float(np.hypot(dx, dy))
-    #        length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
-    #        颜色：近竖直=绿色，近水平=蓝色，其余=灰白
-    #        color = (200,200,200)
-    #        if ang >= 80.0:
-    #            color = (0,255,0)
-    #        elif ang <= 10.0:
-    #            color = (255,0,0)
-    #        cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
-    #        在中点标注线段索引
-    #        mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
-    #        try:
-    #            cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-    #        except Exception:
-    #            pass
-    #    绘制角点（使用 paired_corners；不依赖是否生成 X/Q 缺陷）
-    #    for (ii, jj, cp_arr) in (paired_corners or []):
-    #       try:
-    #           cx, cy = float(cp_arr[0]), float(cp_arr[1])
-    #           cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
-    #           cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
-    #       except Exception:
-    #           continue
+    try:
+       #绘制主边（使用 edges_for_drawing，已包含延长/截断）
+       for i, seg in enumerate(edges_for_drawing or []):
+           x1,y1,x2,y2 = map(float, seg)
+           dx, dy = (x2-x1), (y2-y1)
+           ang = abs(np.degrees(np.arctan2(dy, dx)))
+           if ang > 90.0: ang = 180.0 - ang
+           length_px = float(np.hypot(dx, dy))
+           length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
+        #   颜色：近竖直=绿色，近水平=蓝色，其余=灰白
+           color = (200,200,200)
+           if ang >= 80.0:
+               color = (0,255,0)
+           elif ang <= 10.0:
+               color = (255,0,0)
+           cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
+        #   在中点标注线段索引
+           mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
+           try:
+               cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+           except Exception:
+               pass
+       #绘制角点（使用 paired_corners；不依赖是否生成 X/Q 缺陷）
+       for (ii, jj, cp_arr) in (paired_corners or []):
+          try:
+              cx, cy = float(cp_arr[0]), float(cp_arr[1])
+              cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
+              cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
+          except Exception:
+              continue
 
-    #    已移除演示射线，仅保留真实命中射线在缺陷绘制阶段显示
-    # except Exception:
-    #    pass
+       #已移除演示射线，仅保留真实命中射线在缺陷绘制阶段显示
+    except Exception:
+       pass
     
     for defect_report in final_defects_for_report:
         defect = defect_report['raw_defect']

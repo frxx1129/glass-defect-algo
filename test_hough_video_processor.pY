@@ -166,19 +166,47 @@ def main():
         # 文件夹模式下无需视频写入，直接完成
 
     elif os.path.isfile(input_path):
-        print(f"\n--- 开始处理视频: {args.input} ---")
-        # 预先解析扩展名以判断是否为 WebM，并尽量使用 FFMPEG 后端以提升兼容性
+        # 解析扩展名，区分“单张图片”与“视频文件”
         base_filename, input_ext = os.path.splitext(os.path.basename(input_path))
         input_ext = input_ext.strip().strip('`"\'')
-        is_webm = (input_ext.lower() == '.webm') or base_filename.lower().endswith('.webm')
+        ext_lower = input_ext.lower()
+        image_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
 
-        if is_webm:
-            cap = cv2.VideoCapture(input_path, cv2.CAP_FFMPEG)
-            if not cap.isOpened():
-                # 回退到默认后端再试一次
-                cap = cv2.VideoCapture(input_path)
+        if ext_lower in image_exts:
+            # --- 单张图片模式：直接按原格式保存标注结果 ---
+            print(f"\n--- 开始处理图片: {args.input} ---")
+            frame = cv2.imread(input_path)
+            if frame is None:
+                print(f"错误: 无法读取图片 '{args.input}'。")
+                return
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            result, annotated_image = process_frame_task(gray_frame, cam_index, config, shared_settings, roi_cache)
+
+            print(f"  报告: 状态={result['image_status']}, state_code={result['state_code']}, 缺陷数={len(result['defects'])}")
+
+            # 输出文件名：原名 + _annotated + 原扩展名
+            out_base = base_filename
+            output_image_path = os.path.join(args.output, f"{out_base}_annotated{input_ext}")
+            report_output_path = os.path.join(args.output, f"{out_base}_report.json")
+
+            cv2.imwrite(output_image_path, annotated_image)
+            with open(report_output_path, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+
+            total_items = 1
+
         else:
-            cap = cv2.VideoCapture(input_path)
+            print(f"\n--- 开始处理视频: {args.input} ---")
+            # 预先解析扩展名以判断是否为 WebM，并尽量使用 FFMPEG 后端以提升兼容性
+            is_webm = (ext_lower == '.webm') or base_filename.lower().endswith('.webm')
+
+            if is_webm:
+                cap = cv2.VideoCapture(input_path, cv2.CAP_FFMPEG)
+                if not cap.isOpened():
+                    # 回退到默认后端再试一次
+                    cap = cv2.VideoCapture(input_path)
+            else:
+                cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
             print(f"错误: 无法打开视频文件 '{args.input}'。")
             return

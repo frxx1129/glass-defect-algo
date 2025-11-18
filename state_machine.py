@@ -114,6 +114,27 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             pass
         return max_mark, line_map
 
+    def _suppress_q_for_multi_vertical_cam(result_obj: dict) -> None:
+        """若该相机任一 ROI 的 near_vertical_line_count>=2，则剔除所有 Q 缺陷；
+        若剔除后已无缺陷，则将 image_status 设置为 'OK'。
+        """
+        try:
+            rois = result_obj.get('rois', []) or []
+            if not isinstance(rois, list) or not rois:
+                return
+            has_multi_vert = any(int(r.get('near_vertical_line_count', 0) or 0) >= 2 for r in rois)
+            if not has_multi_vert:
+                return
+            defs = result_obj.get('defects')
+            if isinstance(defs, list):
+                kept = [d for d in defs if str(d.get('type', '')).upper() != 'Q']
+                result_obj['defects'] = kept
+                if not kept:
+                    # 无其他缺陷，视为 OK 帧
+                    result_obj['image_status'] = 'OK'
+        except Exception:
+            pass
+
     def _decide_route_marks_for_auto(expected_cams: int, ng_cams: set, shared_settings) -> list[int] | None:
         """依据规则决定'标记'(0..max_mark) 列表，用于剔废触发；不再返回语义字符串。
         约定：

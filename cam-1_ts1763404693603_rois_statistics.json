@@ -1,0 +1,29 @@
+{
+    "average_roi_overall": {
+        "x": 290,
+        "y": 811,
+        "width": 2141,
+        "height": 163
+    },
+    "total_images_annotated": 1,
+    "total_rois_annotated": 2,
+    "detailed_data": [
+        {
+            "filename": "cam-1_ts1763404693603.jpg",
+            "rois": [
+                [
+                    286,
+                    550,
+                    2145,
+                    162
+                ],
+                [
+                    294,
+                    1072,
+                    2138,
+                    164
+                ]
+            ]
+        }
+    ]
+}
