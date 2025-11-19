@@ -4132,7 +4132,12 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         d.pop('raw_defect', None)
 
     roi_color = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
-    # 不再绘制 intersections 与示例射线
+
+    # 可视化：用亮黄色标出 Canny 边缘（用于缺角二次验证）
+    # if binary_edges is not None:
+    #     roi_color[binary_edges > 0] = [0, 255, 255]
+
+
     # 可视化颜色：'E'（边缘异常）使用红色；注意为 BGR 通道顺序
     DEFECT_COLORS_BGR = {'Q': (0, 0, 255), 'E': (0, 0, 255), 'X': (255, 0, 0), 'L': (255, 0, 255), 'B': (0, 165, 255)}
     p_vis = params["VISUALIZATION"]
