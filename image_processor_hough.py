@@ -2332,7 +2332,12 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         dist_min = float(np.min(np.linalg.norm(cnt_pts - cp, axis=1))) if cnt_pts.size > 0 else 9999.0
                     except Exception:
                         dist_min = 9999.0
-                    if dist_min <= 14.4:
+                    # 从配置读取角点到主体轮廓的最小距离阈值（像素），默认 16.0
+                    try:
+                        min_corner_dist_px = float(params.get('DEFECT_DETECTION', {}).get('Q_CORNER_CONTOUR_MIN_DIST_PX', 16.0))
+                    except Exception:
+                        min_corner_dist_px = 16.0
+                    if dist_min <= float(min_corner_dist_px):
                         continue
                     # 方向判定改为“基于轮廓的双向试探”：对每条主边，分别沿端点方向发射射线，选择命中距离更近的一侧
                     inter_hits = []  # (point, edge_index)
