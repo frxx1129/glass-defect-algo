@@ -66,6 +66,10 @@ def _update_glass_boundaries(roi_key, vertical_x_list, params):
     """记录多玻璃之间的候选分隔线(边界), 与栅栏不同: 边界是两块玻璃之间的中线。
     当帧内存在至少两条近竖直边且最大间隙>=配置阈值时, 取该最大间隙的中点作为候选边界。累积若干帧后取中位数稳定化。
     """
+    # 若已生成边界，不再累积历史，避免内存泄漏
+    if roi_key in _roi_glass_boundaries:
+        return
+
     try:
         need_frames = int(params.get('DEFECT_DETECTION', {}).get('GLASS_BOUNDARY_STABLE_FRAMES', 5))
     except Exception:
@@ -88,17 +92,23 @@ def _update_glass_boundaries(roi_key, vertical_x_list, params):
         return
     hist = _roi_glass_boundary_history.setdefault(roi_key, [])
     hist.append(mid_pt)
-    if len(hist) >= need_frames and roi_key not in _roi_glass_boundaries:
+    if len(hist) >= need_frames:
         try:
             _roi_glass_boundaries[roi_key] = float(np.median(np.array(hist, dtype=float)))
         except Exception:
             _roi_glass_boundaries[roi_key] = mid_pt
+        # 生成后清空历史以释放内存
+        _roi_glass_boundary_history[roi_key] = []
 
 def _get_glass_boundary(roi_key):
     return _roi_glass_boundaries.get(roi_key, None)
 
 def _update_vertical_fences(roi_key, vertical_x_list, params):
     """更新竖直边历史并在达到设定帧数后生成栅栏。"""
+    # 若已生成栅栏，不再累积历史，避免内存泄漏
+    if roi_key in _roi_fences:
+        return
+
     try:
         fence_frames = int(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_EXTEND_FENCE_INIT_FRAMES', 10))
     except Exception:
@@ -136,6 +146,8 @@ def _update_vertical_fences(roi_key, vertical_x_list, params):
             _roi_fences[roi_key] = fences
         except Exception:
             _roi_fences[roi_key] = []
+        # 生成后清空历史以释放内存
+        _roi_vertical_history[roi_key] = []
 
 def _get_fences_for_roi(roi_key):
     return _roi_fences.get(roi_key, [])
