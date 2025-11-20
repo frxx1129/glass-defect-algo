@@ -85,34 +85,56 @@ def rejection_handler_thread(rejection_queue, rejection_controller, stop_event, 
                 time.sleep(sleep_duration)
 
             # 解析 route -> marks -> channels
+            try:
+                burst_count = int(getattr(shared_settings, 'rejection_pulse_burst_count', 10) or 10)
+            except Exception:
+                burst_count = 10
+            try:
+                on_ms = int(getattr(shared_settings, 'rejection_pulse_on_ms', 250) or 250)
+            except Exception:
+                on_ms = 250
+            try:
+                cycle_ms = int(getattr(shared_settings, 'rejection_pulse_cycle_ms', 500) or 500)
+            except Exception:
+                cycle_ms = 500
             if pulse_override_ms is not None:
                 try:
-                    pulse_ms = int(pulse_override_ms)
+                    approx_total = max(0, int(pulse_override_ms))
+                    if cycle_ms > 0:
+                        burst_count = max(1, int(round(approx_total / cycle_ms)))
                 except Exception:
-                    pulse_ms = 0
-            else:
-                try:
-                    pulse_ms = int(getattr(shared_settings, 'REJECTION_PULSE_MS', 100) or 100)
-                except Exception:
-                    pulse_ms = 100
+                    pass
+            burst_count = max(1, burst_count)
+            on_ms = max(10, on_ms)
+            cycle_ms = max(on_ms, cycle_ms)
+            off_ms = max(0, cycle_ms - on_ms)
 
-            pulse_ms = max(8000, pulse_ms)
+            on_duration = on_ms / 1000.0
+            off_duration = off_ms / 1000.0
 
             channels = _resolve_marks_to_channels(route, shared_settings)
             if not channels:
                 # 若未给出 route/marks，则不触发
                 continue
 
-            # 同步触发：ON 所有 -> 延时 -> OFF 所有
-            try:
-                for ch in channels:
-                    rejection_controller.send_command(ch, 0x01)
-                time.sleep(max(0.0, pulse_ms / 1000.0))
-                for ch in channels:
-                    rejection_controller.send_command(ch, 0x00)
-                print(f"[剔除处理器线程]: 同步触发 - marks={route}, channels={channels}, duration={pulse_ms}ms")
-            except Exception as e:
-                print(f"[剔除处理器线程]: 触发失败: {e}")
+            # 同步触发：burst_count 组脉冲，每组 on_ms ON，off_ms OFF（总周期 cycle_ms）
+            for burst_idx in range(burst_count):
+                try:
+                    for ch in channels:
+                        rejection_controller.send_command(ch, 0x01)
+                except Exception as e:
+                    print(f"[剔除处理器线程]: 通道上电失败: {e}")
+                    break
+                time.sleep(on_duration)
+                try:
+                    for ch in channels:
+                        rejection_controller.send_command(ch, 0x00)
+                except Exception as e:
+                    print(f"[剔除处理器线程]: 通道断电失败: {e}")
+                    break
+                if burst_idx < burst_count - 1 and off_duration > 0:
+                    time.sleep(off_duration)
+            print(f"[剔除处理器线程]: 脉冲串触发 - marks={route}, channels={channels}, burst={burst_count}, on={on_ms}ms, cycle={cycle_ms}ms")
         except Empty:
             continue
         except Exception as e:

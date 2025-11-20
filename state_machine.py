@@ -812,8 +812,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
 
                     if marks:
                         rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
-                        auto_pulse_ms = max(8000, int(getattr(shared_settings, 'auto_rejection_pulse_ms', getattr(shared_settings, 'REJECTION_PULSE_MS', 1000)) or 8000))
-                        rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index, marks, auto_pulse_ms))
+                        rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index, marks))
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                             try:
                                 alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
