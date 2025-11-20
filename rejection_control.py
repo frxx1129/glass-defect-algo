@@ -64,11 +64,14 @@ def rejection_handler_thread(rejection_queue, rejection_controller, stop_event, 
             payload = rejection_queue.get(timeout=0.1)
             # 兼容旧格式: (fire_time, cam_index)
             if isinstance(payload, (list, tuple)):
+                pulse_override_ms = None
                 if len(payload) == 2:
                     fire_time, cam_index = payload
                     route = None
                 elif len(payload) == 3:
                     fire_time, cam_index, route = payload
+                elif len(payload) == 4:
+                    fire_time, cam_index, route, pulse_override_ms = payload
                 else:
                     # 不支持的格式，跳过
                     continue
@@ -82,10 +85,18 @@ def rejection_handler_thread(rejection_queue, rejection_controller, stop_event, 
                 time.sleep(sleep_duration)
 
             # 解析 route -> marks -> channels
-            try:
-                pulse_ms = int(getattr(shared_settings, 'REJECTION_PULSE_MS', 100) or 100)
-            except Exception:
-                pulse_ms = 100
+            if pulse_override_ms is not None:
+                try:
+                    pulse_ms = int(pulse_override_ms)
+                except Exception:
+                    pulse_ms = 0
+            else:
+                try:
+                    pulse_ms = int(getattr(shared_settings, 'REJECTION_PULSE_MS', 100) or 100)
+                except Exception:
+                    pulse_ms = 100
+
+            pulse_ms = max(8000, pulse_ms)
 
             channels = _resolve_marks_to_channels(route, shared_settings)
             if not channels:

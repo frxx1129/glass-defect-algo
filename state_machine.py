@@ -85,7 +85,6 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     # 自动分路：每片玻璃内的 NG 汇聚与一次性触发
     auto_ng_cams = set()           # 出现NG的相机集合（逻辑索引）
     last_result_by_cam = {}        # 最近一帧NG结果（含缺陷坐标）的引用
-    auto_first_ng_ts_ms = None     # 第一次检测到NG的时间（毫秒）
     # 新增：按整片玻璃周期统计的“竖直边总数”的最大值（跨相机求和，跨时刻取最大）
     pane_max_total_vertical_count = 0
 
@@ -236,16 +235,35 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             pass
         return 0
 
-    def _estimate_piece_count(cam_vertical_counts: dict) -> int:
-        """根据每相机的近竖直线数量估计切割片数（1~4）。
-        粗略规则：cut_count = min( len([ci for cnt>=2]), 3 ); piece_count = cut_count + 1。
-        """
+    def _estimate_piece_count(cam_vertical_counts: dict, expected_cams: int) -> int:
+        """依据全相机竖直边总量估计玻璃片数，并优先参考中间相机的分割线。"""
         try:
-            indicators = [ci for ci, cnt in cam_vertical_counts.items() if int(cnt or 0) >= 2]
-            cut_count = min(len(indicators), 3)
-            return cut_count + 1 if cut_count >= 1 else 1
+            total_edges = int(sum(max(0, int(cnt or 0)) for cnt in cam_vertical_counts.values()))
         except Exception:
+            total_edges = 0
+        if total_edges <= 0:
             return 1
+        try:
+            rough = int(round(total_edges / 2.0))
+        except Exception:
+            rough = 1
+        rough = max(1, min(4, rough if rough >= 1 else 1))
+        try:
+            n = int(expected_cams or 0)
+            center = (n - 1) / 2.0 if n > 0 else 0.0
+            center_edges = 0
+            for ci, cnt in cam_vertical_counts.items():
+                try:
+                    if abs(float(ci) - center) <= 1.0:
+                        center_edges += max(0, int(cnt or 0))
+                except Exception:
+                    continue
+            if center_edges > 0:
+                center_cuts = int(round(center_edges / 2.0))
+                rough = max(rough, min(4, center_cuts + 1))
+        except Exception:
+            pass
+        return rough
 
     def _gather_defect_centers_for_cam(result_obj: dict) -> list[float]:
         """提取单相机内缺陷的 x 中心（像素）。优先 location(x,width)，否则 center[0]；无法得到返回空。"""
@@ -272,13 +290,13 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     def _decide_marks_by_pieces_and_positions(cam_vertical_counts: dict, last_result_by_cam: dict, expected_cams: int, shared_settings, piece_count_override: int | None = None) -> list[int] | None:
         """
         依据估计的切片数（1~4）以及缺陷位置，返回需要触发的'标记'集合：
-        - 1 切 2 块 -> 允许 {0,1,2}，优先给出属于缺陷所在块的标记（1 或 2）；
-          中间相机(5路的cam2)用相机内 X 坐标区分左右（小->1，大->2）。
-        - 2 切 3 块 -> 允许 {0,1,2,3}，按全局位置映射至 1/2/3；
-        - 3 切 4 块 -> 允许 {0,1,2,3,4}，按全局位置映射至 1..4；
+                - 1 切 2 块 -> 允许 {0,1,2}，优先给出属于缺陷所在块的标记（1=最右，2=最左）；
+                    中间相机(5路的cam2)用相机内 X 坐标区分左右（像素小->左->2，像素大->右->1）。
+                - 2 切 3 块 -> 允许 {0,1,2,3}，按全局位置映射至 1/2/3（1=最右，3=最左）；
+                - 3 切 4 块 -> 允许 {0,1,2,3,4}，按全局位置映射至 1..4（1=最右，4=最左）；
         - 若无法判定，兜底 [0]。
         """
-        piece_count = piece_count_override if isinstance(piece_count_override, int) and piece_count_override >= 1 else _estimate_piece_count(cam_vertical_counts)
+        piece_count = piece_count_override if isinstance(piece_count_override, int) and piece_count_override >= 1 else _estimate_piece_count(cam_vertical_counts, expected_cams)
         if piece_count <= 1:
             return [0]
 
@@ -327,19 +345,20 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         for ci, x in samples:
             if piece_count == 2:
                 if ci < center:
-                    marks.add(1)
-                elif ci > center:
                     marks.add(2)
+                elif ci > center:
+                    marks.add(1)
                 else:
                     # 中间相机：按 x 分左右
                     if x is not None and cam_w > 1e-6:
-                        marks.add(1 if x < (cam_w / 2.0) else 2)
+                        marks.add(2 if x < (cam_w / 2.0) else 1)
                     else:
                         marks.add(1)
             elif piece_count in (3, 4):
-                marks.add(_global_piece_index(ci, x))
+                idx = _global_piece_index(ci, x)
+                marks.add(piece_count - idx + 1)
             else:
-                marks.add(1)
+                marks.add(piece_count)
 
         # 将标记限制在 [1..max_mark] 范围内（0 保留为整片撤清，非此处产生）
         final_marks = sorted({m for m in marks if 1 <= m <= max_mark})
@@ -348,13 +367,14 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     def build_report_for_frame(result_obj, rejection_details_to_save):
         defects = result_obj.get('defects', [])
         def primary_size(d):
-            # 修改：按缺陷的“最短边”来确定尺寸标签
+            """缺陷尺寸标签：E 用最长边，其余维持最短边。"""
             loc = d.get('location', {})
             length = float(loc.get('length_mm', 0) or 0)
             width = float(loc.get('width_mm', 0) or 0)
             if length <= 0 and width <= 0:
                 return 0.0
-            return min(length, width)
+            defect_type = str(d.get('type', '')).upper()
+            return max(length, width) if defect_type == 'E' else min(length, width)
         # 汇总：取所有缺陷“最短边”的最大值，作为 size_label 的数值
         max_defect_size = max([primary_size(d) for d in defects] or [0])
         # 仅在存在 X 型时追加 'X' 标签；E 不追加字母，仅以尺寸参与 size_label
@@ -459,7 +479,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         nonlocal machine_state, last_camera_states, current_pane_ng_buffer, current_pane_reports, current_pane_folder
         nonlocal pane_ng_frame_counter, max_complexity_snapshot, is_current_event_rejected, manual_reject_active_mode
         nonlocal rejection_details, saved_for_this_pane, presence_streak, absence_streak, pane_enter_time_s
-        nonlocal auto_ng_cams, last_result_by_cam, auto_first_ng_ts_ms, pane_max_total_vertical_count
+        nonlocal auto_ng_cams, last_result_by_cam, pane_max_total_vertical_count
         try:
             machine_state = "WAITING_FOR_PANE"
             machine_state_shared.value = 0
@@ -492,7 +512,6 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             auto_ng_cams.clear(); last_result_by_cam.clear()
         except Exception:
             pass
-        auto_first_ng_ts_ms = None
         pane_max_total_vertical_count = 0
         # 灯光恢复为正常状态
         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
@@ -647,7 +666,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
                         is_current_event_rejected = False
                         # 重置自动分路聚合状态
-                        auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
+                        auto_ng_cams.clear(); last_result_by_cam.clear()
                         pane_max_total_vertical_count = 0
                         pane_enter_time_s = None
                         continue
@@ -691,7 +710,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                 yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
                             broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
                         is_current_event_rejected = False
-                        auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
+                        auto_ng_cams.clear(); last_result_by_cam.clear()
                         pane_max_total_vertical_count = 0
                         pane_enter_time_s = None
                         continue
@@ -745,144 +764,118 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         cam_i = int(result['camera_index'])
                         auto_ng_cams.add(cam_i)
                         last_result_by_cam[cam_i] = result
-                        if auto_first_ng_ts_ms is None:
-                            auto_first_ng_ts_ms = int(time.time() * 1000)
                     except Exception:
                         pass
 
                 if np.sum(last_camera_states) > np.sum(max_complexity_snapshot):
                     max_complexity_snapshot = last_camera_states.copy()
 
-                if not is_current_event_rejected:
-                    # 自动剔废：汇聚后一次性分路触发
-                    # 仅当进入后持续时间达到 enter_min_time_s 才允许触发自动剔废，避免瞬时误触发
-                    dwell_ok = (pane_enter_time_s is not None) and ((time.time() - pane_enter_time_s) >= enter_min_time_s)
-                    if shared_rejection_mode.value == 1 and result.get('should_reject', False) and dwell_ok:
-                        try:
-                            hold_ms = int(getattr(shared_settings, 'auto_route_decision_hold_ms', 120) or 120)
-                        except Exception:
-                            hold_ms = 120
-                        now_ms = int(time.time() * 1000)
-                        can_decide_time = (auto_first_ng_ts_ms is not None) and (now_ms - auto_first_ng_ts_ms >= hold_ms)
-                        expected = int(getattr(shared_settings, 'expected_cameras', num_cameras) or num_cameras)
-                        # 新：基于竖直线统计的'标记'决策（0 起始）
-                        # 新增：基于竖直线统计的多路剔废逻辑
-                        try:
-                            # 汇总每个相机的“近竖直主边”数量
-                            vertical_counts = {}
-                            for ci, res in last_result_by_cam.items():
-                                vertical_counts[ci] = _count_near_vertical_per_cam(res)
-                            if vertical_counts:
-                                # 新规则：跨相机求和，并在整个玻璃周期内取最大值
-                                current_total_vertical = int(sum(int(v or 0) for v in vertical_counts.values()))
-                                if current_total_vertical > pane_max_total_vertical_count:
-                                    pane_max_total_vertical_count = current_total_vertical
-                                # 将“最大竖直边总数”换算为切片数：2->1片，4->2片，6->3片，最大4片
-                                try:
-                                    piece_count_override = max(1, min(4, int(round(pane_max_total_vertical_count / 2.0))))
-                                except Exception:
-                                    piece_count_override = 1
-                                # 结合缺陷位置计算应触发的标记集合
-                                marks = _decide_marks_by_pieces_and_positions(
-                                    vertical_counts, last_result_by_cam, expected, shared_settings,
-                                    piece_count_override=piece_count_override
-                                )
-                                if marks:
-                                    is_current_event_rejected = True
-                                    saved_for_this_pane = True
-                                    rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
-                                    # 将 '标记' 列表直接作为 route 传入，由剔废线程按 lineName 映射后“同步触发”
-                                    rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index, marks))
-                                    if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
-                                        try:
-                                            alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
-                                        except Exception:
-                                            pass
-                                    with stats_lock:
-                                        total_rejections += 1
-                                        shared_rejection_counter.value = total_rejections
-                                        yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
-                                    broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                                    print(f"    [状态机]: 基于竖直线统计剔废触发，marks={marks}，counts={vertical_counts}")
-                                    continue
-                        except Exception as e:
-                            print(f"[状态机]: 竖直线分路逻辑异常: {e}")
-                        # 若未得到 marks，则按 NG 分布兜底生成 '标记' 路由
-                        marks_fallback = None
-                        if can_decide_time:
-                            if expected == 5 and auto_ng_cams == {2}:
-                                # 用坐标决定左右 -> 1 或 max_mark
-                                base_res = last_result_by_cam.get(2)
-                                if base_res:
-                                    side = _decide_left_right_by_coord_for_cam2(base_res)
-                                    max_mark, _ = _get_line_mark_info(shared_settings)
-                                    if side == 'right':
-                                        marks_fallback = [1]
-                                    elif side == 'left':
-                                        marks_fallback = [max_mark]
-                            if marks_fallback is None and len(auto_ng_cams) >= 1:
-                                marks_fallback = _decide_route_marks_for_auto(expected, auto_ng_cams, shared_settings)
-                                if marks_fallback is None and len(auto_ng_cams) >= 3:
-                                    marks_fallback = [0]
-                        if marks_fallback is not None:
-                            is_current_event_rejected = True
-                            saved_for_this_pane = True
-                            rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
-                            rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index, marks_fallback))
-                            if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
-                                try:
-                                    alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
-                                except Exception:
-                                    pass
-                            with stats_lock:
-                                total_rejections += 1
-                                shared_rejection_counter.value = total_rejections
-                                yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
-                            broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                            print(f"    [状态机]: 自动剔废触发，marks={marks_fallback}，NG相机={sorted(list(auto_ng_cams))}")
-                    # 即时手动剔废：任何时候都可触发。始终执行硬件动作；仅在有NG缓存时才追加上传
-                    elif manual_reject_flag.value:
-                        is_current_event_rejected = True
-                        manual_reject_flag.value = False
-                        # 触发后，自当前时刻起，直到该片离开，均标记为“手动剔废模式”
-                        manual_reject_active_mode = True
-                        rejection_details = {"rejection_time": datetime.now(), "rejection_type": "2"}
-                        try:
-                            route = getattr(shared_settings, 'manual_reject_route', None)
-                        except Exception:
-                            route = None
-                        rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, -1, route))
+                auto_reject_ready = (shared_rejection_mode.value == 1 and result.get('should_reject', False))
+                if auto_reject_ready:
+                    expected = int(getattr(shared_settings, 'expected_cameras', num_cameras) or num_cameras)
+                    marks = None
+                    vertical_counts = {}
+                    try:
+                        for ci, res in last_result_by_cam.items():
+                            vertical_counts[ci] = _count_near_vertical_per_cam(res)
+                        piece_count_override = None
+                        if vertical_counts:
+                            current_total_vertical = int(sum(int(v or 0) for v in vertical_counts.values()))
+                            if current_total_vertical > pane_max_total_vertical_count:
+                                pane_max_total_vertical_count = current_total_vertical
+                            try:
+                                piece_count_override = max(1, min(4, int(round(pane_max_total_vertical_count / 2.0))))
+                            except Exception:
+                                piece_count_override = 1
+                            marks = _decide_marks_by_pieces_and_positions(
+                                vertical_counts, last_result_by_cam, expected, shared_settings,
+                                piece_count_override=piece_count_override
+                            )
+                    except Exception as e:
+                        print(f"[状态机]: 竖直线分路逻辑异常: {e}")
+
+                    if not marks:
+                        marks = None
+                        if expected == 5 and auto_ng_cams == {2}:
+                            base_res = last_result_by_cam.get(2)
+                            if base_res:
+                                side = _decide_left_right_by_coord_for_cam2(base_res)
+                                max_mark, _ = _get_line_mark_info(shared_settings)
+                                if side == 'right':
+                                    marks = [1]
+                                elif side == 'left':
+                                    marks = [max_mark]
+                        if marks is None and len(auto_ng_cams) >= 1:
+                            marks = _decide_route_marks_for_auto(expected, auto_ng_cams, shared_settings)
+                            if marks is None and len(auto_ng_cams) >= 3:
+                                marks = [0]
+
+                    if marks:
+                        rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
+                        auto_pulse_ms = max(8000, int(getattr(shared_settings, 'auto_rejection_pulse_ms', getattr(shared_settings, 'REJECTION_PULSE_MS', 1000)) or 8000))
+                        rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index, marks, auto_pulse_ms))
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                             try:
                                 alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
                             except Exception:
                                 pass
-                        with stats_lock:
-                            total_rejections += 1
-                            shared_rejection_counter.value = total_rejections
-                            yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
-                        broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                        print("    [状态机]: 即时手动剔废触发！")
-                        # 可选上传：只有当当前片有NG缓存时才上传
-                        if current_pane_ng_buffer and current_pane_reports:
-                            # 在即时上传前，保存当前片中所有 NG 帧的未标注原图
-                            try:
-                                for res_item in current_pane_ng_buffer:
-                                    raw_buf = res_item.get('raw_image_buffer')
-                                    if not raw_buf:
-                                        continue
-                                    ts = float(res_item.get('timestamp', time.time()) or time.time())
-                                    cam_idx = int(res_item.get('camera_index', -1) or -1)
-                                    day_dir = time.strftime('%Y-%m-%d', time.localtime(ts))
-                                    out_dir = os.path.join(STORAGE_PATH, day_dir, 'original')
-                                    os.makedirs(out_dir, exist_ok=True)
-                                    ms = int(ts * 1000)
-                                    out_name = f"cam{cam_idx}_ts{ms}.jpg"
-                                    with open(os.path.join(out_dir, out_name), 'wb') as f:
-                                        f.write(raw_buf)
-                            except Exception as e:
-                                print(f"[状态机]: 手动剔废即时上传前保存未标注原图失败: {e}")
-                            send_reports_batch_to_server(current_pane_reports, [r.get('annotated_image_buffer') for r in current_pane_ng_buffer], shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
+                        newly_rejected = False
+                        if not is_current_event_rejected:
+                            newly_rejected = True
+                            is_current_event_rejected = True
+                            saved_for_this_pane = True
+                            with stats_lock:
+                                total_rejections += 1
+                                shared_rejection_counter.value = total_rejections
+                                yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                            broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                        else:
+                            saved_for_this_pane = True
+                        log_counts = vertical_counts if vertical_counts else 'N/A'
+                        if newly_rejected:
+                            print(f"    [状态机]: 自动剔废触发，marks={marks}，counts={log_counts}")
+                        else:
+                            print(f"    [状态机]: 自动剔废重复触发，marks={marks}，counts={log_counts}")
+
+                if manual_reject_flag.value:
+                    is_current_event_rejected = True
+                    manual_reject_flag.value = False
+                    manual_reject_active_mode = True
+                    rejection_details = {"rejection_time": datetime.now(), "rejection_type": "2"}
+                    try:
+                        route = getattr(shared_settings, 'manual_reject_route', None)
+                    except Exception:
+                        route = None
+                    rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, -1, route))
+                    if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                        try:
+                            alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
+                        except Exception:
+                            pass
+                    with stats_lock:
+                        total_rejections += 1
+                        shared_rejection_counter.value = total_rejections
+                        yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
+                    broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
+                    print("    [状态机]: 即时手动剔废触发！")
+                    if current_pane_ng_buffer and current_pane_reports:
+                        try:
+                            for res_item in current_pane_ng_buffer:
+                                raw_buf = res_item.get('raw_image_buffer')
+                                if not raw_buf:
+                                    continue
+                                ts = float(res_item.get('timestamp', time.time()) or time.time())
+                                cam_idx = int(res_item.get('camera_index', -1) or -1)
+                                day_dir = time.strftime('%Y-%m-%d', time.localtime(ts))
+                                out_dir = os.path.join(STORAGE_PATH, day_dir, 'original')
+                                os.makedirs(out_dir, exist_ok=True)
+                                ms = int(ts * 1000)
+                                out_name = f"cam{cam_idx}_ts{ms}.jpg"
+                                with open(os.path.join(out_dir, out_name), 'wb') as f:
+                                    f.write(raw_buf)
+                        except Exception as e:
+                            print(f"[状态机]: 手动剔废即时上传前保存未标注原图失败: {e}")
+                        send_reports_batch_to_server(current_pane_reports, [r.get('annotated_image_buffer') for r in current_pane_ng_buffer], shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
 
             elif machine_state == "WAITING_FOR_PANE":
                 if current_total_panes > 0:
@@ -939,7 +932,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         presence_streak = 0
                         absence_streak = 0
                         # 重置自动分路聚合状态
-                        auto_ng_cams.clear(); last_result_by_cam.clear(); auto_first_ng_ts_ms = None
+                        auto_ng_cams.clear(); last_result_by_cam.clear()
                         pane_max_total_vertical_count = 0
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                             try:

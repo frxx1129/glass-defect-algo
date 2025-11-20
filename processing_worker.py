@@ -10,23 +10,16 @@ import fused_image_processor
 import copy
 
 def should_reject_pane(pane_json, shared_settings, pixels_per_mm):
-    """根据缺陷类型与尺寸判定是否剔废。
-    规则：
-    - Q(缺角) 与 E(边缘异常，兼容旧 X) 直接判定剔废。
-    - B(崩边)、L(裂纹) 若任一缺陷的 length_mm 或 width_mm >= 阈值(max_defect_size_mm) 判定剔废。
-    - 其余或无缺陷 => 不剔废。
-    """
+    """根据缺陷类型与尺寸判定是否剔废：Q/E/B/L/X 均按照尺寸阈值处理。"""
     if pane_json.get('image_status') == 'OK':
         return False
     max_size_thresh = float(getattr(shared_settings, 'max_defect_size_mm', 20))
     for defect in pane_json.get('defects', []):
-        defect_type = defect.get('type')
-        # 直接剔废：缺角(Q) 与 边缘异常(E)；保留对历史 X 的兼容
-        if defect_type in ('E', 'X', 'Q'):
+        defect_type = str(defect.get('type', '')).upper()
+        if defect_type == 'X':
             return True
-        # 按尺寸阈值剔废：崩边/裂纹
-        if defect_type in ('B', 'L'):
-            loc = defect.get('location', {})
+        if defect_type in ('B', 'L', 'Q', 'E'):
+            loc = defect.get('location', {}) or {}
             length_mm = float(loc.get('length_mm', 0) or 0)
             width_mm = float(loc.get('width_mm', 0) or 0)
             if max(length_mm, width_mm) >= max_size_thresh:
