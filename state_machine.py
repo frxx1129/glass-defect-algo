@@ -810,6 +810,10 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             if marks is None and len(auto_ng_cams) >= 3:
                                 marks = [0]
 
+                    # 最外层兜底：只要有 NG 相机且 should_reject，本帧仍算不出 marks，则整片剔 [0]
+                    if not marks and len(auto_ng_cams) >= 1:
+                        marks = [0]
+
                     if marks:
                         # 每一帧 should_reject 的 NG 图像都入队执行剔废脉冲，不管当前玻璃是否已判定过剔除
                         rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index, marks))
