@@ -7,7 +7,7 @@ import json
 from camera_manager import CameraManager, MultiCameraSetup
 from GigECamera_Types import TriggerMode_On, TriggerMode_Off, TriggerSource_Software, TriggerActivation_RisingEdge, MVStreamCB  # noqa
 from MVGigE import *
-from genenrate_test_image import generate_test_image
+from generate_test_image import generate_test_image
 import platform
 import ctypes
 
@@ -221,7 +221,7 @@ def _camera_worker_process(cam_index: int, task_queue, stop_event, run_event, co
 
 def _test_camera_worker_process(cam_index: int, task_queue, stop_event, run_event, capture_interval_s: float,
                                 shared_states):
-    from genenrate_test_image import generate_test_image
+    from generate_test_image import generate_test_image
     shared_states[cam_index] = {"status": "Connected (Test Mode)"}
     last_emit_ts = 0.0
     while not stop_event.is_set():
