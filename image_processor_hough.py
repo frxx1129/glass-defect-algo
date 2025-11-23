@@ -2695,15 +2695,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
 
     # 仅使用角点 + 轮廓三角法作为缺角(Q)检测结果
     rect_q_defects = corner_contour_q_defects
-    # 若本 ROI 中“原始近竖直直线”数量>=2，则过滤掉该相机在本 ROI 内产生的所有 Q 缺陷
-    # 说明：这里在 Q 级别直接清空，后续 E/B 等不受影响；进入/离开逻辑仍由状态机根据 rois 统计
-    try:
-        if int(raw_vertical_cnt) >= 2:
-            if _DBG_PRINT and _DBG_LEVEL >= 1:
-                _dprint(f"[DBG] suppress Q-defects in ROI: raw_vertical_cnt={raw_vertical_cnt}>=2")
-            rect_q_defects = []
-    except Exception:
-        pass
+
     # 若聚类凸包相交，则阻断 Q 生成（相机级别过滤在上层进行）
     if 'qx_blocked' in locals() and bool(qx_blocked):
         rect_q_defects = []

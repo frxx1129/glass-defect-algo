@@ -811,30 +811,30 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                 marks = [0]
 
                     if marks:
-                        rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
+                        # 每一帧 should_reject 的 NG 图像都入队执行剔废脉冲，不管当前玻璃是否已判定过剔除
                         rejection_queue.put((time.time() + shared_settings.REJECTION_DELAY_S, cam_index, marks))
-                        if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
-                            try:
-                                alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
-                            except Exception:
-                                pass
-                        newly_rejected = False
+
+                        # 统计与上传仍按"每片玻璃只计一次"的原则：
+                        # 第一次触发自动剔废时更新 rejection_details 和全局计数，其余帧只做硬件剔废，不再重复计数。
+                        log_counts = vertical_counts if vertical_counts else 'N/A'
                         if not is_current_event_rejected:
-                            newly_rejected = True
                             is_current_event_rejected = True
                             saved_for_this_pane = True
+                            rejection_details = {"rejection_time": datetime.now(), "rejection_type": "1"}
                             with stats_lock:
                                 total_rejections += 1
                                 shared_rejection_counter.value = total_rejections
                                 yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
                             broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                        else:
-                            saved_for_this_pane = True
-                        log_counts = vertical_counts if vertical_counts else 'N/A'
-                        if newly_rejected:
+                            if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
+                                try:
+                                    alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
+                                except Exception:
+                                    pass
                             print(f"    [状态机]: 自动剔废触发，marks={marks}，counts={log_counts}")
                         else:
-                            print(f"    [状态机]: 自动剔废重复触发，marks={marks}，counts={log_counts}")
+                            # 已经标记过剔除的玻璃，后续帧继续入队但不再增加计数
+                            print(f"    [状态机]: 自动剔废再次触发（仅硬件），marks={marks}，counts={log_counts}")
 
                 if manual_reject_flag.value:
                     is_current_event_rejected = True
