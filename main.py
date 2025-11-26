@@ -195,41 +195,11 @@ def main():
     except Exception as e:
         sys.exit(f"错误: 无法加载 {cfg_path}: {e}")
 
-    # ================= 运行模式选择 =================
-    # 模式1: 正常检测 (默认)
-    # 模式2: 采集模式 -> 读取 data_collector_config.json 的 camera_setup 参数用于相机采集，并保存ROI裁剪图片
-    data_collection_mode = False
-    try:
-        # 交互式选择；若在无控制台/打包环境失败则回退默认
-        selection = input("请选择运行模式 (1=正常检测 2=采集模式) [默认1]: ").strip()
-        if selection == '2':
-            try:
-                with open('data_collector_config.json', 'r', encoding='utf-8') as f:
-                    collector_cfg = json.load(f)
-                if isinstance(collector_cfg, dict):
-                    # 合并 camera_setup
-                    if 'camera_setup' in collector_cfg:
-                        config['camera_setup'] = collector_cfg['camera_setup']
-                    # 合并 camera_rois (关键: 让处理进程能够读取 test.json)
-                    if 'camera_rois' in collector_cfg:
-                        config['camera_rois'] = collector_cfg['camera_rois']
-                        print(f"[主进程]: 采集模式载入 camera_rois: {collector_cfg['camera_rois']}")
-                    # 若采集配置中指定 roi_template_file 也覆盖（用于启动前越界校验）
-                    if 'roi_template_file' in collector_cfg:
-                        config['roi_template_file'] = collector_cfg['roi_template_file']
-                    data_collection_mode = True
-                    print("[主进程]: 已切换到采集模式 (模式2)，采集配置合并完成")
-                else:
-                    print("[主进程]: data_collector_config.json 结构异常，继续使用原配置 (回退模式1)")
-            except Exception as e:
-                print(f"[主进程]: 读取 data_collector_config.json 失败: {e}，继续使用正常检测模式")
-        else:
-            print("[主进程]: 运行模式=正常检测 (模式1)")
-    except Exception:
-        print("[主进程]: 运行模式选择失败，默认使用正常检测模式 (模式1)")
-
-    # 在配置中标记（供后续模块参考）
-    config['data_collection_mode'] = data_collection_mode
+    # ================= 运行模式选择移除 =================
+    # 直接使用正常检测模式，不再交互选择；若需采集模式可通过配置文件显式设置 data_collection_mode=true。
+    data_collection_mode = bool(config.get('data_collection_mode', False)) and False  # 强制为 False
+    config['data_collection_mode'] = False
+    print("[主进程]: 已开启正常检测模式。")
 
     # --- 启动前校验：ROI 不得越界于相机分辨率 ---
     try:
@@ -708,6 +678,58 @@ def main():
 
     _maintenance_thread = threading.Thread(target=_maintenance_loop, daemon=True)
     _maintenance_thread.start()
+
+    # ============= 状态机故障重启监视线程 =============
+    # 状态机或其它子组件可以设置 shared_settings.request_children_restart = True 来触发一次“全子系统”重启。
+    try:
+        import gc
+    except Exception:
+        gc = None
+    try:
+        shared_settings.request_children_restart = False
+    except Exception:
+        pass
+
+    def _restart_watch_loop():
+        while not stop_event.is_set():
+            time.sleep(1.0)
+            flag = False
+            try:
+                flag = bool(getattr(shared_settings, 'request_children_restart', False))
+            except Exception:
+                flag = False
+            if flag and not stop_event.is_set():
+                print("\n[主进程]: 检测到状态机请求重启子系统，开始执行内存清理与重启...")
+                # 清理标志，避免重复触发
+                try:
+                    shared_settings.request_children_restart = False
+                except Exception:
+                    pass
+                # 软重置状态机（让其在下一代重新启动）
+                try:
+                    setattr(shared_settings, 'request_state_machine_reset', True)
+                except Exception:
+                    pass
+                # 强制释放部分缓存引用
+                try:
+                    for k in list(shared_camera_states.keys()):
+                        shared_camera_states.pop(k, None)
+                except Exception:
+                    pass
+                # 垃圾回收
+                if gc:
+                    try:
+                        gc.collect()
+                    except Exception:
+                        pass
+                # 执行一次重启
+                try:
+                    _restart_children(grace_seconds=5.0)
+                except Exception as e:
+                    print(f"[主进程]: 重启子系统失败: {e}")
+                else:
+                    print("[主进程]: 子系统重启完成。")
+    threading.Thread(target=_restart_watch_loop, daemon=True).start()
     
     # 根据DEBUG_MODE_ON控制前台/后台行为
     debug_mode = bool(config.get('DEBUG_MODE_ON', True))

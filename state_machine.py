@@ -951,4 +951,14 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     # 连续无玻璃：重置帧计数
                     presence_streak = 0
         except Exception as e:
-            print(f"[状态机]: 处理结果时出错: {e}")
+            try:
+                print(f"[状态机]: 处理结果时出错: {e}，请求主进程重启子系统。")
+            except Exception:
+                pass
+            try:
+                shared_settings.request_children_restart = True
+            except Exception:
+                pass
+            # 避免异常风暴导致主进程无法及时响应
+            time.sleep(0.2)
+            continue
