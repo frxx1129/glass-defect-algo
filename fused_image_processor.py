@@ -58,7 +58,11 @@ def _adjust_params_for_dark(params: Dict[str, Any]) -> Dict[str, Any]:
         'Q_CANNY_STRIPE_HALF_WIDTH_PX',
         'Q_CORNER_ALIGNMENT_TOL_PX',
         'Q_TRIANGLE_MIN_AREA_MM2',
-        # 若后续启用块状chipping过滤，可在此补充 BLOCK_* 相关键
+        # 平行四边形排除/聚类过滤相关：
+        'Q_PARALLELOGRAM_EXCLUDE_STRIPE_HALF_PX',
+        'Q_PARALLELOGRAM_USE_DILATE',
+        'Q_PARALLELOGRAM_MIN_EDGE_PIXELS',
+        'Q_PARALLELOGRAM_MIN_SPAN_FRAC',
     ]
     for k in q_keys:
         if k in dd and isinstance(dd[k], (int, float)):
