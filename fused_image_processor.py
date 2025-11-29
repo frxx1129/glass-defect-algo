@@ -38,69 +38,36 @@ def _scale_numeric(value, scale):
 
 
 def _adjust_params_for_dark(params: Dict[str, Any]) -> Dict[str, Any]:
-    """在深色模式下基于浅色参数做动态调整（严格按现有键名）：
-    - PREPROCESSING.CANNY_THRESHOLD_LOW/HIGH -> 30/90
-    - 缺角(Q/chipping)过滤参数 ×0.25：
-      DEFECT_DETECTION 下以下键：
-        Q_CORNER_CONTOUR_MIN_DIST_PX
-        Q_DEFECT_GRADIENT_THRESHOLD
-        Q_DEFECT_SEARCH_WIDTH_PX
-        Q_TRIANGLE_BRIGHTNESS_MARGIN
-        Q_CANNY_STRIPE_HALF_WIDTH_PX
-        Q_TRIANGLE_MIN_AREA_MM2
-        CHIPPING_ENDPOINT_SHIELD_RADIUS_MM
-        CHIPPING_ENDPOINT_SHIELD_RADIUS
-    - 崩边(B)过滤参数 ×1.5：
-      DEFECT_DETECTION 下以下键：
-        B_MERGE_MIN_SIDE_MM
-        B_MAX_DISTANCE_TO_EDGE_MM
-        B_FILTER_DISTANCE_TO_EDGE_MAX_MM
-        B_FILTER_PARALLEL_TOLERANCE_DEG
-        B_FILTER_NEAR_NONQ_INTERSECTION_RADIUS_MM
-        B_TO_L_MIN_AR
-        B_TO_L_PERP_TOLERANCE_DEG
-        B_FILTER_PARALLEL_AR_MIN
-        B_FILTER_PARALLEL_MIN_SIDE_MM
-      以及 RECLASSIFY_B_AS_L_PARAMS 子键：
-        MIN_ASPECT_RATIO, MAX_DISTANCE_MM, MAX_DISTANCE_PX, ANGLE_TOLERANCE, ENDPOINT_SHIELD_RATIO_FOR_EXTENDED
-    """
+
     p = copy.deepcopy(params) if isinstance(params, dict) else {}
 
-    # 1) Canny 阈值提升至 30/90（严格键名）
+    # 1) Canny 阈值提升至 36/96（严格键名）
     try:
         pre = p.setdefault('PREPROCESSING', {})
-        pre['CANNY_THRESHOLD_LOW'] = 40
-        pre['CANNY_THRESHOLD_HIGH'] = 105
+        pre['CANNY_THRESHOLD_LOW'] = 36
+        pre['CANNY_THRESHOLD_HIGH'] = 96
     except Exception:
         pass
 
     # 2) 获取 DEFECT_DETECTION
     dd = p.setdefault('DEFECT_DETECTION', {})
 
-    # 2.1 缺角/Chipping 过滤参数 ×0.25
+    # 2.1 缺角/Chipping 过滤参数 ×0.25（仅保留算法中仍使用的键）
     q_keys = [
         'Q_CORNER_CONTOUR_MIN_DIST_PX',
-        'Q_DEFECT_GRADIENT_THRESHOLD',
-        'Q_DEFECT_SEARCH_WIDTH_PX',
-        'Q_TRIANGLE_BRIGHTNESS_MARGIN',
         'Q_CANNY_STRIPE_HALF_WIDTH_PX',
+        'Q_CORNER_ALIGNMENT_TOL_PX',
         'Q_TRIANGLE_MIN_AREA_MM2',
-        'CHIPPING_ENDPOINT_SHIELD_RADIUS_MM',
-        'CHIPPING_ENDPOINT_SHIELD_RADIUS',
+        # 若后续启用块状chipping过滤，可在此补充 BLOCK_* 相关键
     ]
     for k in q_keys:
         if k in dd and isinstance(dd[k], (int, float)):
             dd[k] = _scale_numeric(dd[k], 0.25)
 
-    # 2.2 崩边(B)过滤参数 ×1.5
+    # 2.2 崩边(B)过滤参数 ×1.5（仅保留算法中仍使用的键；不含 B->L 重分类）
     b_keys = [
-        'B_MERGE_MIN_SIDE_MM',
         'B_MAX_DISTANCE_TO_EDGE_MM',
-        'B_FILTER_DISTANCE_TO_EDGE_MAX_MM',
         'B_FILTER_PARALLEL_TOLERANCE_DEG',
-        'B_FILTER_NEAR_NONQ_INTERSECTION_RADIUS_MM',
-        'B_TO_L_MIN_AR',
-        'B_TO_L_PERP_TOLERANCE_DEG',
         'B_FILTER_PARALLEL_AR_MIN',
         'B_FILTER_PARALLEL_MIN_SIDE_MM',
     ]
@@ -108,13 +75,7 @@ def _adjust_params_for_dark(params: Dict[str, Any]) -> Dict[str, Any]:
         if k in dd and isinstance(dd[k], (int, float)):
             dd[k] = _scale_numeric(dd[k], 1.5)
 
-    # 2.3 RECLASSIFY_B_AS_L_PARAMS 子键 ×1.5（视为崩边相关过滤）
-    sub = dd.get('RECLASSIFY_B_AS_L_PARAMS')
-    if isinstance(sub, dict):
-        for sk in ['MIN_ASPECT_RATIO', 'MAX_DISTANCE_MM', 'MAX_DISTANCE_PX', 'ANGLE_TOLERANCE', 'ENDPOINT_SHIELD_RATIO_FOR_EXTENDED']:
-            if sk in sub and isinstance(sub[sk], (int, float)):
-                sub[sk] = _scale_numeric(sub[sk], 1.5)
-        dd['RECLASSIFY_B_AS_L_PARAMS'] = sub
+    # 2.3 不调整 B->L 重分类参数（按要求不考虑该类参数）
 
     p['DEFECT_DETECTION'] = dd
     return p
