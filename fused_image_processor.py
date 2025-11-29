@@ -16,27 +16,115 @@ import multiprocessing
 from typing import List, Tuple, Dict, Any
 
 # 直接复用现有两个实现模块(浅色/深色), 若深色模块结构不完整则做最小安全封装
+import copy
 import image_processor_hough as light_impl
 import image_processor_hough_dark as dark_impl
 
-def _run_light(image_gray, rois, config):
-    return light_impl.process_image_from_memory_parallel(image_gray, rois, config)
+def _run_light(image_gray, rois, full_config):
+    # 仅使用浅色参数集
+    params = full_config.get('hough_inspector_params', full_config)
+    return light_impl.process_image_from_memory_parallel(image_gray, rois, params)
+
+
+def _scale_numeric(value, scale):
+    try:
+        if isinstance(value, (int, float)):
+            return type(value)(value * scale)
+        if isinstance(value, (list, tuple)):
+            return type(value)([_scale_numeric(v, scale) for v in value])
+    except Exception:
+        pass
+    return value
+
+
+def _adjust_params_for_dark(params: Dict[str, Any]) -> Dict[str, Any]:
+    """在深色模式下基于浅色参数做动态调整（严格按现有键名）：
+    - PREPROCESSING.CANNY_THRESHOLD_LOW/HIGH -> 30/90
+    - 缺角(Q/chipping)过滤参数 ×0.25：
+      DEFECT_DETECTION 下以下键：
+        Q_CORNER_CONTOUR_MIN_DIST_PX
+        Q_DEFECT_GRADIENT_THRESHOLD
+        Q_DEFECT_SEARCH_WIDTH_PX
+        Q_TRIANGLE_BRIGHTNESS_MARGIN
+        Q_CANNY_STRIPE_HALF_WIDTH_PX
+        Q_TRIANGLE_MIN_AREA_MM2
+        CHIPPING_ENDPOINT_SHIELD_RADIUS_MM
+        CHIPPING_ENDPOINT_SHIELD_RADIUS
+    - 崩边(B)过滤参数 ×1.5：
+      DEFECT_DETECTION 下以下键：
+        B_MERGE_MIN_SIDE_MM
+        B_MAX_DISTANCE_TO_EDGE_MM
+        B_FILTER_DISTANCE_TO_EDGE_MAX_MM
+        B_FILTER_PARALLEL_TOLERANCE_DEG
+        B_FILTER_NEAR_NONQ_INTERSECTION_RADIUS_MM
+        B_TO_L_MIN_AR
+        B_TO_L_PERP_TOLERANCE_DEG
+        B_FILTER_PARALLEL_AR_MIN
+        B_FILTER_PARALLEL_MIN_SIDE_MM
+      以及 RECLASSIFY_B_AS_L_PARAMS 子键：
+        MIN_ASPECT_RATIO, MAX_DISTANCE_MM, MAX_DISTANCE_PX, ANGLE_TOLERANCE, ENDPOINT_SHIELD_RATIO_FOR_EXTENDED
+    """
+    p = copy.deepcopy(params) if isinstance(params, dict) else {}
+
+    # 1) Canny 阈值提升至 30/90（严格键名）
+    try:
+        pre = p.setdefault('PREPROCESSING', {})
+        pre['CANNY_THRESHOLD_LOW'] = 40
+        pre['CANNY_THRESHOLD_HIGH'] = 105
+    except Exception:
+        pass
+
+    # 2) 获取 DEFECT_DETECTION
+    dd = p.setdefault('DEFECT_DETECTION', {})
+
+    # 2.1 缺角/Chipping 过滤参数 ×0.25
+    q_keys = [
+        'Q_CORNER_CONTOUR_MIN_DIST_PX',
+        'Q_DEFECT_GRADIENT_THRESHOLD',
+        'Q_DEFECT_SEARCH_WIDTH_PX',
+        'Q_TRIANGLE_BRIGHTNESS_MARGIN',
+        'Q_CANNY_STRIPE_HALF_WIDTH_PX',
+        'Q_TRIANGLE_MIN_AREA_MM2',
+        'CHIPPING_ENDPOINT_SHIELD_RADIUS_MM',
+        'CHIPPING_ENDPOINT_SHIELD_RADIUS',
+    ]
+    for k in q_keys:
+        if k in dd and isinstance(dd[k], (int, float)):
+            dd[k] = _scale_numeric(dd[k], 0.25)
+
+    # 2.2 崩边(B)过滤参数 ×1.5
+    b_keys = [
+        'B_MERGE_MIN_SIDE_MM',
+        'B_MAX_DISTANCE_TO_EDGE_MM',
+        'B_FILTER_DISTANCE_TO_EDGE_MAX_MM',
+        'B_FILTER_PARALLEL_TOLERANCE_DEG',
+        'B_FILTER_NEAR_NONQ_INTERSECTION_RADIUS_MM',
+        'B_TO_L_MIN_AR',
+        'B_TO_L_PERP_TOLERANCE_DEG',
+        'B_FILTER_PARALLEL_AR_MIN',
+        'B_FILTER_PARALLEL_MIN_SIDE_MM',
+    ]
+    for k in b_keys:
+        if k in dd and isinstance(dd[k], (int, float)):
+            dd[k] = _scale_numeric(dd[k], 1.5)
+
+    # 2.3 RECLASSIFY_B_AS_L_PARAMS 子键 ×1.5（视为崩边相关过滤）
+    sub = dd.get('RECLASSIFY_B_AS_L_PARAMS')
+    if isinstance(sub, dict):
+        for sk in ['MIN_ASPECT_RATIO', 'MAX_DISTANCE_MM', 'MAX_DISTANCE_PX', 'ANGLE_TOLERANCE', 'ENDPOINT_SHIELD_RATIO_FOR_EXTENDED']:
+            if sk in sub and isinstance(sub[sk], (int, float)):
+                sub[sk] = _scale_numeric(sub[sk], 1.5)
+        dd['RECLASSIFY_B_AS_L_PARAMS'] = sub
+
+    p['DEFECT_DETECTION'] = dd
+    return p
 
 def _run_dark(image_gray, rois, full_config):
-    """调用深色玻璃实现。
-    之前错误：仅传入 full_config['hough_inspector_dark_params'] 子字典，
-    dark_impl 内部再次调用 config.get('hough_inspector_dark_params') 导致找不到 -> 抛异常 -> 回退浅色。
-    修复：传递完整 full_config，必要参数由深色实现自行解析。
-    若缺少配置或执行失败，记录一次日志并回退浅色。
-    """
+    """深色玻璃：仅基于浅色参数集做运行时调整，不再读取独立 dark 参数。"""
     try:
-        if not hasattr(dark_impl, 'process_image_from_memory_parallel'):
-            print("[fused_image_processor] 深色实现缺失接口, 回退浅色")
-            return _run_light(image_gray, rois, full_config)
-        if 'hough_inspector_dark_params' not in full_config:
-            print("[fused_image_processor] 配置缺少 hough_inspector_dark_params, 回退浅色")
-            return _run_light(image_gray, rois, full_config)
-        return dark_impl.process_image_from_memory_parallel(image_gray, rois, full_config)
+        base_params = full_config.get('hough_inspector_params', full_config)
+        dark_params = _adjust_params_for_dark(base_params)
+        return light_impl.process_image_from_memory_parallel(image_gray, rois, dark_params)
     except Exception as e:
         print(f"[fused_image_processor] 深色模式执行异常, 回退浅色: {e}")
         return _run_light(image_gray, rois, full_config)

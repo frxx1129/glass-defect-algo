@@ -70,7 +70,7 @@
     }
   },
   "camera_rois": {
-    "0": "cam01_2025-11-10T11-08-41-177.webm_20251110_202454.671_roi_averaged_by_group.json",
+    "0": "cam01_2025-11-27T10-40-29-573.webm_20251129_095305.116_roi_averaged_by_group.json",
     "1": "cam2_roi_averaged_by_group.json",
     "2": "cam5_roi_averaged_by_group.json",
     "3": "cam4_roi_averaged_by_group.json",
@@ -93,7 +93,7 @@
   "rejection_controller": {"port": "COM5", "baud": 115200},
   "rejection_params": {"max_defect_size_mm": 20, "REJECTION_PULSE_MS": 100, "REJECTION_DELAY_S": 2},
   "hough_inspector_params": {
-    "PREPROCESSING": {"MEDIAN_BLUR_KSIZE": 7, "CLAHE_CLIP_LIMIT": 3.0, "CLAHE_GRID_SIZE": [8, 8], "CANNY_THRESHOLD_LOW": 20, "CANNY_THRESHOLD_HIGH": 80},
+    "PREPROCESSING": {"MEDIAN_BLUR_KSIZE": 7, "CLAHE_CLIP_LIMIT": 2.0, "CLAHE_GRID_SIZE": [8, 8], "CANNY_THRESHOLD_LOW": 30, "CANNY_THRESHOLD_HIGH": 90},
     "HOUGH_TRANSFORM": {"THRESHOLD": 35, "MIN_LINE_LENGTH_RATIO": 0.05, "MAX_LINE_GAP_MM": 5, "MAX_LINE_GAP": 30},
     "LINE_MERGING": {"ANGLE_TOLERANCE": 1.5, "MAX_LATERAL_DISTANCE_MM": 5, "MAX_LATERAL_DISTANCE": 40, "TOP_N_EDGES": 5},
     "CRACK_CLASSIFICATION": {"ENDPOINT_SHIELD_RATIO": 0.1, "ENDPOINT_PROXIMITY_THRESHOLD_MM": 5.49},
@@ -109,8 +109,7 @@
       "Q_DEFECT_SEARCH_WIDTH_PX": 3,
       "Q_TRIANGLE_BRIGHTNESS_MARGIN": 10.0,
       "Q_CANNY_STRIPE_HALF_WIDTH_PX": 3,
-      "Q_TRIANGLE_MIN_AREA_MM2": 25.0,
-      "Q_BRIGHTNESS_MIN_DIFF": 25.0,
+      "Q_TRIANGLE_MIN_AREA_MM2": 16.0,
       "SKEW_CURVED_REMOVE_LINE_THICKNESS_PX": 24,
       "SKEW_CURVED_MIN_ARC_LEN_PX": 700.0,
       "SKEW_CURVED_MAX_DEV_RATIO": 0.08,
