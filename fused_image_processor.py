@@ -41,34 +41,26 @@ def _adjust_params_for_dark(params: Dict[str, Any]) -> Dict[str, Any]:
 
     p = copy.deepcopy(params) if isinstance(params, dict) else {}
 
-    # 1) Canny 阈值提升至 36/96（严格键名）
+    # 1) Canny 阈值提升至 40/105（严格键名）
     try:
         pre = p.setdefault('PREPROCESSING', {})
-        pre['CANNY_THRESHOLD_LOW'] = 36
-        pre['CANNY_THRESHOLD_HIGH'] = 96
+        pre['CANNY_THRESHOLD_LOW'] = 40
+        pre['CANNY_THRESHOLD_HIGH'] = 105
     except Exception:
         pass
 
-    # 2) 获取 DEFECT_DETECTION
+    # 2) HOUGH 阶段阈值整体下调至默认的 85%
+    try:
+        hough = p.setdefault('HOUGH_TRANSFORM', {})
+        if 'THRESHOLD' in hough and isinstance(hough['THRESHOLD'], (int, float)):
+            hough['THRESHOLD'] = _scale_numeric(hough['THRESHOLD'], 0.85)
+    except Exception:
+        pass
+
+    # 3) 获取 DEFECT_DETECTION
     dd = p.setdefault('DEFECT_DETECTION', {})
 
-    # 2.1 缺角/Chipping 过滤参数 ×0.25（仅保留算法中仍使用的键）
-    q_keys = [
-        'Q_CORNER_CONTOUR_MIN_DIST_PX',
-        'Q_CANNY_STRIPE_HALF_WIDTH_PX',
-        'Q_CORNER_ALIGNMENT_TOL_PX',
-        'Q_TRIANGLE_MIN_AREA_MM2',
-        # 平行四边形排除/聚类过滤相关：
-        'Q_PARALLELOGRAM_EXCLUDE_STRIPE_HALF_PX',
-        'Q_PARALLELOGRAM_USE_DILATE',
-        'Q_PARALLELOGRAM_MIN_EDGE_PIXELS',
-        'Q_PARALLELOGRAM_MIN_SPAN_FRAC',
-    ]
-    for k in q_keys:
-        if k in dd and isinstance(dd[k], (int, float)):
-            dd[k] = _scale_numeric(dd[k], 0.25)
-
-    # 2.2 崩边(B)过滤参数 ×1.5（仅保留算法中仍使用的键；不含 B->L 重分类）
+    # 3.1 崩边(B)过滤参数 ×1.5（仅保留算法中仍使用的键；不含 B->L 重分类）
     b_keys = [
         'B_MAX_DISTANCE_TO_EDGE_MM',
         'B_FILTER_PARALLEL_TOLERANCE_DEG',
@@ -79,7 +71,7 @@ def _adjust_params_for_dark(params: Dict[str, Any]) -> Dict[str, Any]:
         if k in dd and isinstance(dd[k], (int, float)):
             dd[k] = _scale_numeric(dd[k], 1.5)
 
-    # 2.3 不调整 B->L 重分类参数（按要求不考虑该类参数）
+    # 3.2 不调整 Q 类过滤及 B->L 重分类参数（按要求不考虑该类参数）
 
     p['DEFECT_DETECTION'] = dd
     return p

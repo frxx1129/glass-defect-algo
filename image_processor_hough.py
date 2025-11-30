@@ -3966,12 +3966,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 continue
             length_mm = location.get('length_mm', 0); width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm; aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
-            # 新增：过滤长宽比过大的 Q（> 4.0）
-            if aspect_ratio > 4.0: continue
             if area_mm2 < 2.25: continue
             if min(length_mm, width_mm) < 2.0: continue
             if length_mm < min_size_mm: continue
-            if length_mm >300.0 or width_mm >300.0: continue
             
         elif new_defect['type'] in ['B']:
             if location.get('length_mm', 0) < min_size_mm:
@@ -4139,38 +4136,38 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     # 绘制主边直线、角点（移除调试打印）
     annotations_to_draw = []
-    try:
-       for i, seg in enumerate(edges_for_drawing or []):
-           x1,y1,x2,y2 = map(float, seg)
-           dx, dy = (x2-x1), (y2-y1)
-           ang = abs(np.degrees(np.arctan2(dy, dx)))
-           if ang > 90.0: ang = 180.0 - ang
-           length_px = float(np.hypot(dx, dy))
-           length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
+    # try:
+    #    for i, seg in enumerate(edges_for_drawing or []):
+    #        x1,y1,x2,y2 = map(float, seg)
+    #        dx, dy = (x2-x1), (y2-y1)
+    #        ang = abs(np.degrees(np.arctan2(dy, dx)))
+    #        if ang > 90.0: ang = 180.0 - ang
+    #        length_px = float(np.hypot(dx, dy))
+    #        length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
 
-           color = (200,200,200)
-           if ang >= 80.0:
-               color = (0,255,0)
-           elif ang <= 10.0:
-               color = (255,0,0)
-           cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
+    #        color = (200,200,200)
+    #        if ang >= 80.0:
+    #            color = (0,255,0)
+    #        elif ang <= 10.0:
+    #            color = (255,0,0)
+    #        cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
 
-           mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
-           try:
-               cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-           except Exception:
-               pass
+    #        mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
+    #        try:
+    #            cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    #        except Exception:
+    #            pass
 
-       for (ii, jj, cp_arr) in (paired_corners or []):
-          try:
-              cx, cy = float(cp_arr[0]), float(cp_arr[1])
-              cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
-              cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
-          except Exception:
-              continue
+    #    for (ii, jj, cp_arr) in (paired_corners or []):
+    #       try:
+    #           cx, cy = float(cp_arr[0]), float(cp_arr[1])
+    #           cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
+    #           cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
+    #       except Exception:
+    #           continue
 
-    except Exception:
-       pass
+    # except Exception:
+    #    pass
     
     for defect_report in final_defects_for_report:
         defect = defect_report['raw_defect']
