@@ -21,9 +21,8 @@ import image_processor_hough as light_impl
 import image_processor_hough_dark as dark_impl
 
 def _run_light(image_gray, rois, full_config):
-    # 仅使用浅色参数集
-    params = full_config.get('hough_inspector_params', full_config)
-    return light_impl.process_image_from_memory_parallel(image_gray, rois, params)
+    # 直接传入完整配置，保持原有接口期望
+    return light_impl.process_image_from_memory_parallel(image_gray, rois, full_config)
 
 
 def _scale_numeric(value, scale):
@@ -79,9 +78,12 @@ def _adjust_params_for_dark(params: Dict[str, Any]) -> Dict[str, Any]:
 def _run_dark(image_gray, rois, full_config):
     """深色玻璃：仅基于浅色参数集做运行时调整，不再读取独立 dark 参数。"""
     try:
-        base_params = full_config.get('hough_inspector_params', full_config)
-        dark_params = _adjust_params_for_dark(base_params)
-        return light_impl.process_image_from_memory_parallel(image_gray, rois, dark_params)
+        cfg = copy.deepcopy(full_config)
+        base_params = cfg.get('hough_inspector_params')
+        if base_params is None:
+            raise ValueError("'hough_inspector_params' missing in config")
+        cfg['hough_inspector_params'] = _adjust_params_for_dark(base_params)
+        return light_impl.process_image_from_memory_parallel(image_gray, rois, cfg)
     except Exception as e:
         print(f"[fused_image_processor] 深色模式执行异常, 回退浅色: {e}")
         return _run_light(image_gray, rois, full_config)

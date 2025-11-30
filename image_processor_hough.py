@@ -745,6 +745,70 @@ def denoise_edge_map(edge_img: np.ndarray, params) -> np.ndarray:
     out = (work * 255).astype(np.uint8)
     return out
 
+
+def _snap_line_to_canny(seg: np.ndarray, edge_img: np.ndarray, stripe_half_px: int,
+                        min_points: int, max_angle_deg: float) -> np.ndarray:
+    """将合并后的直线在 Canny 边缘图上进行细调，减少角度与位置偏移。"""
+    if edge_img is None or edge_img.size == 0:
+        return seg
+    h_img, w_img = edge_img.shape[:2]
+    if h_img <= 0 or w_img <= 0:
+        return seg
+    if edge_img.dtype != np.uint8:
+        edge_bin = (edge_img > 0).astype(np.uint8)
+    else:
+        edge_bin = edge_img
+    thickness = max(1, int(stripe_half_px) * 2 + 1)
+    mask = np.zeros((h_img, w_img), dtype=np.uint8)
+    p1 = (int(round(float(seg[0]))), int(round(float(seg[1]))))
+    p2 = (int(round(float(seg[2]))), int(round(float(seg[3]))))
+    cv2.line(mask, p1, p2, 255, thickness=thickness)
+    overlap = cv2.bitwise_and(edge_bin, edge_bin, mask=mask)
+    ys, xs = np.where(overlap > 0)
+    if xs.size < max(2, int(min_points)):
+        return seg
+    pts = np.column_stack((xs, ys)).astype(np.float32)
+    try:
+        vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
+    except Exception:
+        return seg
+    norm = math.hypot(float(vx), float(vy))
+    if norm < 1e-6:
+        return seg
+    vx = float(vx) / norm
+    vy = float(vy) / norm
+    angle_old = math.degrees(math.atan2(float(seg[3]) - float(seg[1]), float(seg[2]) - float(seg[0])))
+    if angle_old < 0:
+        angle_old += 180.0
+    angle_new = math.degrees(math.atan2(vy, vx))
+    if angle_new < 0:
+        angle_new += 180.0
+    angle_diff = abs(angle_new - angle_old)
+    if angle_diff > 90.0:
+        angle_diff = 180.0 - angle_diff
+    if angle_diff > float(max_angle_deg):
+        return seg
+    base = np.array([float(x0), float(y0)], dtype=float)
+    direction = np.array([vx, vy], dtype=float)
+
+    def _project(pt: np.ndarray) -> float:
+        return float(np.dot(pt - base, direction))
+
+    p1_arr = np.array(seg[:2], dtype=float)
+    p2_arr = np.array(seg[2:], dtype=float)
+    t1 = _project(p1_arr)
+    t2 = _project(p2_arr)
+    t_min = min(t1, t2)
+    t_max = max(t1, t2)
+    new_p1 = base + t_min * direction
+    new_p2 = base + t_max * direction
+    new_seg = np.array([new_p1[0], new_p1[1], new_p2[0], new_p2[1]], dtype=float)
+    new_seg[0] = float(np.clip(new_seg[0], 0.0, w_img - 1.0))
+    new_seg[1] = float(np.clip(new_seg[1], 0.0, h_img - 1.0))
+    new_seg[2] = float(np.clip(new_seg[2], 0.0, w_img - 1.0))
+    new_seg[3] = float(np.clip(new_seg[3], 0.0, h_img - 1.0))
+    return new_seg
+
 def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img=None):
     if lines is None or len(lines) < 1: return []
     p = params["LINE_MERGING"]
@@ -780,6 +844,26 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
         canny_refine_half_px = int(params.get('LINE_MERGING', {}).get('CANNY_AXIS_REFINE_HALF_PX', 3))
     except Exception:
         canny_refine_half_px = 3
+    try:
+        snap_enable = bool(params.get('LINE_MERGING', {}).get('CANNY_SNAP_ENABLE', True))
+    except Exception:
+        snap_enable = True
+    try:
+        snap_half_px = int(params.get('LINE_MERGING', {}).get('CANNY_SNAP_HALF_STRIPE_PX', 4))
+    except Exception:
+        snap_half_px = 4
+    try:
+        snap_min_points = int(params.get('LINE_MERGING', {}).get('CANNY_SNAP_MIN_POINTS', 12))
+    except Exception:
+        snap_min_points = 12
+    try:
+        snap_max_angle = float(params.get('LINE_MERGING', {}).get('CANNY_SNAP_MAX_ANGLE_DIFF_DEG', 8.0))
+    except Exception:
+        snap_max_angle = 8.0
+    try:
+        min_vertical_gap_px = float(params.get('LINE_MERGING', {}).get('MIN_VERTICAL_EDGE_GAP_PX', 10.0))
+    except Exception:
+        min_vertical_gap_px = 10.0
     merged_min_support_px = _px_dist_mm('MERGED_MIN_SUPPORT_MM', 'MERGED_MIN_SUPPORT_PX', 5.0, default_px=0.0)
 
     def _is_near_vertical(angle_deg: float) -> bool:
@@ -1062,6 +1146,17 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
     def _proj_length(seg):
         return float(np.hypot(float(seg[2]) - float(seg[0]), float(seg[3]) - float(seg[1])))
 
+    def _merge_vertical_lines(seg_a, score_a, seg_b, score_b):
+        """将过近的竖线合并为单条；x 取加权平均，y 取全范围。"""
+        w = max(1e-6, float(score_a) + float(score_b))
+        x_a = float(seg_a[0] + seg_a[2]) / 2.0
+        x_b = float(seg_b[0] + seg_b[2]) / 2.0
+        x_new = (x_a * float(score_a) + x_b * float(score_b)) / w
+        y_vals = [float(seg_a[1]), float(seg_a[3]), float(seg_b[1]), float(seg_b[3])]
+        y_min = min(y_vals)
+        y_max = max(y_vals)
+        return np.array([x_new, y_min, x_new, y_max], dtype=float)
+
     # 配置：水平重复合并的最大垂距与最小轴向重叠比
     horiz_dup_max_off_px = _px_dist_mm('HORIZONTAL_DUP_MERGE_MAX_OFFSET_MM', 'HORIZONTAL_DUP_MERGE_MAX_OFFSET_PX', 2.0, default_px=4.0)
     try:
@@ -1131,15 +1226,50 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
     # 保持支持度排序
     filtered.sort(key=lambda it: it['score'], reverse=True)
 
+    # 基于 Canny 对合并结果进行二次微调，保证线段紧贴真实边缘
+    if edge_img is not None and snap_enable and snap_half_px > 0 and filtered:
+        snapped = []
+        for item in filtered:
+            seg = item['line']
+            ang = _angle_deg(seg)
+            if _is_near_vertical(ang) or _is_near_horizontal(ang):
+                seg = _snap_line_to_canny(seg, edge_img, snap_half_px, snap_min_points, snap_max_angle)
+            snapped.append({'line': seg, 'score': item['score']})
+        filtered = snapped
+
+    if min_vertical_gap_px and min_vertical_gap_px > 0.0 and filtered:
+        filtered_with_gap = []
+        for item in filtered:
+            seg = item['line']
+            score = item['score']
+            if not _is_near_vertical(_angle_deg(seg)):
+                filtered_with_gap.append({'line': seg, 'score': score})
+                continue
+            x_center = float(seg[0] + seg[2]) / 2.0
+            merged = False
+            for existing in filtered_with_gap:
+                ex_seg = existing['line']
+                if not _is_near_vertical(_angle_deg(ex_seg)):
+                    continue
+                ex_center = float(ex_seg[0] + ex_seg[2]) / 2.0
+                if abs(x_center - ex_center) < float(min_vertical_gap_px):
+                    existing['line'] = _merge_vertical_lines(ex_seg, existing['score'], seg, score)
+                    existing['score'] += score
+                    merged = True
+                    break
+            if not merged:
+                filtered_with_gap.append({'line': seg, 'score': score})
+        filtered = filtered_with_gap
+
     # 根据是否与其它直线（实际或小范围延长后）相交，决定用于角度/扫描/过滤的有效线段：
     # - 不相交：保持原始长度
     # - 相交（含延长容差内相交）：使用“交点 → 原始线段最远端点”的新线段
     edges = [item['line'] for item in filtered[:p["TOP_N_EDGES"]]]
     # 多样性保护：若 Top-N 中没有近竖直主边，而候选集中存在强近竖直主边，则用其替换最弱一条
     try:
-        ensure_vertical = bool(params.get('LINE_MERGING', {}).get('ENSURE_VERTICAL_PRESENCE', True))
+        ensure_vertical = bool(params.get('LINE_MERGING', {}).get('ENSURE_VERTICAL_PRESENCE', False))
     except Exception:
-        ensure_vertical = True
+        ensure_vertical = False
     if ensure_vertical and len(filtered) > 0 and len(edges) > 0:
         try:
             v_tol = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
@@ -3967,6 +4097,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             length_mm = location.get('length_mm', 0); width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm; aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
             if area_mm2 < 2.25: continue
+            if aspect_ratio > 20.0: continue
             if min(length_mm, width_mm) < 2.0: continue
             if length_mm < min_size_mm: continue
             
@@ -4136,38 +4267,38 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     # 绘制主边直线、角点（移除调试打印）
     annotations_to_draw = []
-    # try:
-    #    for i, seg in enumerate(edges_for_drawing or []):
-    #        x1,y1,x2,y2 = map(float, seg)
-    #        dx, dy = (x2-x1), (y2-y1)
-    #        ang = abs(np.degrees(np.arctan2(dy, dx)))
-    #        if ang > 90.0: ang = 180.0 - ang
-    #        length_px = float(np.hypot(dx, dy))
-    #        length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
+    try:
+       for i, seg in enumerate(edges_for_drawing or []):
+           x1,y1,x2,y2 = map(float, seg)
+           dx, dy = (x2-x1), (y2-y1)
+           ang = abs(np.degrees(np.arctan2(dy, dx)))
+           if ang > 90.0: ang = 180.0 - ang
+           length_px = float(np.hypot(dx, dy))
+           length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
 
-    #        color = (200,200,200)
-    #        if ang >= 80.0:
-    #            color = (0,255,0)
-    #        elif ang <= 10.0:
-    #            color = (255,0,0)
-    #        cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
+           color = (200,200,200)
+           if ang >= 80.0:
+               color = (0,255,0)
+           elif ang <= 10.0:
+               color = (255,0,0)
+           cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
 
-    #        mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
-    #        try:
-    #            cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-    #        except Exception:
-    #            pass
+           mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
+           try:
+               cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+           except Exception:
+               pass
 
-    #    for (ii, jj, cp_arr) in (paired_corners or []):
-    #       try:
-    #           cx, cy = float(cp_arr[0]), float(cp_arr[1])
-    #           cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
-    #           cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
-    #       except Exception:
-    #           continue
+       for (ii, jj, cp_arr) in (paired_corners or []):
+          try:
+              cx, cy = float(cp_arr[0]), float(cp_arr[1])
+              cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
+              cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
+          except Exception:
+              continue
 
-    # except Exception:
-    #    pass
+    except Exception:
+       pass
     
     for defect_report in final_defects_for_report:
         defect = defect_report['raw_defect']
