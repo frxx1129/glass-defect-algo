@@ -809,6 +809,165 @@ def _snap_line_to_canny(seg: np.ndarray, edge_img: np.ndarray, stripe_half_px: i
     new_seg[3] = float(np.clip(new_seg[3], 0.0, h_img - 1.0))
     return new_seg
 
+
+def _fit_line_from_edges(edge_img: np.ndarray, seg: np.ndarray, band_half: int,
+                         min_points: int, max_angle_dev_deg: float) -> np.ndarray|None:
+    """在水平段附近用 Canny 点拟合直线，允许轻微斜率以贴合真实边缘。"""
+    if edge_img is None or edge_img.size == 0:
+        return None
+    H, W = edge_img.shape[:2]
+    band_half = max(1, int(band_half))
+    x1, y1, x2, y2 = map(float, seg)
+    x_min = int(max(0, math.floor(min(x1, x2))))
+    x_max = int(min(W - 1, math.ceil(max(x1, x2))))
+    y_med = int(round(0.5 * (y1 + y2)))
+    y0 = max(0, y_med - band_half)
+    y1b = min(H - 1, y_med + band_half)
+    if x_max - x_min < 1 or y1b - y0 < 1:
+        return None
+    roi = edge_img[y0:y1b+1, x_min:x_max+1]
+    ys, xs = np.where(roi > 0)
+    if xs.size < max(2, int(min_points)):
+        return None
+    xs = xs.astype(np.float32) + float(x_min)
+    ys = ys.astype(np.float32) + float(y0)
+    pts = np.column_stack((xs, ys)).astype(np.float32)
+    try:
+        vx, vy, cx, cy = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
+    except Exception:
+        return None
+    norm = math.hypot(float(vx), float(vy))
+    if norm < 1e-6:
+        return None
+    vx = float(vx) / norm; vy = float(vy) / norm
+    ang = abs(math.degrees(math.atan2(vy, vx)))
+    if ang > 90.0:
+        ang = 180.0 - ang
+    if ang > float(max_angle_dev_deg):
+        return None
+    base = np.array([float(cx), float(cy)], dtype=float)
+    direction = np.array([vx, vy], dtype=float)
+    t_vals = np.dot(pts - base, direction)
+    t_min = float(np.min(t_vals)); t_max = float(np.max(t_vals))
+    p1n = base + t_min * direction
+    p2n = base + t_max * direction
+    seg_new = np.array([p1n[0], p1n[1], p2n[0], p2n[1]], dtype=float)
+    seg_new[0] = float(np.clip(seg_new[0], 0.0, W - 1.0))
+    seg_new[1] = float(np.clip(seg_new[1], 0.0, H - 1.0))
+    seg_new[2] = float(np.clip(seg_new[2], 0.0, W - 1.0))
+    seg_new[3] = float(np.clip(seg_new[3], 0.0, H - 1.0))
+    return seg_new
+
+
+def _detect_edge_notches(edge_img: np.ndarray, segments: list, pixels_per_mm: float, params: dict) -> list:
+    """在主边上查找较长的“凹进/缺段”并标记为缺角(Q)。"""
+    if edge_img is None or edge_img.size == 0 or not segments:
+        return []
+    try:
+        stripe_half = int(params.get('DEFECT_DETECTION', {}).get('NOTCH_STRIPE_HALF_PX', 3))
+    except Exception:
+        stripe_half = 3
+    try:
+        min_gap = int(params.get('DEFECT_DETECTION', {}).get('NOTCH_MIN_GAP_PX', 12))
+    except Exception:
+        min_gap = 12
+    stripe_half = max(1, int(stripe_half))
+    min_gap = max(4, int(min_gap))
+    H, W = edge_img.shape[:2]
+    defects = []
+
+    def _runs_of_false(mask: np.ndarray):
+        # mask: 1d bool
+        if mask.size == 0:
+            return []
+        diff = np.diff(mask.astype(np.int8))
+        run_starts = list(np.where(diff == -1)[0] + 1) if mask[0] else [0] + list(np.where(diff == -1)[0] + 1)
+        run_ends = list(np.where(diff == 1)[0] + 1) if not mask[-1] else list(np.where(diff == 1)[0] + 1) + [mask.size]
+        if len(run_starts) != len(run_ends):
+            m = min(len(run_starts), len(run_ends))
+            run_starts = run_starts[:m]; run_ends = run_ends[:m]
+        return [(s, e) for s, e in zip(run_starts, run_ends) if e > s]
+
+    for seg in segments:
+        try:
+            x1,y1,x2,y2 = map(float, seg)
+            dx, dy = x2 - x1, y2 - y1
+            ang = abs(np.degrees(np.arctan2(dy, dx)))
+            if ang > 90.0:
+                ang = 180.0 - ang
+            near_vert = ang >= 45.0
+            if near_vert:
+                y0 = int(max(0, math.floor(min(y1, y2))))
+                y1i = int(min(H - 1, math.ceil(max(y1, y2))))
+                if y1i - y0 + 1 < min_gap:
+                    continue
+                x_med = int(round((x1 + x2) * 0.5))
+                x0 = max(0, x_med - stripe_half); x1c = min(W - 1, x_med + stripe_half)
+                stripe = edge_img[y0:y1i+1, x0:x1c+1]
+                if stripe.size == 0:
+                    continue
+                presence = np.any(stripe > 0, axis=1)
+                runs = _runs_of_false(presence)
+                for s, e in runs:
+                    gap_len = e - s
+                    if gap_len < min_gap:
+                        continue
+                    if presence[:s].any() and presence[e:].any():
+                        ys0 = y0 + s; ys1 = y0 + e
+                        cx = 0.5 * (x0 + x1c)
+                        cy = 0.5 * (ys0 + ys1)
+                        w_px = float(x1c - x0 + 1)
+                        h_px = float(gap_len)
+                        rect = ((cx, cy), (w_px, h_px), 0.0)
+                        box = cv2.boxPoints(rect)
+                        defects.append({
+                            'type': 'Q',
+                            'origin': 'notch_vertical_gap',
+                            'min_area_rect': rect,
+                            'box_points': np.int32(box),
+                            'center': (int(round(cx)), int(round(cy))),
+                            'length_mm': h_px / float(pixels_per_mm) if pixels_per_mm else 0.0,
+                            'width_mm': w_px / float(pixels_per_mm) if pixels_per_mm else 0.0,
+                            'notch_run_px': int(gap_len)
+                        })
+            else:
+                x0i = int(max(0, math.floor(min(x1, x2))))
+                x1i = int(min(W - 1, math.ceil(max(x1, x2))))
+                if x1i - x0i + 1 < min_gap:
+                    continue
+                y_med = int(round((y1 + y2) * 0.5))
+                y0c = max(0, y_med - stripe_half); y1c = min(H - 1, y_med + stripe_half)
+                stripe = edge_img[y0c:y1c+1, x0i:x1i+1]
+                if stripe.size == 0:
+                    continue
+                presence = np.any(stripe > 0, axis=0)
+                runs = _runs_of_false(presence)
+                for s, e in runs:
+                    gap_len = e - s
+                    if gap_len < min_gap:
+                        continue
+                    if presence[:s].any() and presence[e:].any():
+                        xs0 = x0i + s; xs1 = x0i + e
+                        cx = 0.5 * (xs0 + xs1)
+                        cy = 0.5 * (y0c + y1c)
+                        w_px = float(gap_len)
+                        h_px = float(y1c - y0c + 1)
+                        rect = ((cx, cy), (w_px, h_px), 0.0)
+                        box = cv2.boxPoints(rect)
+                        defects.append({
+                            'type': 'Q',
+                            'origin': 'notch_horizontal_gap',
+                            'min_area_rect': rect,
+                            'box_points': np.int32(box),
+                            'center': (int(round(cx)), int(round(cy))),
+                            'length_mm': w_px / float(pixels_per_mm) if pixels_per_mm else 0.0,
+                            'width_mm': h_px / float(pixels_per_mm) if pixels_per_mm else 0.0,
+                            'notch_run_px': int(gap_len)
+                        })
+        except Exception:
+            continue
+    return defects
+
 def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img=None):
     if lines is None or len(lines) < 1: return []
     p = params["LINE_MERGING"]
@@ -860,6 +1019,22 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
         snap_max_angle = float(params.get('LINE_MERGING', {}).get('CANNY_SNAP_MAX_ANGLE_DIFF_DEG', 8.0))
     except Exception:
         snap_max_angle = 8.0
+    try:
+        horiz_fit_enable = bool(params.get('LINE_MERGING', {}).get('HORIZONTAL_LOCK_FIT_ENABLE', True))
+    except Exception:
+        horiz_fit_enable = True
+    try:
+        horiz_fit_half_px = int(params.get('LINE_MERGING', {}).get('HORIZONTAL_LOCK_FIT_HALF_PX', 4))
+    except Exception:
+        horiz_fit_half_px = 4
+    try:
+        horiz_fit_min_pts = int(params.get('LINE_MERGING', {}).get('HORIZONTAL_LOCK_FIT_MIN_POINTS', 18))
+    except Exception:
+        horiz_fit_min_pts = 18
+    try:
+        horiz_fit_max_angle = float(params.get('LINE_MERGING', {}).get('HORIZONTAL_LOCK_MAX_ANGLE_DEV_DEG', h_tol_deg))
+    except Exception:
+        horiz_fit_max_angle = h_tol_deg
     try:
         min_vertical_gap_px = float(params.get('LINE_MERGING', {}).get('MIN_VERTICAL_EDGE_GAP_PX', 10.0))
     except Exception:
@@ -1043,12 +1218,25 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
                 x0_seg = max(0, int(np.floor(points[:,0].min())))
                 x1_seg = min(w_img-1, int(np.ceil(points[:,0].max())))
                 y_med = int(round(float(np.median(points[:,1]))))
-                cy_best = y_med; best_sum = -1
-                for cy in range(max(0, y_med - canny_refine_half_px), min(h_img-1, y_med + canny_refine_half_px) + 1):
-                    row_sum = int(np.count_nonzero(edge_img[cy, x0_seg:x1_seg+1]))
-                    if row_sum > best_sum:
-                        best_sum = row_sum; cy_best = cy
-                final_merged_line = np.array([x0_seg, cy_best, x1_seg, cy_best], dtype=float)
+                # 先尝试基于 Canny 的线拟合，允许轻微斜率以紧贴真实边缘
+                fitted = None
+                if horiz_fit_enable:
+                    fitted = _fit_line_from_edges(edge_img, np.array([x0_seg, y_med, x1_seg, y_med], dtype=float),
+                                                  horiz_fit_half_px, horiz_fit_min_pts, horiz_fit_max_angle)
+                if fitted is not None:
+                    final_merged_line = fitted
+                    cy_best = int(round(float((fitted[1] + fitted[3]) * 0.5)))
+                else:
+                    cy_best = y_med; best_sum = -1
+                    for cy in range(max(0, y_med - canny_refine_half_px), min(h_img-1, y_med + canny_refine_half_px) + 1):
+                        row_sum = int(np.count_nonzero(edge_img[cy, x0_seg:x1_seg+1]))
+                        if row_sum > best_sum:
+                            best_sum = row_sum; cy_best = cy
+                    # 防止 cy_best 未命中任何行的极端情况
+                    if cy_best is None:
+                        cy_best = y_med
+                    final_merged_line = np.array([x0_seg, cy_best, x1_seg, cy_best], dtype=float)
+                cy_best = int(round(float(cy_best)))
 
                 # ================= 新增：水平线段合并连接性校验 =================
                 # 若本合并将多个原子线段跨越较大 gap，而 gap 区域缺乏 Canny 白点，则拆分回原 group（保留支持度最高的代表）
@@ -3500,6 +3688,15 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         # 合并结果 = 其他类型 + 不参与合并的小 B + 合并后的 B
         surviving_chipping_defects = others + b_small_list + fused_b_list
             
+    # 新增：检测主边上的凹进/缺段，标记为缺角
+    try:
+        edges_notch_img = preprocess_for_hough_enhanced(roi_gray, params)
+        notch_defects = _detect_edge_notches(edges_notch_img, edges_for_drawing, pixels_per_mm, params)
+        if notch_defects:
+            corner_defects.extend(notch_defects)
+    except Exception:
+        pass
+
     # 合并输出缺陷：角点/崩边/斜边（直线）
     combined_defects = corner_defects + surviving_chipping_defects + skew_line_defects + rect_q_defects
 
@@ -4267,38 +4464,38 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     # 绘制主边直线、角点（移除调试打印）
     annotations_to_draw = []
-    try:
-       for i, seg in enumerate(edges_for_drawing or []):
-           x1,y1,x2,y2 = map(float, seg)
-           dx, dy = (x2-x1), (y2-y1)
-           ang = abs(np.degrees(np.arctan2(dy, dx)))
-           if ang > 90.0: ang = 180.0 - ang
-           length_px = float(np.hypot(dx, dy))
-           length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
+    # try:
+    #    for i, seg in enumerate(edges_for_drawing or []):
+    #        x1,y1,x2,y2 = map(float, seg)
+    #        dx, dy = (x2-x1), (y2-y1)
+    #        ang = abs(np.degrees(np.arctan2(dy, dx)))
+    #        if ang > 90.0: ang = 180.0 - ang
+    #        length_px = float(np.hypot(dx, dy))
+    #        length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
 
-           color = (200,200,200)
-           if ang >= 80.0:
-               color = (0,255,0)
-           elif ang <= 10.0:
-               color = (255,0,0)
-           cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
+    #        color = (200,200,200)
+    #        if ang >= 80.0:
+    #            color = (0,255,0)
+    #        elif ang <= 10.0:
+    #            color = (255,0,0)
+    #        cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
 
-           mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
-           try:
-               cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-           except Exception:
-               pass
+    #        mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
+    #        try:
+    #            cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    #        except Exception:
+    #            pass
 
-       for (ii, jj, cp_arr) in (paired_corners or []):
-          try:
-              cx, cy = float(cp_arr[0]), float(cp_arr[1])
-              cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
-              cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
-          except Exception:
-              continue
+    #    for (ii, jj, cp_arr) in (paired_corners or []):
+    #       try:
+    #           cx, cy = float(cp_arr[0]), float(cp_arr[1])
+    #           cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
+    #           cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
+    #       except Exception:
+    #           continue
 
-    except Exception:
-       pass
+    # except Exception:
+    #    pass
     
     for defect_report in final_defects_for_report:
         defect = defect_report['raw_defect']
@@ -4604,31 +4801,70 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
                 continue
 
         if cand_global:
-            # 按 x 中值聚类
-            xs = []
+            try:
+                slant_bias = float(hough_params.get('DEFECT_DETECTION', {}).get('CROSS_ROI_VERTICAL_SLANT_BIAS', 0.5))
+            except Exception:
+                slant_bias = 0.5
+            xs = [0.5 * (float(s[0]) + float(s[2])) for s in cand_global]
+            angles = []
             for s in cand_global:
-                xs.append(0.5 * (float(s[0]) + float(s[2])))
+                dx = float(s[2]) - float(s[0]); dy = float(s[3]) - float(s[1])
+                ang = abs(np.degrees(np.arctan2(dy, dx)))
+                if ang > 90.0:
+                    ang = 180.0 - ang
+                angles.append(ang)
             order = np.argsort(np.array(xs))
             groups = []
             for idx in order:
-                xm = xs[int(idx)]
-                seg = cand_global[int(idx)]
-                if not groups:
-                    groups.append({'xs':[xm],'segs':[seg]})
-                else:
-                    if abs(xm - float(np.mean(groups[-1]['xs']))) <= cluster_x_px:
-                        groups[-1]['xs'].append(xm); groups[-1]['segs'].append(seg)
-                    else:
-                        groups.append({'xs':[xm],'segs':[seg]})
-            # 每组生成一条全局竖直边：x = 均值；y 范围 = 该组所有段的 min/max
+                xm = xs[int(idx)]; ang = angles[int(idx)]; seg = cand_global[int(idx)]
+                placed = False
+                for g in groups:
+                    if abs(xm - float(np.mean(g['xs']))) <= cluster_x_px:
+                        g['xs'].append(xm); g['segs'].append(seg); g['angs'].append(ang)
+                        placed = True; break
+                if not placed:
+                    groups.append({'xs':[xm],'segs':[seg],'angs':[ang]})
+            scored_lines = []
             for g in groups:
-                x_mean = float(np.mean(np.array(g['xs'], dtype=float)))
-                y_min = 1e9; y_max = -1e9
+                pts = []
+                total_len = 0.0
                 for s in g['segs']:
-                    y_min = min(y_min, float(min(s[1], s[3])))
-                    y_max = max(y_max, float(max(s[1], s[3])))
-                if y_max - y_min >= 1.0:
-                    shared_vertical_global.append([x_mean, y_min, x_mean, y_max])
+                    pts.append([float(s[0]), float(s[1])]); pts.append([float(s[2]), float(s[3])])
+                    total_len += float(np.hypot(float(s[2]) - float(s[0]), float(s[3]) - float(s[1])))
+                pts_np = np.array(pts, dtype=np.float32)
+                try:
+                    vx, vy, x0, y0 = cv2.fitLine(pts_np, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+                except Exception:
+                    vx, vy, x0, y0 = 0.0, 1.0, float(np.mean(g['xs'])), float(np.mean(pts_np[:,1]))
+                norm = math.hypot(float(vx), float(vy))
+                if norm < 1e-6:
+                    vx, vy = 0.0, 1.0
+                else:
+                    vx, vy = float(vx) / norm, float(vy) / norm
+                ang_fit = abs(np.degrees(math.atan2(vy, vx)))
+                if ang_fit > 90.0:
+                    ang_fit = 180.0 - ang_fit
+                y_min = float(np.min(pts_np[:,1])); y_max = float(np.max(pts_np[:,1]))
+                if y_max - y_min < 1.0:
+                    continue
+                if abs(vy) < 1e-3:
+                    x_min = x_max = float(np.mean(g['xs']))
+                else:
+                    x_min = float(x0 + vx / vy * (y_min - y0))
+                    x_max = float(x0 + vx / vy * (y_max - y0))
+                line_fit = [x_min, y_min, x_max, y_max]
+                ang_dev = max(0.0, float(abs(90.0 - ang_fit)))
+                score = total_len * (1.0 + slant_bias * (ang_dev / max(1e-3, vertical_tol_deg_cross)))
+                scored_lines.append({'line': line_fit, 'score': score, 'ang_dev': ang_dev})
+            # 按倾斜度优先的得分排序，保留全部，但确保不重复过近的 x
+            scored_lines.sort(key=lambda d: d['score'], reverse=True)
+            kept = []
+            for item in scored_lines:
+                lx = 0.5 * (float(item['line'][0]) + float(item['line'][2]))
+                if any(abs(lx - 0.5 * (float(k[0]) + float(k[2]))) < cluster_x_px * 0.5 for k in kept):
+                    continue
+                kept.append(item['line'])
+            shared_vertical_global.extend(kept)
 
         # 不再与外部预注入的共享竖直边合并（删除跨帧逻辑）
 
