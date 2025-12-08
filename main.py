@@ -730,6 +730,114 @@ def main():
                 else:
                     print("[主进程]: 子系统重启完成。")
     threading.Thread(target=_restart_watch_loop, daemon=True).start()
+
+    # ============= 内存监控线程：超阈值(默认14GB)时暂停、清缓存并重启子进程 =============
+    def _get_memory_usage() -> tuple[float|None, float|None]:
+        """返回 (used_gb, total_gb)。优先 psutil，回退 Windows GlobalMemoryStatusEx。"""
+        try:
+            import psutil  # type: ignore
+            vm = psutil.virtual_memory()
+            used = float(vm.total - vm.available) / float(1024 ** 3)
+            total = float(vm.total) / float(1024 ** 3)
+            return used, total
+        except Exception:
+            try:
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                    total = float(stat.ullTotalPhys) / float(1024 ** 3)
+                    used = float(stat.ullTotalPhys - stat.ullAvailPhys) / float(1024 ** 3)
+                    return used, total
+            except Exception:
+                return (None, None)
+        return (None, None)
+
+    try:
+        mem_threshold_pct = float(system_params.get('memory_pause_threshold_percent', 85.0) or 85.0)
+    except Exception:
+        mem_threshold_pct = 85.0
+    try:
+        mem_check_interval_s = float(system_params.get('memory_check_interval_s', 5.0) or 5.0)
+    except Exception:
+        mem_check_interval_s = 5.0
+
+    mem_recovering_flag = threading.Event()
+
+    def _clear_caches_and_temp():
+        cleared = {}
+        def _drain_queue(q, name):
+            c = 0
+            try:
+                while True:
+                    q.get_nowait()
+                    c += 1
+            except Exception:
+                pass
+            cleared[name] = c
+        _drain_queue(task_queue, 'task')
+        _drain_queue(results_queue, 'results')
+        _drain_queue(rejection_queue, 'rejection')
+        try:
+            for k in list(shared_camera_states.keys()):
+                shared_camera_states.pop(k, None)
+        except Exception:
+            pass
+        try:
+            for k in list(data_sessions.keys()):
+                data_sessions.pop(k, None)
+        except Exception:
+            pass
+        # 垃圾回收
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
+        try:
+            print(f"[主进程]: 内存超阈值清理完成，队列清空计数={cleared}")
+        except Exception:
+            pass
+
+    def _memory_watch_loop():
+        while not stop_event.is_set():
+            time.sleep(max(1.0, mem_check_interval_s))
+            used_gb, total_gb = _get_memory_usage()
+            if used_gb is None or total_gb is None or total_gb <= 0:
+                continue
+            pct = (used_gb / total_gb) * 100.0
+            if pct >= float(mem_threshold_pct) and not mem_recovering_flag.is_set():
+                mem_recovering_flag.set()
+                try:
+                    print(f"\n[主进程]: 检测到系统内存已用 {used_gb:.2f}/{total_gb:.2f} GB ({pct:.1f}%)，>= 阈值 {mem_threshold_pct}% ，暂停检测并执行清理...")
+                except Exception:
+                    pass
+                try:
+                    run_event.clear()
+                except Exception:
+                    pass
+                _clear_caches_and_temp()
+                try:
+                    _restart_children(grace_seconds=5.0)
+                except Exception as e:
+                    try:
+                        print(f"[主进程]: 内存超阈值重启子进程失败: {e}")
+                    except Exception:
+                        pass
+                mem_recovering_flag.clear()
+
+    threading.Thread(target=_memory_watch_loop, daemon=True).start()
     
     # 根据DEBUG_MODE_ON控制前台/后台行为
     debug_mode = bool(config.get('DEBUG_MODE_ON', True))
