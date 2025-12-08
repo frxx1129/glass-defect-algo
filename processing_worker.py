@@ -45,6 +45,7 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
     drain_max_n = int(config.get('system_params', {}).get('coalesce_max_drain', 500))
     
     roi_cache: dict[int, list] = {}
+    conf_cache: dict[int, dict] = {}
     camera_rois_cfg = config.get('camera_rois', {})
     def load_rois_for_cam(cam_idx: int):
         roi_path = None
@@ -65,6 +66,62 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
             print(f"[计算进程 {process_index}]: Cam{cam_idx} 加载ROI失败: {e}")
             return []
     
+    frame_counter = 0
+
+    def _get_conf_for_cam(cam_idx: int, algo_mode_rt: int):
+        # 复用 per-cam 深拷贝，避免每帧 deepcopy；按相机缓存一份，并在调用前刷新 Q 开关/运行时字段
+        if cam_idx not in conf_cache:
+            try:
+                conf_cache[cam_idx] = copy.deepcopy(config) if isinstance(config, dict) else config
+            except Exception:
+                conf_cache[cam_idx] = config
+        conf_local = conf_cache[cam_idx]
+        try:
+            cam_setup = conf_local.get('camera_setup', {}) or {}
+            total_cams_rt = int(cam_setup.get('expected_cameras', 0) or 0)
+            if total_cams_rt <= 0:
+                try:
+                    total_cams_rt = int(len(cam_setup.get('camera_bindings', []) or []))
+                except Exception:
+                    total_cams_rt = 0
+            if total_cams_rt <= 0:
+                try:
+                    cro = conf_local.get('camera_rois', {}) or {}
+                    if isinstance(cro, dict):
+                        total_cams_rt = len(cro.keys())
+                    elif isinstance(cro, list):
+                        total_cams_rt = len(cro)
+                except Exception:
+                    total_cams_rt = 0
+            q_enabled_rt = True
+            if total_cams_rt >= 1:
+                first_idx_rt = 0
+                last_idx_rt = max(0, total_cams_rt - 1)
+                q_enabled_rt = (cam_idx in (first_idx_rt, last_idx_rt))
+            try:
+                hip = conf_local.setdefault('hough_inspector_params', {})
+                dd  = hip.setdefault('DEFECT_DETECTION', {})
+                dd['Q_ENABLED'] = bool(q_enabled_rt)
+                # 传递当前算法模式供下游使用（不改变原有逻辑，仅存储）
+                hip.setdefault('__runtime__', {})['algorithm_mode'] = int(algo_mode_rt)
+            except Exception:
+                pass
+            try:
+                hid = conf_local.setdefault('hough_inspector_dark_params', {})
+                ddd = hid.setdefault('DEFECT_DETECTION', {})
+                ddd['Q_ENABLED'] = bool(q_enabled_rt)
+                hid.setdefault('__runtime__', {})['algorithm_mode'] = int(algo_mode_rt)
+            except Exception:
+                pass
+            try:
+                rt = conf_local.setdefault('__runtime__', {})
+                rt['current_cam_idx'] = cam_idx
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return conf_local
+
     while not stop_event.is_set():
         if not run_event.is_set():
             try:
@@ -112,51 +169,8 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                     algo_mode = int(getattr(shared_settings, 'algorithm_mode', 1))
                 except Exception:
                     algo_mode = 1
-                # 在进入处理器前，根据“仅头尾相机启用 Q”策略，为本次调用构造局部配置副本并注入运行时开关
-                conf_local = copy.deepcopy(config) if isinstance(config, dict) else config
-                try:
-                    cam_setup = conf_local.get('camera_setup', {}) or {}
-                    total_cams_rt = int(cam_setup.get('expected_cameras', 0) or 0)
-                    if total_cams_rt <= 0:
-                        try:
-                            total_cams_rt = int(len(cam_setup.get('camera_bindings', []) or []))
-                        except Exception:
-                            total_cams_rt = 0
-                    if total_cams_rt <= 0:
-                        try:
-                            cro = conf_local.get('camera_rois', {}) or {}
-                            if isinstance(cro, dict):
-                                total_cams_rt = len(cro.keys())
-                            elif isinstance(cro, list):
-                                total_cams_rt = len(cro)
-                        except Exception:
-                            total_cams_rt = 0
-                    q_enabled_rt = True
-                    if total_cams_rt >= 1:
-                        first_idx_rt = 0
-                        last_idx_rt = max(0, total_cams_rt - 1)
-                        q_enabled_rt = (cam_idx in (first_idx_rt, last_idx_rt))
-                    # 将运行时开关写入浅色与深色参数节
-                    try:
-                        hip = conf_local.setdefault('hough_inspector_params', {})
-                        dd  = hip.setdefault('DEFECT_DETECTION', {})
-                        dd['Q_ENABLED'] = bool(q_enabled_rt)
-                    except Exception:
-                        pass
-                    try:
-                        hid = conf_local.setdefault('hough_inspector_dark_params', {})
-                        ddd = hid.setdefault('DEFECT_DETECTION', {})
-                        ddd['Q_ENABLED'] = bool(q_enabled_rt)
-                    except Exception:
-                        pass
-                    # 记录当前相机索引，便于下游按需使用
-                    try:
-                        rt = conf_local.setdefault('__runtime__', {})
-                        rt['current_cam_idx'] = cam_idx
-                    except Exception:
-                        pass
-                except Exception:
-                    conf_local = config
+
+                conf_local = _get_conf_for_cam(cam_idx, algo_mode)
 
                 pane_json, annotated_image = fused_image_processor.process_image(
                     frame_data, roi_cache[cam_idx], conf_local, algo_mode)
@@ -317,6 +331,18 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                     result["raw_image_buffer"] = raw_buffer_encoded.tobytes()
                 # 采集模式下不保存 inspection_results 目录（主逻辑已有 storage_path，但这里只控制结果入队即可）
                 results_queue.put(result)
+                # 帧级资源释放提示 GC 更快回收
+                del frame_data, annotated_image, preview_image
+                del original_buffer_encoded
+                if success_raw and raw_buffer_encoded is not None:
+                    del raw_buffer_encoded
+                frame_counter += 1
+                if frame_counter % 200 == 0:
+                    try:
+                        import gc as _gc
+                        _gc.collect()
+                    except Exception:
+                        pass
         except Exception:
             traceback.print_exc()
 # --- END OF FILE processing_worker.py ---
