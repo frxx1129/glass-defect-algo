@@ -61,6 +61,8 @@ _roi_frame_count = {}
 _roi_fences = {}
 _roi_glass_boundary_history = {}
 _roi_glass_boundaries = {}
+# 理想竖直线缓存: 允许检测到的理想直线在后续缺失时保留最多2帧
+_roi_ideal_vertical_cache = {}
 
 def _update_glass_boundaries(roi_key, vertical_x_list, params):
     """记录多玻璃之间的候选分隔线(边界), 与栅栏不同: 边界是两块玻璃之间的中线。
@@ -1590,6 +1592,8 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
 def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: float, binary_edges=None):
     p_defect = params["DEFECT_DETECTION"]; p_crack = params["CRACK_CLASSIFICATION"]
     num_edges = len(edges); roi_h, roi_w = roi_dims
+    # 保留原始检测到的所有线段，用于后续“斜边异常(E)”对全量直线的扫描
+    all_detected_edges = [np.array(e, dtype=float) for e in (edges or [])]
     # 调试开关（控制台打印）：默认关闭，可通过 params.DEBUG.PRINT_CORNERS 开启
     try:
         _DBG_PRINT = bool(params.get('DEBUG', {}).get('PRINT_CORNERS', params.get('DEFECT_DETECTION', {}).get('DEBUG_PRINT', False)))
@@ -2181,262 +2185,115 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 pass
 
     # 新增：按角度将主边分类为 平行 / 垂直 / 斜边，并为斜边生成覆盖条带+Canny白点范围的缺陷
+    # 新需求：不依赖主边/直线，只要 ROI 中存在“较斜”的 Canny 边缘即判为 E
     skew_line_defects = []
     try:
-        # 默认容忍角度改为 10°（可通过 DEFECT_DETECTION.VERTICAL_ANGLE_TOL_DEG 覆盖）
         vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
     except Exception:
         vertical_tol_deg = 10.0
 
-    def _angle_to_x_axis_deg(line):
-        x1, y1, x2, y2 = map(float, line)
-        dx, dy = (x2 - x1), (y2 - y1)
-        ang = abs(np.degrees(np.arctan2(dy, dx)))
-        if ang > 90.0:
-            ang = 180.0 - ang
-        return ang  # [0,90]
-
-    def _axis_aligned_box_points_for_line(seg, pad: int = 2):
-        # 用线段端点生成窄矩形，再取其 axis-aligned 外接框
-        p1 = np.array(seg[:2], dtype=float); p2 = np.array(seg[2:], dtype=float)
-        v = p2 - p1
-        L = float(np.linalg.norm(v))
-        if L < 1e-6:
-            x = int(round(min(p1[0], p2[0]))); y = int(round(min(p1[1], p2[1])))
-            w = h = max(1, int(pad*2))
+    if isinstance(binary_edges, np.ndarray) and binary_edges.size > 0:
+        # 放宽可容纳的 Canny 范围：可选对边缘图做轻微膨胀，扩大可判定区域
+        try:
+            dil_iter = int(params.get('DEFECT_DETECTION', {}).get('E_CANNY_DILATE_ITER', 1))
+            dil_iter = max(0, min(dil_iter, 5))
+        except Exception:
+            dil_iter = 1
+        if dil_iter > 0:
+            kernel_e = np.ones((3,3), np.uint8)
+            edges_for_e = cv2.dilate((binary_edges > 0).astype(np.uint8), kernel_e, iterations=dil_iter)
         else:
-            u = v / L
-            n = np.array([-u[1], u[0]])
-            half_w = float(max(1, pad))
-            quad = np.array([
-                p1 + n * half_w,
-                p2 + n * half_w,
-                p2 - n * half_w,
-                p1 - n * half_w
-            ], dtype=np.float32)
-            x, y, w, h = cv2.boundingRect(np.int32(quad))
-        box = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.int32)
-        return box
-
-    # 计算“参考垂直角”：用当前 ROI 中被判为垂直的边的角度均值；若无，则用 90°
-    try:
-        all_angles_deg = []
-        for e in true_edges:
-            all_angles_deg.append(_angle_to_x_axis_deg(e))
-        vertical_angles = [a for a in all_angles_deg if a >= (90.0 - vertical_tol_deg)]
-        vertical_ref_deg = (float(np.mean(vertical_angles)) if vertical_angles else 90.0)
-    except Exception:
-        vertical_ref_deg = 90.0
-
-    # 分类并收集边缘异常（非平行且非垂直）
-    for e in true_edges:
+            edges_for_e = (binary_edges > 0).astype(np.uint8)
+        contours, _ = cv2.findContours(edges_for_e, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         try:
-            a_deg = _angle_to_x_axis_deg(e)
-            is_parallel = (a_deg <= vertical_tol_deg)
-            is_vertical = (abs(a_deg - vertical_ref_deg) <= vertical_tol_deg)
-            if not is_parallel and not is_vertical:
-                angle_to_vertical = float(abs(a_deg - vertical_ref_deg))
-                # 构建沿斜边的“拓宽+延长”条带，并用该条带内的 Canny 白点作为完整覆盖范围
-                p1 = np.array(e[:2], dtype=float); p2 = np.array(e[2:], dtype=float)
-                v = p2 - p1; L = float(np.linalg.norm(v))
-                if L < 1e-6:
-                    continue
-                u = v / L
-                n = np.array([-u[1], u[0]], dtype=float)
-                # 宽度与延长长度（毫米配置转像素）
-                try:
-                    half_w_px = 0.5 * _get_dist_px(params.get('DEFECT_DETECTION', {}), 'E_STRIPE_WIDTH_MM', None, 6.0, pixels_per_mm)
-                except Exception:
-                    half_w_px = max(3.0, 3.0 * float(pixels_per_mm if pixels_per_mm else 1.0))
-                try:
-                    extend_px = _get_dist_px(params.get('DEFECT_DETECTION', {}), 'E_EXTEND_MARGIN_MM', None, 10.0, pixels_per_mm)
-                except Exception:
-                    extend_px = 10.0 * float(pixels_per_mm if pixels_per_mm else 1.0)
-                # 生成扩展后的四点条带
-                s = p1 - u * float(extend_px)
-                t = p2 + u * float(extend_px)
-                q1 = s + n * float(half_w_px)
-                q2 = t + n * float(half_w_px)
-                q3 = t - n * float(half_w_px)
-                q4 = s - n * float(half_w_px)
-                band_poly = np.array([q1, q2, q3, q4], dtype=np.int32).reshape((-1,1,2))
-
-                # 在条带内取 Canny 白点；如无 Canny，回退到细长框
-                min_rect = None; box_pts = None
-                if binary_edges is not None and isinstance(binary_edges, np.ndarray) and binary_edges.size > 0:
-                    try:
-                        mask = np.zeros(roi_gray.shape, dtype=np.uint8)
-                        cv2.fillPoly(mask, [band_poly], 255)
-                        # 条带内边缘
-                        band_edges = cv2.bitwise_and(binary_edges, mask)
-                        # 1) 条带内膨胀，尽量闭合
-                        try:
-                            k_band = int(params.get('DEFECT_DETECTION', {}).get('E_BAND_DILATE_KSIZE', 3))
-                        except Exception:
-                            k_band = 3
-                        k_band = max(1, k_band | 1)  # 确保奇数
-                        try:
-                            it_band = int(params.get('DEFECT_DETECTION', {}).get('E_BAND_DILATE_ITERS', 1))
-                        except Exception:
-                            it_band = 1
-                        kernel_band = np.ones((k_band, k_band), dtype=np.uint8)
-                        band_dil = cv2.dilate(band_edges, kernel_band, iterations=max(1, it_band))
-                        # 2) 连接条带外部：对全局边缘轻度膨胀，找与 band_dil 连通的整块
-                        try:
-                            k_conn = int(params.get('DEFECT_DETECTION', {}).get('E_CONNECT_DILATE_KSIZE', 3))
-                        except Exception:
-                            k_conn = 3
-                        k_conn = max(1, k_conn | 1)
-                        try:
-                            it_conn = int(params.get('DEFECT_DETECTION', {}).get('E_CONNECT_DILATE_ITERS', 1))
-                        except Exception:
-                            it_conn = 1
-                        kernel_conn = np.ones((k_conn, k_conn), dtype=np.uint8)
-                        global_conn = cv2.dilate(binary_edges, kernel_conn, iterations=max(1, it_conn))
-                        # 连通域标签
-                        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((global_conn > 0).astype(np.uint8), connectivity=8)
-                        if num_labels > 1:
-                            # 找与 band_dil 有重叠的标签集合（去除背景0）
-                            overlap_labels = np.unique(labels[(band_dil > 0)])
-                            overlap_labels = overlap_labels[overlap_labels != 0]
-                            union_mask = (band_dil > 0).astype(np.uint8)
-                            for lbl in overlap_labels:
-                                union_mask |= (labels == int(lbl)).astype(np.uint8)
-                        else:
-                            union_mask = (band_dil > 0).astype(np.uint8)
-                        # 若 ROI 存在水平边，则先构造水平带状屏蔽掩码，并从联合掩码中剔除
-                        try:
-                            try:
-                                h_tol_deg_local = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', 10.0))
-                            except Exception:
-                                h_tol_deg_local = 10.0
-                            try:
-                                stripe_w_px = int(params.get('DEFECT_DETECTION', {}).get('E_HORIZONTAL_MASK_STRIPE_PX', 5))
-                            except Exception:
-                                stripe_w_px = 5
-                            stripe_half = max(1.0, float(stripe_w_px) / 2.0)
-                            hmask = np.zeros_like(union_mask, dtype=np.uint8)
-                            for he in (true_edges or []):
-                                ang_h = _angle_to_x_axis_deg(he)
-                                if ang_h <= h_tol_deg_local:
-                                    hp1 = np.array(he[:2], dtype=float); hp2 = np.array(he[2:], dtype=float)
-                                    hv = hp2 - hp1
-                                    hL = float(np.linalg.norm(hv))
-                                    if hL <= 1e-6:
-                                        continue
-                                    hu = hv / hL
-                                    hn = np.array([-hu[1], hu[0]], dtype=float)
-                                    hq1 = hp1 + hn * stripe_half
-                                    hq2 = hp2 + hn * stripe_half
-                                    hq3 = hp2 - hn * stripe_half
-                                    hq4 = hp1 - hn * stripe_half
-                                    hpoly = np.array([hq1, hq2, hq3, hq4], dtype=np.int32).reshape((-1,1,2))
-                                    cv2.fillPoly(hmask, [hpoly], 1)
-                            if int(np.sum(hmask)) > 0:
-                                union_mask = (union_mask & (1 - hmask)).astype(np.uint8)
-                        except Exception:
-                            pass
-
-                        # 生成区域轮廓并取凸包→最小外接矩形
-                        if int(cv2.countNonZero(union_mask)) >= 10:
-                            contours, _ = cv2.findContours((union_mask * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                            if contours:
-                                biggest = max(contours, key=cv2.contourArea)
-                                hull = cv2.convexHull(biggest)
-                                if isinstance(hull, np.ndarray) and hull.shape[0] >= 3:
-                                    min_rect = cv2.minAreaRect(hull)
-                                    box_pts = cv2.boxPoints(min_rect).astype(np.int32)
-                                else:
-                                    min_rect = None; box_pts = None
-                        # 无法构建则回退
-                    except Exception:
-                        min_rect = None; box_pts = None
-                # 回退：若 Canny 未覆盖，使用原有细窄外接框
-                if min_rect is None or box_pts is None:
-                    # 直接使用线段的轴对齐外接框
-                    box_pts = _axis_aligned_box_points_for_line(e, pad=3)
-                    skew_line_defects.append({
-                        'type': 'E',
-                        'box_points': box_pts,
-                        'skew_angle_deg': angle_to_vertical
-                    })
-                else:
-                    # 改为输出轴对齐 bounding box：由 minAreaRect 的四点再取 boundingRect
-                    try:
-                        rect = cv2.boundingRect(box_pts.astype(np.int32))
-                        xbb, ybb, wbb, hbb = rect
-                        aabb = np.array([[xbb, ybb], [xbb + wbb, ybb], [xbb + wbb, ybb + hbb], [xbb, ybb + hbb]], dtype=np.int32)
-                    except Exception:
-                        # 回退：若异常则直接用原 box_pts（通常已接近旋转矩形），仍作为多边形输出
-                        aabb = box_pts.astype(np.int32)
-                    skew_line_defects.append({
-                        'type': 'E',
-                        'box_points': aabb,
-                        'skew_angle_deg': angle_to_vertical
-                    })
+            min_area_px2 = _get_area_px2(params.get('DEFECT_DETECTION', {}), 'E_MIN_AREA_MM2', None, 4.0, pixels_per_mm)
         except Exception:
-            continue
+            min_area_px2 = 20.0
+        try:
+            min_side_px_cfg = _get_dist_px(params.get('DEFECT_DETECTION', {}), 'E_MIN_SIDE_MM', None, 20.0, pixels_per_mm)
+        except Exception:
+            min_side_px_cfg = _mm_to_px(20.0, pixels_per_mm)
+        try:
+            min_side_px_required = _mm_to_px(20.0, pixels_per_mm)
+        except Exception:
+            min_side_px_required = min_side_px_cfg
+        min_side_px = max(min_side_px_cfg, min_side_px_required)
+        for cnt in contours:
+            area = float(cv2.contourArea(cnt))
+            if area < max(1.0, min_area_px2):
+                continue
+            rect = cv2.minAreaRect(cnt)
+            (cx, cy), (w, h), angle_raw = rect
+            if w < 1e-3 or h < 1e-3:
+                continue
+            if min(w, h) < max(1.0, min_side_px):
+                continue
+            ang = float(abs(angle_raw))
+            if w < h:
+                ang = float(abs(angle_raw + 90.0))
+            if ang > 90.0:
+                ang -= 90.0
+            if ang <= vertical_tol_deg or ang >= (90.0 - vertical_tol_deg):
+                continue
+            box = cv2.boxPoints(rect).astype(np.int32)
+            xbb, ybb, wbb, hbb = cv2.boundingRect(box)
+            aabb = np.array([[xbb, ybb], [xbb + wbb, ybb], [xbb + wbb, ybb + hbb], [xbb, ybb + hbb]], dtype=np.int32)
+            skew_line_defects.append({
+                'type': 'E',
+                'box_points': aabb,
+                'skew_angle_deg': float(90.0 - ang)
+            })
 
-    # 合并重叠的 E 类型 bounding box，并生成 size_label
     if skew_line_defects:
-        try:
-            e_items = [d for d in skew_line_defects if d.get('type') == 'E' and d.get('box_points') is not None]
-            others_e = [d for d in skew_line_defects if not (d.get('type') == 'E' and d.get('box_points') is not None)]
-            rects = []  # (x,y,w,h,angle,area)
-            for ed in e_items:
-                try:
-                    box = np.array(ed.get('box_points'), dtype=np.int32)
-                    x,y,w,h = cv2.boundingRect(box)
-                    ang = float(ed.get('skew_angle_deg', 0.0))
-                    area = float(max(1,w)*max(1,h))
-                    rects.append([x,y,w,h,ang,area])
-                except Exception:
-                    continue
-            n_e = len(rects)
-            if n_e > 0:
-                parent = list(range(n_e))
-                def find(a):
-                    while parent[a] != a:
-                        parent[a] = parent[parent[a]]
-                        a = parent[a]
-                    return a
-                def union(a,b):
-                    ra,rb = find(a),find(b)
-                    if ra!=rb: parent[rb]=ra
-                def overlap(r1,r2):
-                    x1,y1,w1,h1 = r1[0],r1[1],r1[2],r1[3]
-                    x2,y2,w2,h2 = r2[0],r2[1],r2[2],r2[3]
-                    ax1,ay1,ax2,ay2 = x1,y1,x1+w1,y1+h1
-                    bx1,by1,bx2,by2 = x2,y2,x2+w2,y2+h2
-                    ix1,iy1 = max(ax1,bx1), max(ay1,by1)
-                    ix2,iy2 = min(ax2,bx2), min(ay2,by2)
-                    return (ix2-ix1) > 0 and (iy2-iy1) > 0
-                for i in range(n_e):
-                    for j in range(i+1,n_e):
-                        try:
-                            if overlap(rects[i], rects[j]):
-                                union(i,j)
-                        except Exception:
-                            continue
-                groups = {}
-                for i in range(n_e):
-                    r = find(i)
-                    groups.setdefault(r, []).append(i)
-                merged = []
-                for _, idxs in groups.items():
-                    xs=[]; ys=[]; x2s=[]; y2s=[]; angle_sum=0.0; area_sum=0.0
-                    for k in idxs:
-                        x,y,w,h,ang,area = rects[k]
-                        xs.append(x); ys.append(y); x2s.append(x+w); y2s.append(y+h)
-                        angle_sum += ang * area; area_sum += area
-                    X=min(xs); Y=min(ys); X2=max(x2s); Y2=max(y2s)
-                    W=max(1, X2-X); H=max(1, Y2-Y)
-                    aabb = np.array([[X,Y],[X+W,Y],[X+W,Y+H],[X,Y+H]], dtype=np.int32)
-                    avg_ang = float(angle_sum/area_sum) if area_sum>1e-6 else 0.0
-                    merged.append({'type':'E','box_points':aabb,'skew_angle_deg':avg_ang})
-                skew_line_defects = others_e + merged
-        except Exception:
-            pass
+        e_items = [d for d in skew_line_defects if d.get('type') == 'E' and d.get('box_points') is not None]
+        others_e = [d for d in skew_line_defects if not (d.get('type') == 'E' and d.get('box_points') is not None)]
+        rects = []  # (x,y,w,h,angle,area)
+        for ed in e_items:
+            box = np.array(ed.get('box_points'), dtype=np.int32)
+            x,y,w,h = cv2.boundingRect(box)
+            ang = float(ed.get('skew_angle_deg', 0.0))
+            area = float(max(1,w)*max(1,h))
+            rects.append([x,y,w,h,ang,area])
+        n_e = len(rects)
+        if n_e > 0:
+            parent = list(range(n_e))
+            def find(a):
+                while parent[a] != a:
+                    parent[a] = parent[parent[a]]
+                    a = parent[a]
+                return a
+            def union(a,b):
+                ra,rb = find(a),find(b)
+                if ra!=rb: parent[rb]=ra
+            def overlap(r1,r2):
+                x1,y1,w1,h1 = r1[0],r1[1],r1[2],r1[3]
+                x2,y2,w2,h2 = r2[0],r2[1],r2[2],r2[3]
+                ax1,ay1,ax2,ay2 = x1,y1,x1+w1,y1+h1
+                bx1,by1,bx2,by2 = x2,y2,x2+w2,y2+h2
+                ix1,iy1 = max(ax1,bx1), max(ay1,by1)
+                ix2,iy2 = min(ax2,bx2), min(ay2,by2)
+                return (ix2-ix1) > 0 and (iy2-iy1) > 0
+            for i in range(n_e):
+                for j in range(i+1,n_e):
+                    if overlap(rects[i], rects[j]):
+                        union(i,j)
+            groups = {}
+            for i in range(n_e):
+                r = find(i)
+                groups.setdefault(r, []).append(i)
+            merged = []
+            for _, idxs in groups.items():
+                xs=[]; ys=[]; x2s=[]; y2s=[]; angle_sum=0.0; area_sum=0.0
+                for k in idxs:
+                    x,y,w,h,ang,area = rects[k]
+                    xs.append(x); ys.append(y); x2s.append(x+w); y2s.append(y+h)
+                    angle_sum += ang * area; area_sum += area
+                X=min(xs); Y=min(ys); X2=max(x2s); Y2=max(y2s)
+                W=max(1, X2-X); H=max(1, Y2-Y)
+                aabb = np.array([[X,Y],[X+W,Y],[X+W,Y+H],[X,Y+H]], dtype=np.int32)
+                avg_ang = float(angle_sum/area_sum) if area_sum>1e-6 else 0.0
+                merged.append({'type':'E','box_points':aabb,'skew_angle_deg':avg_ang})
+            skew_line_defects = others_e + merged
     # 为 E 类型添加尺寸，供后续输出（size_label 不在算法侧生成）
     try:
         for ed in (skew_line_defects or []):
@@ -3858,6 +3715,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     if y + h > H:
         h = max(0, H - y)
     roi_gray = image_gray[y:y+h, x:x+w]
+    # ROI 标识用于跨帧缓存（如理想直线保留）
+    roi_id = params.get('ROI_ID', None)
+    roi_key_for_cache = (roi_id, w, h)
     
     p_hough = params["HOUGH_TRANSFORM"]
     binary_edges = preprocess_for_hough_enhanced(roi_gray, params)
@@ -4010,6 +3870,14 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         enable_ev = bool(p_def_evb.get('B_USE_IDEAL_VERTICAL_FROM_CANNY', True))
     except Exception:
         enable_ev = True
+    cache_entry_ideal = _roi_ideal_vertical_cache.get(roi_key_for_cache, None)
+    cached_ideal_lines = []
+    if cache_entry_ideal and isinstance(cache_entry_ideal.get('lines'), list):
+        try:
+            cached_ideal_lines = [np.array(l, dtype=float) for l in cache_entry_ideal.get('lines')]
+        except Exception:
+            cached_ideal_lines = []
+    added_from_cache = False
     if enable_ev and binary_edges is not None and binary_edges.size > 0:
         try:
             # 统计当前近竖直主边数量
@@ -4072,8 +3940,72 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             continue
                         seg_new = np.array([x_new, 0.0, x_new, float(H_be - 1)], dtype=float)
                         main_edges.append(seg_new)
+                        cached_ideal_lines.append(seg_new.copy())
+                    if cached_ideal_lines:
+                        _roi_ideal_vertical_cache[roi_key_for_cache] = {'lines': [c.tolist() for c in cached_ideal_lines], 'ttl': 2}
+                elif cached_ideal_lines:
+                    # 没有检测到新的理想线，但有缓存，保留最多2帧
+                    try:
+                        remaining = int(cache_entry_ideal.get('ttl', 0)) if cache_entry_ideal else 0
+                    except Exception:
+                        remaining = 0
+                    if remaining > 0:
+                        def _x_mid(seg):
+                            return 0.5 * (float(seg[0]) + float(seg[2]))
+                        existing_xs = []
+                        for e in (main_edges or []):
+                            if _is_near_vertical(e, tol_v):
+                                existing_xs.append(_x_mid(e))
+                        for seg_new in cached_ideal_lines:
+                            x_new = _x_mid(seg_new)
+                            if any(abs(float(ex) - x_new) <= 2.0 for ex in existing_xs):
+                                continue
+                            main_edges.append(seg_new.copy())
+                            added_from_cache = True
+                        remaining = max(0, remaining - 1)
+                        if remaining > 0:
+                            _roi_ideal_vertical_cache[roi_key_for_cache] = {'lines': [c.tolist() for c in cached_ideal_lines], 'ttl': remaining}
+                        else:
+                            _roi_ideal_vertical_cache.pop(roi_key_for_cache, None)
         except Exception:
             pass
+    # 如果本帧未启用理想线生成（或边缘为空）但存在缓存，则同样尝试复用一次
+    if (not added_from_cache) and cached_ideal_lines:
+        try:
+            tol_v_fallback = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+        except Exception:
+            tol_v_fallback = 10.0
+        def _is_near_vertical_fb(seg, tol_deg=10.0):
+            x1,y1,x2,y2 = map(float, seg)
+            ang = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+            if ang > 90.0:
+                ang = 180.0 - ang
+            return ang >= (90.0 - tol_deg)
+        try:
+            current_v_fb = sum(1 for e in (main_edges or []) if _is_near_vertical_fb(e, tol_v_fallback))
+        except Exception:
+            current_v_fb = 0
+        try:
+            remaining_fb = int(cache_entry_ideal.get('ttl', 0)) if cache_entry_ideal else 0
+        except Exception:
+            remaining_fb = 0
+        if remaining_fb > 0 and current_v_fb < 2:
+            def _x_mid_fb(seg):
+                return 0.5 * (float(seg[0]) + float(seg[2]))
+            existing_xs_fb = []
+            for e in (main_edges or []):
+                if _is_near_vertical_fb(e, tol_v_fallback):
+                    existing_xs_fb.append(_x_mid_fb(e))
+            for seg_new in cached_ideal_lines:
+                x_new = _x_mid_fb(seg_new)
+                if any(abs(float(ex) - x_new) <= 2.0 for ex in existing_xs_fb):
+                    continue
+                main_edges.append(seg_new.copy())
+            remaining_fb = max(0, remaining_fb - 1)
+            if remaining_fb > 0:
+                _roi_ideal_vertical_cache[roi_key_for_cache] = {'lines': [c.tolist() for c in cached_ideal_lines], 'ttl': remaining_fb}
+            else:
+                _roi_ideal_vertical_cache.pop(roi_key_for_cache, None)
     # 计算本帧（该 ROI）主边之间的有效相交点（仅在本 ROI 范围内）
     intersections_frame = []
     if main_edges and len(main_edges) >= 2:
