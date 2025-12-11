@@ -3748,7 +3748,62 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             return 0.0
         return 0.0
 
+    def _measure_length_mm_for_defect(d: dict, ppm: float) -> float:
+        try:
+            if d is None or ppm is None or ppm <= 0:
+                return 0.0
+            t = d.get('type')
+            if t == 'Q':
+                try:
+                    tri = None
+                    if 'region_contour' in d and isinstance(d['region_contour'], np.ndarray) and d['region_contour'].shape[0] >= 3:
+                        tri = d['region_contour'].reshape(-1,2).astype(np.float32)
+                    if tri is None and 'min_area_rect' in d and isinstance(d['min_area_rect'], tuple):
+                        rectq = d['min_area_rect']
+                        w_px = float(rectq[1][0] or 0.0)
+                        h_px = float(rectq[1][1] or 0.0)
+                        return max(w_px, h_px) / float(ppm)
+                    if tri is not None and tri.shape[0] >= 3:
+                        rectq = cv2.minAreaRect(tri)
+                        w_px = float(rectq[1][0] or 0.0)
+                        h_px = float(rectq[1][1] or 0.0)
+                        return max(w_px, h_px) / float(ppm)
+                except Exception:
+                    pass
+            rect = d.get('min_area_rect')
+            if rect is not None and isinstance(rect, tuple) and len(rect) >= 2:
+                w_px = float(rect[1][0] or 0.0)
+                h_px = float(rect[1][1] or 0.0)
+                return max(w_px, h_px) / float(ppm)
+            box = d.get('box_points')
+            if box is not None and len(box) >= 4:
+                rect2 = cv2.minAreaRect(np.array(box, dtype=np.float32).reshape(-1, 2))
+                w_px = float(rect2[1][0] or 0.0)
+                h_px = float(rect2[1][1] or 0.0)
+                return max(w_px, h_px) / float(ppm)
+            cnt = d.get('contour')
+            if cnt is not None and len(cnt) >= 3:
+                rect3 = cv2.minAreaRect(np.array(cnt, dtype=np.float32))
+                w_px = float(rect3[1][0] or 0.0)
+                h_px = float(rect3[1][1] or 0.0)
+                return max(w_px, h_px) / float(ppm)
+        except Exception:
+            return 0.0
+        return 0.0
+
     filtered_defects = []
+    try:
+        q_len_filter_enable = bool(params.get('DEFECT_DETECTION', {}).get('Q_LENGTH_RANGE_FILTER_ENABLE', False))
+    except Exception:
+        q_len_filter_enable = True
+    try:
+        q_len_min_mm = float(params.get('DEFECT_DETECTION', {}).get('Q_LENGTH_MIN_MM', 23.0))
+    except Exception:
+        q_len_min_mm = 23.0
+    try:
+        q_len_max_mm = float(params.get('DEFECT_DETECTION', {}).get('Q_LENGTH_MAX_MM', 34.0))
+    except Exception:
+        q_len_max_mm = 34.0
     for d in combined_defects:
         if d is None:
             continue
@@ -3756,6 +3811,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         if t in ('Q', 'B', 'L'):
             width_mm = _measure_width_mm_for_defect(d, pixels_per_mm)
             if width_mm >= 5.0:
+                if t == 'Q' and q_len_filter_enable:
+                    length_mm = _measure_length_mm_for_defect(d, pixels_per_mm)
+                    if (q_len_min_mm and length_mm < q_len_min_mm) or (q_len_max_mm and length_mm > q_len_max_mm):
+                        # drop
+                        continue
                 filtered_defects.append(d)
             else:
                 # 过滤宽度小于 5mm 的 Q/B/L
@@ -4464,38 +4524,38 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     # 绘制主边直线、角点（移除调试打印）
     annotations_to_draw = []
-    # try:
-    #    for i, seg in enumerate(edges_for_drawing or []):
-    #        x1,y1,x2,y2 = map(float, seg)
-    #        dx, dy = (x2-x1), (y2-y1)
-    #        ang = abs(np.degrees(np.arctan2(dy, dx)))
-    #        if ang > 90.0: ang = 180.0 - ang
-    #        length_px = float(np.hypot(dx, dy))
-    #        length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
+    try:
+       for i, seg in enumerate(edges_for_drawing or []):
+           x1,y1,x2,y2 = map(float, seg)
+           dx, dy = (x2-x1), (y2-y1)
+           ang = abs(np.degrees(np.arctan2(dy, dx)))
+           if ang > 90.0: ang = 180.0 - ang
+           length_px = float(np.hypot(dx, dy))
+           length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
 
-    #        color = (200,200,200)
-    #        if ang >= 80.0:
-    #            color = (0,255,0)
-    #        elif ang <= 10.0:
-    #            color = (255,0,0)
-    #        cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
+           color = (200,200,200)
+           if ang >= 80.0:
+               color = (0,255,0)
+           elif ang <= 10.0:
+               color = (255,0,0)
+           cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
 
-    #        mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
-    #        try:
-    #            cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-    #        except Exception:
-    #            pass
+           mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
+           try:
+               cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+           except Exception:
+               pass
 
-    #    for (ii, jj, cp_arr) in (paired_corners or []):
-    #       try:
-    #           cx, cy = float(cp_arr[0]), float(cp_arr[1])
-    #           cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
-    #           cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
-    #       except Exception:
-    #           continue
+       for (ii, jj, cp_arr) in (paired_corners or []):
+          try:
+              cx, cy = float(cp_arr[0]), float(cp_arr[1])
+              cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
+              cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
+          except Exception:
+              continue
 
-    # except Exception:
-    #    pass
+    except Exception:
+       pass
     
     for defect_report in final_defects_for_report:
         defect = defect_report['raw_defect']

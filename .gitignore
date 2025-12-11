@@ -60,7 +60,7 @@ inspection_results/
 *.avi
 *.mkv
 *.mov
-
+inputs
 *_results/
 *_output/
 *_reports/
