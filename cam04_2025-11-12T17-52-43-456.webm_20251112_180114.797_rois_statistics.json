@@ -1,0 +1,29 @@
+{
+    "average_roi_overall": {
+        "x": 3,
+        "y": 368,
+        "width": 1217,
+        "height": 91
+    },
+    "total_images_annotated": 1,
+    "total_rois_annotated": 2,
+    "detailed_data": [
+        {
+            "filename": "cam04_2025-11-12T17-52-43-456.webm_20251112_180114.797.bmp",
+            "rois": [
+                [
+                    6,
+                    232,
+                    1216,
+                    94
+                ],
+                [
+                    1,
+                    504,
+                    1218,
+                    88
+                ]
+            ]
+        }
+    ]
+}

@@ -6,7 +6,7 @@
   "user_id_auto": 7,
   "user_id_manual": 9999,
   "system_params": {
-    "pixels_per_mm": 2.4,
+    "pixels_per_mm": 1.22,
     "queue_size_factor": 2,
     "http_client_max_workers": 4,
     "http_get_timeout_s": 5,
@@ -70,7 +70,7 @@
     }
   },
   "camera_rois": {
-    "0": "cam01_2025-12-10T11-05-59-030.webm_20251211_173331.451_roi_averaged_by_group.json",
+    "0": "cam04_2025-11-12T17-52-43-456.webm_20251112_180114.797_roi_averaged_by_group.json",
     "1": "cam2_roi_averaged_by_group.json",
     "2": "cam5_roi_averaged_by_group.json",
     "3": "cam4_roi_averaged_by_group.json",
