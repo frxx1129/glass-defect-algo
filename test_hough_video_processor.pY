@@ -8,8 +8,10 @@ import math
 from datetime import datetime
 import base64
 import numpy as np
-# 假设 image_processor_hough.py 在同一目录下
-import image_processor_hough as image_processor
+import importlib
+
+# 将在 main 中按参数选择 CPU/GPU 版本的处理器
+image_processor = None
 
 # --- 模拟 SharedSettings 类 (来自 glass_inspector 项目，简化用于测试) ---
 class MockSharedSettings:
@@ -86,6 +88,7 @@ def main():
     default_cfg = 'config.yaml' if os.path.exists('config.yaml') else 'config.json'
     parser.add_argument('--config', default=default_cfg, help="配置文件的路径（支持 YAML/JSON，默认优先读取 config.yaml）。")
     parser.add_argument('--output-fps', type=float, default=None, help='覆盖输出视频的帧率；不指定则尽量使用输入视频FPS，失败回退到30.0')
+    parser.add_argument('--processor', choices=['cpu','gpu'], default='cpu', help='选择处理器: cpu 或 gpu(需 OpenCV CUDA 支持)')
     args = parser.parse_args()
 
     # 1. 规范化输入路径（去掉可能的反引号/引号/空格），然后检查是否存在
@@ -115,9 +118,23 @@ def main():
         print(f"错误: 解析配置文件 '{args.config}' 失败: {e}")
         return
 
-    # 3. 模拟 SharedSettings 和 ROI 缓存
+    # 3. 选择处理器模块（CPU/GPU）
+    global image_processor
+    module_name = 'image_processor_hough_gpu' if args.processor == 'gpu' else 'image_processor_hough'
+    try:
+        image_processor = importlib.import_module(module_name)
+        print(f"使用处理器模块: {module_name}")
+        if args.processor == 'gpu':
+            cuda_ok = bool(getattr(image_processor, '_CUDA_AVAILABLE', False))
+            if not cuda_ok:
+                raise RuntimeError('OpenCV 未启用 CUDA，无法使用 GPU 路径')
+    except Exception as e:
+        print(f"加载 {module_name} 失败/不满足条件 ({e}), 回退 CPU")
+        image_processor = importlib.import_module('image_processor_hough')
+
+    # 4. 模拟 SharedSettings 和 ROI 缓存
     shared_settings = MockSharedSettings()
-    roi_cache = {} 
+    roi_cache = {}
     
     # 模拟单路相机，相机索引为0
     cam_index = 0 

@@ -1,3 +1,9 @@
+try:
+    profile
+except NameError:
+    def profile(func):
+        return func
+
 # --- START OF FILE image_processor_hough.py ---
 import cv2
 import numpy as np
@@ -17,6 +23,7 @@ except ImportError:
 # --- 全局字体加载 ---
 # ====================================================================================
 
+@profile
 def _get_font(font_size=36):
     if not PIL_AVAILABLE:
         return None
@@ -42,6 +49,10 @@ def _get_font(font_size=36):
 ANNOTATION_FONT = _get_font(font_size=32)
 import math
 
+# 轻量缓存：重复使用的 CLAHE 和 3x3 kernel，减少重复分配
+_CLAHE_CACHE: dict = {}
+_DENOISE_KERNEL3 = np.ones((3, 3), dtype=np.uint8)
+
 # ====================================================================================
 # --- 水平延长“栅栏”历史缓存 (基于前若干帧竖直边位置) ---
 # ====================================================================================
@@ -64,6 +75,7 @@ _roi_glass_boundaries = {}
 # 理想竖直线缓存: 允许检测到的理想直线在后续缺失时保留最多2帧
 _roi_ideal_vertical_cache = {}
 
+@profile
 def _update_glass_boundaries(roi_key, vertical_x_list, params):
     """记录多玻璃之间的候选分隔线(边界), 与栅栏不同: 边界是两块玻璃之间的中线。
     当帧内存在至少两条近竖直边且最大间隙>=配置阈值时, 取该最大间隙的中点作为候选边界。累积若干帧后取中位数稳定化。
@@ -102,9 +114,11 @@ def _update_glass_boundaries(roi_key, vertical_x_list, params):
         # 生成后清空历史以释放内存
         _roi_glass_boundary_history[roi_key] = []
 
+@profile
 def _get_glass_boundary(roi_key):
     return _roi_glass_boundaries.get(roi_key, None)
 
+@profile
 def _update_vertical_fences(roi_key, vertical_x_list, params):
     """更新竖直边历史并在达到设定帧数后生成栅栏。"""
     # 若已生成栅栏，不再累积历史，避免内存泄漏
@@ -151,6 +165,7 @@ def _update_vertical_fences(roi_key, vertical_x_list, params):
         # 生成后清空历史以释放内存
         _roi_vertical_history[roi_key] = []
 
+@profile
 def _get_fences_for_roi(roi_key):
     return _roi_fences.get(roi_key, [])
 
@@ -161,13 +176,16 @@ def _get_fences_for_roi(roi_key):
 # ====================================================================================
 
 # --- 单位换算与配置读取辅助 ---
+@profile
 def _mm_to_px(val_mm: float, pixels_per_mm: float) -> float:
     return float(val_mm) * float(pixels_per_mm)
 
+@profile
 def _mm2_to_px2(val_mm2: float, pixels_per_mm: float) -> float:
     ppm = float(pixels_per_mm)
     return float(val_mm2) * (ppm * ppm)
 
+@profile
 def _get_dist_px(cfg: dict, key_mm: str, key_px: str | None, default_mm: float | None, pixels_per_mm: float, default_px: float | None = None) -> float:
     """优先读毫米键, 否则回退像素键并原样使用；若都无则用默认并换算。"""
     if key_mm in cfg:
@@ -180,6 +198,7 @@ def _get_dist_px(cfg: dict, key_mm: str, key_px: str | None, default_mm: float |
         return float(default_px)
     return 0.0
 
+@profile
 def _get_area_px2(cfg: dict, key_mm2: str, key_px2: str | None, default_mm2: float | None, pixels_per_mm: float, default_px2: float | None = None) -> float:
     if key_mm2 in cfg:
         return _mm2_to_px2(cfg[key_mm2], pixels_per_mm)
@@ -191,6 +210,7 @@ def _get_area_px2(cfg: dict, key_mm2: str, key_px2: str | None, default_mm2: flo
         return float(default_px2)
     return 0.0
 
+@profile
 def _kernel_mm_to_px_odd(kernel_mm: list[float] | tuple[float, float], pixels_per_mm: float, fallback_px: list[int] | None = None) -> tuple[int, int]:
     """将以毫米配置的核尺寸转换为奇数像素尺寸；若无毫米键则回退像素尺寸。"""
     if kernel_mm is not None:
@@ -212,6 +232,7 @@ def _kernel_mm_to_px_odd(kernel_mm: list[float] | tuple[float, float], pixels_pe
             return (5, 5)
     return (5, 5)
 
+@profile
 def draw_dashed_line(img, pt1, pt2, color, thickness=1, dash_length=10):
     dist = np.linalg.norm(np.array(pt1) - np.array(pt2))
     if dist == 0: return
@@ -231,6 +252,7 @@ def draw_dashed_line(img, pt1, pt2, color, thickness=1, dash_length=10):
         current_pos = current_pos + delta * (2 * dash_length)
         segment_length += 2 * dash_length
 
+@profile
 def find_line_intersection(line1, line2):
     x1, y1, x2, y2 = line1; x3, y3, x4, y4 = line2
     den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
@@ -238,6 +260,7 @@ def find_line_intersection(line1, line2):
     t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den
     return np.array([x1 + t * (x2 - x1), y1 + t * (y2 - y1)])
 
+@profile
 def calculate_vertex_angle(p_prev, p_curr, p_next):
     v1 = np.array(p_prev) - np.array(p_curr); v2 = np.array(p_next) - np.array(p_curr)
     v1_mag, v2_mag = np.linalg.norm(v1), np.linalg.norm(v2)
@@ -246,6 +269,7 @@ def calculate_vertex_angle(p_prev, p_curr, p_next):
     angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
     return np.degrees(angle)
 
+@profile
 def _adjust_angle_near_90(angle_deg: float) -> float:
     """角度修约规则：
     - 若 86°..94°，直接视为 90°；
@@ -263,6 +287,7 @@ def _adjust_angle_near_90(angle_deg: float) -> float:
         return 90.0 + 0.5 * dev
     return a
 
+@profile
 def calculate_angle_between_lines(line1, line2):
     v1 = np.array(line1[2:]) - np.array(line1[:2])
     v2 = np.array(line2[2:]) - np.array(line2[:2])
@@ -275,6 +300,7 @@ def calculate_angle_between_lines(line1, line2):
     # 应用 90° 邻域修约
     return _adjust_angle_near_90(angle_deg)
 
+@profile
 def get_point_line_segment_projection(point, line_segment):
     p = np.array(point); p1 = np.array(line_segment[:2]); p2 = np.array(line_segment[2:])
     line_vec = p2 - p1
@@ -285,6 +311,7 @@ def get_point_line_segment_projection(point, line_segment):
     proj_point = p1 + t * line_vec
     return proj_point, np.linalg.norm(p - proj_point)
 
+@profile
 def get_point_line_perpendicular_distance(point, line_segment):
     """计算点到由线段两端点确定的直线的垂直距离（无限延长线）。
     当线段退化（端点重合）时，退化为点到该点的距离。
@@ -305,6 +332,7 @@ def get_point_line_perpendicular_distance(point, line_segment):
     cross = float(v[0] * (p[1] - a[1]) - v[1] * (p[0] - a[0]))
     return abs(cross) / denom
 
+@profile
 def scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm: float):
     p = params["DEFECT_DETECTION"]
     
@@ -419,6 +447,7 @@ def scan_edge_for_luminosity_defects(roi_gray, edge, params, pixels_per_mm: floa
     return initial_contours
 
 
+@profile
 def scan_edge_for_chipping_blocks(roi_gray, edge, params, pixels_per_mm: float):
     """块状(按长度5mm或配置)统计对比的崩边检测。
     思路:
@@ -566,8 +595,10 @@ def scan_edge_for_chipping_blocks(roi_gray, edge, params, pixels_per_mm: float):
         features.append({"idx": bi, "mean": mean_val, "std": std_val, "grad": grad_mean, "edge_density": edge_density, "poly": poly, "dir_ratio": dir_ratio})
     if len(features) < 2:
         return []
+    @profile
     def _median(values):
         return float(np.median(np.array(values, dtype=float)))
+    @profile
     def _mad(values, med):
         v = np.abs(np.array(values, dtype=float) - med)
         m = np.median(v)
@@ -647,6 +678,7 @@ def scan_edge_for_chipping_blocks(roi_gray, edge, params, pixels_per_mm: float):
     return contours_out
 
 
+@profile
 def find_gradient_endpoint(start_point, line_vec_normalized, roi_gray_blurred, max_search_dist, search_width=2, gradient_stop_threshold=20.0):
     h, w = roi_gray_blurred.shape
     perp_vec = np.array([-line_vec_normalized[1], line_vec_normalized[0]])
@@ -686,16 +718,29 @@ def find_gradient_endpoint(start_point, line_vec_normalized, roi_gray_blurred, m
 # ====================================================================================
 # --- 核心处理流程 ---
 # ====================================================================================
+
+
+def _get_cached_clahe(clip_limit: float, grid_size: tuple[int, int]):
+    """Reuse CLAHE instances keyed by (clip_limit, grid_size) to reduce per-ROI allocations."""
+    key = (float(clip_limit), tuple(grid_size))
+    clahe = _CLAHE_CACHE.get(key)
+    if clahe is None:
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+        _CLAHE_CACHE[key] = clahe
+    return clahe
+
+@profile
 def preprocess_for_hough_enhanced(roi_gray, params):
     p = params["PREPROCESSING"]
     grid_size = tuple(p.get("CLAHE_GRID_SIZE", [8, 8]))
     # 取消 Otsu：直接对原始灰度进行中值滤波 + CLAHE，再做 Canny
     blurred = cv2.medianBlur(roi_gray, p["MEDIAN_BLUR_KSIZE"])
-    clahe = cv2.createCLAHE(clipLimit=p["CLAHE_CLIP_LIMIT"], tileGridSize=grid_size)
+    clahe = _get_cached_clahe(p["CLAHE_CLIP_LIMIT"], grid_size)
     enhanced_contrast = clahe.apply(blurred)
     edges = cv2.Canny(enhanced_contrast, p["CANNY_THRESHOLD_LOW"], p["CANNY_THRESHOLD_HIGH"])
     return denoise_edge_map(edges, params)
 
+@profile
 def denoise_edge_map(edge_img: np.ndarray, params) -> np.ndarray:
     """快速对 Canny 边缘图进行降噪：移除孤立像素与极小簇，减少离群点对后续检测干扰。
     可配置 DEFECT_DETECTION 下参数：
@@ -725,7 +770,7 @@ def denoise_edge_map(edge_img: np.ndarray, params) -> np.ndarray:
     H, W = bin_img.shape[:2]
     if H*W <= 0:
         return edge_img
-    kernel3 = np.ones((3,3), dtype=np.uint8)
+    kernel3 = _DENOISE_KERNEL3
     work = bin_img.copy()
     for _ in range(max(1, max_iter)):
         # 邻域计数：保留计数>min_neighbors的点
@@ -748,6 +793,7 @@ def denoise_edge_map(edge_img: np.ndarray, params) -> np.ndarray:
     return out
 
 
+@profile
 def _snap_line_to_canny(seg: np.ndarray, edge_img: np.ndarray, stripe_half_px: int,
                         min_points: int, max_angle_deg: float) -> np.ndarray:
     """将合并后的直线在 Canny 边缘图上进行细调，减少角度与位置偏移。"""
@@ -793,6 +839,7 @@ def _snap_line_to_canny(seg: np.ndarray, edge_img: np.ndarray, stripe_half_px: i
     base = np.array([float(x0), float(y0)], dtype=float)
     direction = np.array([vx, vy], dtype=float)
 
+    @profile
     def _project(pt: np.ndarray) -> float:
         return float(np.dot(pt - base, direction))
 
@@ -812,6 +859,7 @@ def _snap_line_to_canny(seg: np.ndarray, edge_img: np.ndarray, stripe_half_px: i
     return new_seg
 
 
+@profile
 def _fit_line_from_edges(edge_img: np.ndarray, seg: np.ndarray, band_half: int,
                          min_points: int, max_angle_dev_deg: float) -> np.ndarray|None:
     """在水平段附近用 Canny 点拟合直线，允许轻微斜率以贴合真实边缘。"""
@@ -861,6 +909,7 @@ def _fit_line_from_edges(edge_img: np.ndarray, seg: np.ndarray, band_half: int,
     return seg_new
 
 
+@profile
 def _detect_edge_notches(edge_img: np.ndarray, segments: list, pixels_per_mm: float, params: dict) -> list:
     """在主边上查找较长的“凹进/缺段”并标记为缺角(Q)。"""
     if edge_img is None or edge_img.size == 0 or not segments:
@@ -878,6 +927,7 @@ def _detect_edge_notches(edge_img: np.ndarray, segments: list, pixels_per_mm: fl
     H, W = edge_img.shape[:2]
     defects = []
 
+    @profile
     def _runs_of_false(mask: np.ndarray):
         # mask: 1d bool
         if mask.size == 0:
@@ -970,6 +1020,7 @@ def _detect_edge_notches(edge_img: np.ndarray, segments: list, pixels_per_mm: fl
             continue
     return defects
 
+@profile
 def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img=None):
     if lines is None or len(lines) < 1: return []
     p = params["LINE_MERGING"]
@@ -984,6 +1035,7 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
         h_tol_deg = v_tol_deg
 
     # mm/px 合并与分离阈值（可按方向区分）
+    @profile
     def _px_dist_mm(cfg_key_mm: str, cfg_key_px: str, default_mm: float|None, default_px: float|None=None):
         return _get_dist_px(p, cfg_key_mm, cfg_key_px, default_mm, pixels_per_mm, default_px=default_px)
 
@@ -1043,10 +1095,12 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
         min_vertical_gap_px = 10.0
     merged_min_support_px = _px_dist_mm('MERGED_MIN_SUPPORT_MM', 'MERGED_MIN_SUPPORT_PX', 5.0, default_px=0.0)
 
+    @profile
     def _is_near_vertical(angle_deg: float) -> bool:
         a = angle_deg % 180.0
         return abs(90.0 - a) <= v_tol_deg
 
+    @profile
     def _is_near_horizontal(angle_deg: float) -> bool:
         a = angle_deg % 180.0
         return min(a, 180.0 - a) <= h_tol_deg
@@ -1138,6 +1192,7 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
             if not placed: proximity_groups.append([segment])
         # 针对“竖直粗边”在小横向距离内做二次合并（把双线/多线合成单线）
         if _is_near_vertical(angle) and len(proximity_groups) > 1 and vertical_thick_merge_px and vertical_thick_merge_px > 0:
+            @profile
             def _group_stats(g):
                 pts = np.array([pt for ln in g for pt in (ln[0:2], ln[2:4])], dtype=float)
                 xs = (pts[:,0])
@@ -1327,15 +1382,18 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
     except Exception:
         dup_angle_tol_deg = 3.0
 
+    @profile
     def _angle_deg(seg):
         x1,y1,x2,y2 = map(float, seg)
         ang = np.degrees(np.arctan2(y2 - y1, x2 - x1))
         if ang < 0: ang += 180.0
         return ang
 
+    @profile
     def _proj_length(seg):
         return float(np.hypot(float(seg[2]) - float(seg[0]), float(seg[3]) - float(seg[1])))
 
+    @profile
     def _merge_vertical_lines(seg_a, score_a, seg_b, score_b):
         """将过近的竖线合并为单条；x 取加权平均，y 取全范围。"""
         w = max(1e-6, float(score_a) + float(score_b))
@@ -1370,6 +1428,7 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
             # 近水平的重复判定：垂直距离小且沿轴投影重叠足够
             if _is_near_horizontal(ang) and _is_near_horizontal(kang):
                 # 计算两线的最小垂距（取一个端点到另一线的垂距的最小值近似）
+                @profile
                 def _perp_dist_to_line(pt, line):
                     ax, ay, bx, by = map(float, line)
                     a = np.array([ax, ay]); b = np.array([bx, by]); p = np.array([pt[0], pt[1]])
@@ -1400,6 +1459,7 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
             lv = float(np.dot(v, v))
             if lv < 1e-6:
                 continue
+            @profile
             def _pt_dist(pt):
                 t = float(np.dot(pt - a, v) / lv)
                 t_clamped = max(0.0, min(1.0, t))
@@ -1465,12 +1525,14 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
             v_tol = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
         except Exception:
             v_tol = 10.0
+        @profile
         def _a_deg(seg):
             x1,y1,x2,y2 = map(float, seg)
             ang = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
             if ang > 90.0:
                 ang = 180.0 - ang
             return ang
+        @profile
         def _is_vertical(seg):
             return _a_deg(seg) >= (90.0 - v_tol)
         if not any(_is_vertical(e) for e in edges):
@@ -1490,6 +1552,7 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
 
     # 用于后续“交点裁剪”步骤的辅助：短延长容差与垂距/参数计算
     extend_margin_px_default = _mm_to_px(5.0, pixels_per_mm)
+    @profile
     def _t_param_and_perp_dist(pt, a, b):
         v = b - a
         denom = float(np.dot(v, v))
@@ -1501,6 +1564,7 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
 
     best_intersection = [None] * m  # (inter_pt, t_i, d_perp_i, len_i)
     # 复用上面定义的 _t_param_and_perp_dist 与 extend 容差
+    @profile
     def _inter_score(t: float):
         # 优先选择落在段内的交点；若不在段内，选择距离[0,1]最近者
         if 0.0 <= t <= 1.0:
@@ -1548,6 +1612,7 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
             ext_tol_j = extend_margin_px_default / len_j
             # 放宽：对“近正交”线对（近似竖直×水平），取消相交的距离限制（d_perp）
             try:
+                @profile
                 def _ang_deg(seg):
                     x1,y1,x2,y2 = map(float, seg)
                     a = np.degrees(np.arctan2(y2 - y1, x2 - x1))
@@ -1589,6 +1654,7 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
 
     return adjusted_edges
 
+@profile
 def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: float, binary_edges=None):
     p_defect = params["DEFECT_DETECTION"]; p_crack = params["CRACK_CLASSIFICATION"]
     num_edges = len(edges); roi_h, roi_w = roi_dims
@@ -1603,6 +1669,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         _DBG_LEVEL = int(params.get('DEBUG', {}).get('PRINT_LEVEL', 1))
     except Exception:
         _DBG_LEVEL = 1
+    @profile
     def _dprint(*a, **k):
         if _DBG_PRINT:
             try:
@@ -1635,6 +1702,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         Hc_dyn, Wc_dyn = (0, 0)
     eff_gap_px = float(cluster_gap_px_cfg) if cluster_gap_px_cfg and cluster_gap_px_cfg > 0 else (0.08 * float(Wc_dyn if Wc_dyn else 1000.0))
 
+    @profile
     def _is_vert_for_cluster(seg):
         try:
             tol = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
@@ -1703,6 +1771,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             h_tol_deg_chk = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', v_tol_deg_chk))
         except Exception:
             h_tol_deg_chk = v_tol_deg_chk
+        @profile
         def _ang_x(seg):
             x1,y1,x2,y2 = map(float, seg)
             a = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
@@ -1758,6 +1827,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     # 记录已确认的角点，供 Q 检测阶段复用，避免重复计算交点
     paired_corners = []  # 列表元素: (i_idx, j_idx, np.array([x,y]))
     
+    @profile
     def get_line_quadrant(line, w, h):
         center_x, center_y = w / 2, h / 2
         mid_x, mid_y = (line[0] + line[2]) / 2, (line[1] + line[3]) / 2
@@ -1766,6 +1836,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         else:
             return 'BL' if mid_x < center_x else 'BR'
 
+    @profile
     def get_quadrant_compatibility(q1, q2):
         if q1 == q2: return 0
         pair = frozenset([q1, q2])
@@ -1788,6 +1859,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     except Exception:
         v_ext_min_len_px = 5.0 * float(pixels_per_mm if pixels_per_mm else 1.0)
 
+    @profile
     def _clip_infinite_line_to_roi(seg, w, h):
         """将由 seg 两点确定的无限直线裁剪到 ROI 边界内，返回裁剪后的线段(两端在边界上)。
         若直线与 ROI 无交则返回原始 seg。"""
@@ -1842,6 +1914,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 vertical_tol_deg_local = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
             except Exception:
                 vertical_tol_deg_local = 10.0
+            @profile
             def _angle_to_x_axis_deg_local(line):
                 x1, y1, x2, y2 = map(float, line)
                 dx, dy = (x2 - x1), (y2 - y1)
@@ -1902,6 +1975,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     if true_edges:
         try:
             # 判定近竖直：沿用 vertical_tol_deg_local
+            @profile
             def _is_vertical(seg):
                 ang = _angle_to_x_axis_deg_local(seg)
                 return ang >= (90.0 - vertical_tol_deg_local)
@@ -1911,6 +1985,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             except Exception:
                 q_align_tol_px = 3
 
+            @profile
             def _fuzzy_hv_intersection(hseg, vseg, tol_px: int):
                 """在严格直线求交失败时，为水平与竖直近似线段提供基于像素容差的交点补偿。
                 仅在 hseg 近水平且 vseg 近竖直时尝试，tol_px 默认 3。
@@ -1946,6 +2021,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             vertical_ideals = [(vi, seg.copy()) for vi, seg in enumerate(true_edges) if _is_vertical(seg)]
             if vertical_ideals:
                 # 水平判定：角度接近 0°（不再使用可配置容忍）
+                @profile
                 def _is_horizontal(seg):
                     ang = _angle_to_x_axis_deg_local(seg)
                     return ang <= 10.0  # 固定阈值 10° 内视为水平
@@ -2047,6 +2123,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         continue
                     # 原线斜率（用于 y 外推）
                     slope = dy / dx if abs(dx) > 1e-6 else 0.0
+                    @profile
                     def _y_at(new_x):
                         return y1 + slope * (new_x - x1)
                     new_x1 = x1; new_y1 = y1; new_x2 = x2; new_y2 = y2
@@ -2139,6 +2216,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         h_tol_deg_lm = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', v_tol_deg_lm))
     except Exception:
         v_tol_deg_lm = 10.0; h_tol_deg_lm = 10.0
+    @profile
     def _angle_to_x_axis_deg_lm(seg):
         x1,y1,x2,y2 = map(float, seg)
         ang = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
@@ -2172,6 +2250,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         except Exception:
             pass
     if _DBG_PRINT and true_edges:
+        @profile
         def _ang_deg_for(seg):
             x1,y1,x2,y2 = map(float, seg)
             a = abs(np.degrees(np.arctan2(y2-y1, x2-x1)))
@@ -2212,6 +2291,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 h_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', 10.0))
             except Exception:
                 h_tol_deg = 10.0
+            @profile
             def _ang_deg(seg):
                 x1,y1,x2,y2 = map(float, seg)
                 ang = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
@@ -2249,6 +2329,18 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             border_touch_px = _get_dist_px(params.get('DEFECT_DETECTION', {}), 'E_BORDER_TOUCH_MM', 'E_BORDER_TOUCH_PX', 5.0, pixels_per_mm, default_px=8.0)
         except Exception:
             border_touch_px = 8.0
+        try:
+            h_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', 10.0))
+        except Exception:
+            h_tol_deg = 10.0
+        try:
+            e_hough_min_len = _get_dist_px(params.get('DEFECT_DETECTION', {}), 'E_HOUGH_MIN_LEN_MM', 'E_HOUGH_MIN_LEN_PX', 20.0, pixels_per_mm, default_px=20.0)
+        except Exception:
+            e_hough_min_len = 20.0
+        try:
+            e_hough_max_gap = float(params.get('DEFECT_DETECTION', {}).get('E_HOUGH_MAX_GAP_PX', 5.0))
+        except Exception:
+            e_hough_max_gap = 5.0
         roi_h, roi_w = roi_gray.shape[:2]
         for cnt in contours:
             area = float(cv2.contourArea(cnt))
@@ -2272,6 +2364,25 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             # 仅保留靠近 ROI 边界的斜边，过滤 ROI 内部的独立玻璃轮廓（如一刀切成两块时的中间角）
             if min(xbb, ybb, roi_w - (xbb + wbb), roi_h - (ybb + hbb)) > max(1.0, border_touch_px):
                 continue
+            # 若该连通域可被 Hough 拟合为近竖直/近水平长直线，视为玻璃正常边缘，跳过
+            try:
+                contour_mask = np.zeros_like(edges_for_e, dtype=np.uint8)
+                cv2.drawContours(contour_mask, [cnt], -1, 255, thickness=1)
+                hough_lines = cv2.HoughLinesP(contour_mask, 1, np.pi/180.0, threshold=20, minLineLength=max(5.0, e_hough_min_len), maxLineGap=max(0.0, e_hough_max_gap))
+                if hough_lines is not None:
+                    skip_contour = False
+                    for ln in hough_lines:
+                        x1,y1,x2,y2 = map(float, ln[0])
+                        ang_ln = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+                        if ang_ln > 90.0:
+                            ang_ln = 180.0 - ang_ln
+                        if ang_ln >= (90.0 - vertical_tol_deg) or ang_ln <= h_tol_deg:
+                            skip_contour = True
+                            break
+                    if skip_contour:
+                        continue
+            except Exception:
+                pass
             aabb = np.array([[xbb, ybb], [xbb + wbb, ybb], [xbb + wbb, ybb + hbb], [xbb, ybb + hbb]], dtype=np.int32)
             skew_line_defects.append({
                 'type': 'E',
@@ -2292,14 +2403,17 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         n_e = len(rects)
         if n_e > 0:
             parent = list(range(n_e))
+            @profile
             def find(a):
                 while parent[a] != a:
                     parent[a] = parent[parent[a]]
                     a = parent[a]
                 return a
+            @profile
             def union(a,b):
                 ra,rb = find(a),find(b)
                 if ra!=rb: parent[rb]=ra
+            @profile
             def overlap(r1,r2):
                 x1,y1,w1,h1 = r1[0],r1[1],r1[2],r1[3]
                 x2,y2,w2,h2 = r2[0],r2[1],r2[2],r2[3]
@@ -2359,6 +2473,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 # 轮廓点数组（便于几何计算）
                 cnt_pts = main_cnt_qc.reshape(-1,2).astype(float)
 
+                @profile
                 def _ray_intersect_contour(origin: np.ndarray, dir_vec: np.ndarray, contour_points: np.ndarray, t_min: float = 2.0):
                     # 与多边形每条边求交，返回 t 最小的交点与所在边索引
                     d = dir_vec.astype(float)
@@ -2387,6 +2502,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                 best = (t, P, k)
                     return best  # (t_min, point, edge_index)
 
+                @profile
                 def _nearest_contour_edge_index(P: np.ndarray, contour_points: np.ndarray) -> int:
                     # 估计 P 所在的最近多边形边索引
                     n = len(contour_points)
@@ -2406,6 +2522,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                             best_d = d; best_idx = k
                     return best_idx
 
+                @profile
                 def _ray_intersect_contour_thick(origin: np.ndarray, dir_vec: np.ndarray, contour_points: np.ndarray, t_min: float = 2.0, stripe_half_px: int = 2):
                     # 使用加粗的射线（条带）与轮廓边界相交检测，避免共线退化；返回首个命中点
                     d = dir_vec.astype(float)
@@ -2435,6 +2552,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         t += step
                     return None
 
+                @profile
                 def _build_contour_path(i1_idx: int, i1_pt: np.ndarray, i2_idx: int, i2_pt: np.ndarray, contour_points: np.ndarray):
                     n = len(contour_points)
                     # forward: from i1_idx+1 ... to i2_idx (inclusive)
@@ -2451,6 +2569,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         path_b.append(contour_points[k])
                         k = (k - 1 + n) % n
                     path_b.append(i2_pt)
+                    @profile
                     def _path_len(path):
                         return float(sum(np.linalg.norm(np.array(path[m+1],dtype=float) - np.array(path[m],dtype=float)) for m in range(len(path)-1)))
                     return (path_f, _path_len(path_f)), (path_b, _path_len(path_b))
@@ -2484,10 +2603,12 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 except Exception:
                     horizontal_tol_deg_aug = vertical_tol_deg_aug
 
+                @profile
                 def _is_vertical_aug(seg):
                     ang = _angle_to_x_axis_deg(seg)
                     return ang >= (90.0 - vertical_tol_deg_aug)
 
+                @profile
                 def _is_horizontal_aug(seg):
                     ang = _angle_to_x_axis_deg(seg)
                     return ang <= float(horizontal_tol_deg_aug)
@@ -2629,9 +2750,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                 seg_hit = chosen[hit_idx_local][1]
                                 seg_miss = chosen[miss_idx_local][1]
 
+                                @profile
                                 def _is_vertical_local(seg):
                                     ang = _angle_to_x_axis_deg(seg)
                                     return ang >= (90.0 - vertical_tol_deg)
+                                @profile
                                 def _is_horizontal_local(seg):
                                     ang = _angle_to_x_axis_deg(seg)
                                     return ang <= float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', vertical_tol_deg))
@@ -2733,6 +2856,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                                                 pass
                                 if v_clip is None:
                                     # 退回面积更大端点
+                                    @profile
                                     def _tri_area(cp_pt, a, b):
                                         tri = np.vstack([cp_pt, a, b]).astype(np.float32)
                                         tri_cnt = tri.reshape((-1,1,2)).astype(np.int32)
@@ -2784,6 +2908,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         inward_deg = float(params.get('DEFECT_DETECTION', {}).get('Q_RAY_INWARD_DEG', 1.8))
                     except Exception:
                         inward_deg = 1.8
+                    @profile
                     def _rotate(vec: np.ndarray, deg: float) -> np.ndarray:
                         th = np.deg2rad(deg)
                         c, s = float(np.cos(th)), float(np.sin(th))
@@ -2884,6 +3009,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     except Exception:
         pass
 
+    @profile
     def _dedup_q(existing, new_list, dist_px: float = 20.0):
         kept = existing[:]
         for nd in new_list:
@@ -2912,6 +3038,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
 
     # 新增：对 Q 缺陷进行“平行四边形 + 边缘点集群”验证过滤
     try:
+        @profile
         def _parallelogram_from_triangle(tri_pts: np.ndarray):
             # tri_pts: (3,2) float32 in ROI coords
             A, B, C = tri_pts[0].astype(float), tri_pts[1].astype(float), tri_pts[2].astype(float)
@@ -2934,6 +3061,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             order = np.argsort(ang)
             return pts[order]
 
+        @profile
         def _q_parallelogram_cluster_ok(q_def: dict, edges_img: np.ndarray) -> bool:
             # 从 q_def['region_contour'] 还原三角形顶点
             tri_cnt = q_def.get('region_contour', None)
@@ -3076,6 +3204,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         # 任意错误不影响主流程，保守放行
         pass
 
+    @profile
     def sort_key_func(pair_indices):
         i, j = pair_indices
         line1, line2 = true_edges[i], true_edges[j]
@@ -3104,6 +3233,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         except Exception:
             pass
         # 栅栏/分隔线逻辑适配：若存在稳定 glass_boundary 或 fences，防止跨玻璃或越界配对形成伪角
+        @profile
         def _is_vertical_for_pair(seg):
             try:
                 ang = abs(np.degrees(np.arctan2(float(seg[3]-seg[1]), float(seg[2]-seg[0]))))
@@ -3112,6 +3242,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 return ang >= (90.0 - v_tol)
             except Exception:
                 return False
+        @profile
         def _is_horizontal_for_pair(seg):
             try:
                 ang = abs(np.degrees(np.arctan2(float(seg[3]-seg[1]), float(seg[2]-seg[0]))))
@@ -3233,6 +3364,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             except Exception:
                 pass
 
+            @profile
             def _handle_as_x_defect():
                 angle = calculate_vertex_angle(p1_far, intersection, p2_far)
                 # 仅在合理范围考虑 X（避免尖角/钝角极端值）
@@ -3299,6 +3431,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     # 计算每个 B 缺陷的最小“矩形点(四角+中心)”到任一主边缘线段的距离，超过阈值则丢弃
     b_max_edge_dist_px = _get_dist_px(p_defect, "B_MAX_DISTANCE_TO_EDGE_MM", None, 5.0, pixels_per_mm)
 
+    @profile
     def _min_dist_rect_to_edges(b_defect_obj, edge_list):
         try:
             # 取 minAreaRect 的四角点与中心点
@@ -3489,6 +3622,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             except Exception:
                 b_small_list.append(bd)
 
+        @profile
         def _rotated_rect_intersect(rect1, rect2, box1, box2):
             """判断两个旋转矩形是否相交/包含。
             优先使用 cv2.rotatedRectangleIntersection；若返回不稳定，再使用凸多边形相交测试(cv2.intersectConvexConvex)。
@@ -3521,11 +3655,13 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         # 并查集分组
         n = len(b_merge_list)
         parent = list(range(n))
+        @profile
         def find(x):
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
                 x = parent[x]
             return x
+        @profile
         def union(a, b):
             ra, rb = find(a), find(b)
             if ra != rb:
@@ -3582,7 +3718,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             
     # 新增：检测主边上的凹进/缺段，标记为缺角
     try:
-        edges_notch_img = preprocess_for_hough_enhanced(roi_gray, params)
+        edges_notch_img = binary_edges if binary_edges is not None else preprocess_for_hough_enhanced(roi_gray, params)
         notch_defects = _detect_edge_notches(edges_notch_img, edges_for_drawing, pixels_per_mm, params)
         if notch_defects:
             corner_defects.extend(notch_defects)
@@ -3593,6 +3729,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     combined_defects = corner_defects + surviving_chipping_defects + skew_line_defects + rect_q_defects
 
     # Q/B/L 最短边（宽度）过滤：过滤掉宽度 < 5mm 的缺陷
+    @profile
     def _measure_width_mm_for_defect(d: dict, ppm: float) -> float:
         try:
             if d is None or ppm is None or ppm <= 0:
@@ -3640,6 +3777,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             return 0.0
         return 0.0
 
+    @profile
     def _measure_length_mm_for_defect(d: dict, ppm: float) -> float:
         try:
             if d is None or ppm is None or ppm <= 0:
@@ -3718,8 +3856,10 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     return edges_for_drawing, filtered_defects, paired_corners
 
 
-def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm):
+@profile
+def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm, precomputed_edges=None):
     # 兼容多种 ROI 表达：dict/list/tuple
+    @profile
     def _parse_roi(rt):
         if isinstance(rt, (list, tuple)) and len(rt) >= 4:
             return int(rt[0]), int(rt[1]), int(rt[2]), int(rt[3])
@@ -3755,7 +3895,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     roi_key_for_cache = (roi_id, w, h)
     
     p_hough = params["HOUGH_TRANSFORM"]
-    binary_edges = preprocess_for_hough_enhanced(roi_gray, params)
+    binary_edges = precomputed_edges if precomputed_edges is not None else preprocess_for_hough_enhanced(roi_gray, params)
     # 保证传入 HoughLinesP 的参数为整数类型（OpenCV 要求 threshold 为 int，其他也用 int 更稳妥）
     min_len_pixels = roi_gray.shape[1] * p_hough.get("MIN_LINE_LENGTH_RATIO", 0.05)
     try:
@@ -3798,6 +3938,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     except Exception:
         cross_enabled = True
 
+    @profile
     def _clip_infinite_line_to_roi_local(seg, w_loc, h_loc):
         try:
             x1, y1, x2, y2 = map(float, seg)
@@ -3868,6 +4009,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                         continue
                 if appended:
                     # 简单去重：若与现有主边距离很近则跳过
+                    @profile
                     def _seg_perp_dist(a, b, c, d):
                         A = np.array([a, b], dtype=float); B = np.array([c, d], dtype=float)
                         v = B - A
@@ -3905,6 +4047,11 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         enable_ev = bool(p_def_evb.get('B_USE_IDEAL_VERTICAL_FROM_CANNY', True))
     except Exception:
         enable_ev = True
+    try:
+        ideal_ttl_frames = int(params.get('DEFECT_DETECTION', {}).get('B_IDEAL_VERTICAL_CACHE_TTL_FRAMES', 30))
+    except Exception:
+        ideal_ttl_frames = 30
+    ideal_ttl_frames = max(1, min(ideal_ttl_frames, 200))
     cache_entry_ideal = _roi_ideal_vertical_cache.get(roi_key_for_cache, None)
     cached_ideal_lines = []
     if cache_entry_ideal and isinstance(cache_entry_ideal.get('lines'), list):
@@ -3916,6 +4063,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     if enable_ev and binary_edges is not None and binary_edges.size > 0:
         try:
             # 统计当前近竖直主边数量
+            @profile
             def _is_near_vertical(seg, tol_deg=10.0):
                 x1,y1,x2,y2 = map(float, seg)
                 ang = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
@@ -3963,6 +4111,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 # 将挑选到的列转为本 ROI 内的竖直段，并去重加入 main_edges
                 if picks:
                     # 去重：若与已有主边近似重合（按 x 距离 < 2px）则跳过
+                    @profile
                     def _x_mid(seg):
                         return 0.5 * (float(seg[0]) + float(seg[2]))
                     existing_xs = []
@@ -3977,7 +4126,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                         main_edges.append(seg_new)
                         cached_ideal_lines.append(seg_new.copy())
                     if cached_ideal_lines:
-                        _roi_ideal_vertical_cache[roi_key_for_cache] = {'lines': [c.tolist() for c in cached_ideal_lines], 'ttl': 2}
+                        _roi_ideal_vertical_cache[roi_key_for_cache] = {'lines': [c.tolist() for c in cached_ideal_lines], 'ttl': ideal_ttl_frames}
                 elif cached_ideal_lines:
                     # 没有检测到新的理想线，但有缓存，保留最多2帧
                     try:
@@ -3985,6 +4134,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     except Exception:
                         remaining = 0
                     if remaining > 0:
+                        @profile
                         def _x_mid(seg):
                             return 0.5 * (float(seg[0]) + float(seg[2]))
                         existing_xs = []
@@ -4010,6 +4160,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             tol_v_fallback = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
         except Exception:
             tol_v_fallback = 10.0
+        @profile
         def _is_near_vertical_fb(seg, tol_deg=10.0):
             x1,y1,x2,y2 = map(float, seg)
             ang = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
@@ -4025,6 +4176,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         except Exception:
             remaining_fb = 0
         if remaining_fb > 0 and current_v_fb < 2:
+            @profile
             def _x_mid_fb(seg):
                 return 0.5 * (float(seg[0]) + float(seg[2]))
             existing_xs_fb = []
@@ -4450,6 +4602,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
     except Exception:
         vertical_tol_deg = 10.0
+    @profile
     def _line_angle_deg(line):
         x1, y1, x2, y2 = map(float, line)
         dx, dy = (x2 - x1), (y2 - y1)
@@ -4685,6 +4838,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
     return roi_report, roi_color
 
+@profile
 def process_image_from_memory_parallel(image_gray, template_rois, config):
     final_image = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
     report = {"image_status": "OK", "defects": [] , "state_code": 0, "rois": []}
@@ -4705,9 +4859,12 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
     auto_workers = min(cpu_workers, len(template_rois))
     num_workers = auto_workers if roi_threads_cfg <= 0 else max(1, min(roi_threads_cfg, len(template_rois)))
 
-    def _safe_roi_hough(i, r):
+    precomputed_edges = [None] * len(template_rois)
+
+    @profile
+    def _safe_roi_hough(i, r, pre_edge=None):
         try:
-            return process_roi_hough_based(i, r, image_gray, hough_params, pixels_per_mm)
+            return process_roi_hough_based(i, r, image_gray, hough_params, pixels_per_mm, precomputed_edges=pre_edge)
         except Exception as e:
             print(f"Error processing ROI {i}: {e}")
             # 兼容多种 ROI 表达，尽可能返回一个安全的占位 ROI
@@ -4761,6 +4918,7 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
         except Exception:
             cluster_x_px = 12.0
 
+        @profile
         def _parse_roi(rt):
             if isinstance(rt, (list, tuple)) and len(rt) >= 4:
                 return int(rt[0]), int(rt[1]), int(rt[2]), int(rt[3])
@@ -4777,13 +4935,17 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
             return 0, 0, 0, 0
 
         cand_global = []  # 每条为 [x1,y1,x2,y2] 全局
-        for r in template_rois:
+        for idx_r, r in enumerate(template_rois):
             try:
                 rx, ry, rw, rh = _parse_roi(r)
                 if rw <= 0 or rh <= 0:
                     continue
                 roi_gray = image_gray[ry:ry+rh, rx:rx+rw]
                 edge_img = preprocess_for_hough_enhanced(roi_gray, hough_params)
+                try:
+                    precomputed_edges[idx_r] = edge_img
+                except Exception:
+                    pass
                 p_h = hough_params.get('HOUGH_TRANSFORM', {})
                 min_len_pixels = roi_gray.shape[1] * p_h.get('MIN_LINE_LENGTH_RATIO', 0.05)
                 try:
@@ -4906,7 +5068,7 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
         pass
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(_safe_roi_hough, i, r) for i, r in enumerate(template_rois)]
+        futures = [executor.submit(_safe_roi_hough, i, r, precomputed_edges[i]) for i, r in enumerate(template_rois)]
         results = [future.result() for future in futures]
 
     max_edges_found = 0
