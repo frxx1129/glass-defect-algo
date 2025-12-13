@@ -609,7 +609,18 @@ def main():
                     pass
                 print("[主进程]: 周期维护：相机就绪，已恢复检测。\n")
             else:
-                print("[主进程]: 周期维护：等待相机就绪超时（继续保持暂停状态）。\n")
+                print("[主进程]: 周期维护：等待相机就绪超时（暂时暂停，待就绪自动恢复）。\n")
+                # 若超过超时后相机才就绪，自动恢复 run_event，避免长时间无处理又无日志。
+                def _resume_when_ready():
+                    try:
+                        cameras_ready_event.wait()
+                        if stop_event.is_set():
+                            return
+                        run_event.set()
+                        print("[主进程]: 相机延迟就绪，已自动恢复检测。")
+                    except Exception:
+                        pass
+                threading.Thread(target=_resume_when_ready, daemon=True).start()
         except Exception as e:
             print(f"[主进程]: 周期维护重启失败: {e}")
 
