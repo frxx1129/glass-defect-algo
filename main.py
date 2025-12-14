@@ -22,11 +22,10 @@ from alarm_light_controller import AlarmLightController, _AlarmLightService
 
 # 全局变量，用于在信号处理器中访问
 stop_event = None
-# 子进程控制事件（用于周期性重启），与最终退出事件分离：分别控制相机与计算
+# 子进程控制事件，与最终退出事件分离：分别控制相机与计算
 cam_stop_event = None
 worker_stop_event = None
 processes = []
-_maintenance_thread = None
 # 显式持有相机与计算进程的引用，便于分步关闭
 camera_proc_ref = None
 worker_procs_ref = []
@@ -158,7 +157,7 @@ def main():
     _ensure_single_instance_and_job()
     
     # 全局变量，用于信号处理
-    global stop_event, cam_stop_event, worker_stop_event, processes, rejection_controller, http_client, alarm_light_controller, alarm_light_service_thread, alarm_light_service_instance, _maintenance_thread, camera_proc_ref, worker_procs_ref
+    global stop_event, cam_stop_event, worker_stop_event, processes, rejection_controller, http_client, alarm_light_controller, alarm_light_service_thread, alarm_light_service_instance, camera_proc_ref, worker_procs_ref
     
     # 设置信号处理器，优雅处理CTRL+C和Windows关闭事件
     def signal_handler(sig, frame):
@@ -528,17 +527,49 @@ def main():
         """
         global processes, cam_stop_event, worker_stop_event, camera_proc_ref, worker_procs_ref
         try:
-            print("\n[主进程]: 周期维护：开始重启相机与计算进程...")
+            print("\n[主进程]: 子进程重启：开始重启相机与计算进程（执行冷启动式清理）...")
+            try:
+                run_event.clear()  # 暂停检测，避免新任务进队
+            except Exception:
+                pass
+            try:
+                cam_stop_event.set()  # 先通知相机停产，避免继续灌队列
+            except Exception:
+                pass
+            cleared = {}
+            def _drain_queue(q, name):
+                c = 0
+                try:
+                    while True:
+                        q.get_nowait()
+                        c += 1
+                except Exception:
+                    pass
+                cleared[name] = c
+            _drain_queue(task_queue, 'task')
+            _drain_queue(results_queue, 'results')
+            _drain_queue(rejection_queue, 'rejection')
+            # 清理共享状态以模拟首启
+            try:
+                for k in list(shared_camera_states.keys()):
+                    shared_camera_states.pop(k, None)
+            except Exception:
+                pass
+            try:
+                for k in list(data_sessions.keys()):
+                    data_sessions.pop(k, None)
+            except Exception:
+                pass
+            try:
+                print(f"[主进程]: 子进程重启：已清空队列与缓存 {cleared}")
+            except Exception:
+                pass
             # 1) 通知状态机执行软重置（避免跨代粘连）
             try:
                 setattr(shared_settings, 'request_state_machine_reset', True)
             except Exception:
                 pass
-            # 2) 先关闭相机
-            try:
-                cam_stop_event.set()
-            except Exception:
-                pass
+            # 2) 先关闭相机（已发停产信号，再保证 join/terminate）
             # 等待相机池进程退出
             try:
                 if camera_proc_ref is not None:
@@ -547,7 +578,7 @@ def main():
                         camera_proc_ref.terminate()
             except Exception:
                 pass
-            # 3) 等待计算队列处理完成（不清 run_event，让计算继续处理）
+            # 3) 等待计算队列处理完成（已暂停 run_event，如仍有残留则等待耗尽）
             def _wait_queue_drained(q, timeout_s: float = 30.0):
                 start = time.monotonic()
                 consecutive_empty = 0
@@ -571,7 +602,7 @@ def main():
                 return False
             drained = _wait_queue_drained(task_queue, timeout_s=60.0)
             if not drained:
-                print("[主进程]: 周期维护：在超时时间内队列未完全清空，继续关停计算进程。")
+                print("[主进程]: 子进程重启：在超时时间内队列未完全清空，继续关停计算进程。")
             # 4) 关闭计算进程
             try:
                 worker_stop_event.set()
@@ -586,12 +617,6 @@ def main():
                     pass
             # 等待硬件资源释放
             time.sleep(max(0.0, float(grace_seconds)))
-            # 清空状态快照（相机状态保留字典引用，清键）
-            try:
-                for k in list(shared_camera_states.keys()):
-                    shared_camera_states.pop(k, None)
-            except Exception:
-                pass
             # 新一代事件
             cam_stop_event = multiprocessing.Event()
             worker_stop_event = multiprocessing.Event()
@@ -607,9 +632,9 @@ def main():
                     run_event.set()
                 except Exception:
                     pass
-                print("[主进程]: 周期维护：相机就绪，已恢复检测。\n")
+                print("[主进程]: 子进程重启：相机就绪，已恢复检测。\n")
             else:
-                print("[主进程]: 周期维护：等待相机就绪超时（暂时暂停，待就绪自动恢复）。\n")
+                print("[主进程]: 子进程重启：等待相机就绪超时（暂时暂停，待就绪自动恢复）。\n")
                 # 若超过超时后相机才就绪，自动恢复 run_event，避免长时间无处理又无日志。
                 def _resume_when_ready():
                     try:
@@ -622,7 +647,7 @@ def main():
                         pass
                 threading.Thread(target=_resume_when_ready, daemon=True).start()
         except Exception as e:
-            print(f"[主进程]: 周期维护重启失败: {e}")
+            print(f"[主进程]: 子进程重启失败: {e}")
 
     # 启动首代子进程
     _start_children()

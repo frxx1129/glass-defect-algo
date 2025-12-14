@@ -952,7 +952,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     presence_streak = 0
         except Exception as e:
             try:
-                print(f"[状态机]: 处理结果时出错: {e}，已跳过本轮。")
+                print(f"[状态机]: 处理结果时出错: {e}，已跳过该帧。")
             except Exception:
                 pass
             # 避免异常风暴导致主进程无法及时响应
