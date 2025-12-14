@@ -42,7 +42,7 @@ main.build/
 main.dist/
 main.dist.zip
 persistent_stats.dat
-
+hough_results_gpu
 valid/
 valid_results/
 valid_*/
