@@ -2212,18 +2212,61 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 h_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', 10.0))
             except Exception:
                 h_tol_deg = 10.0
+
+            # 将“贯穿带”按识别到的直线方向绘制（而不是强制水平/竖直），
+            # 以避免“水平边稍微有角度时，屏蔽带仍完全水平”的问题。
+            def _clip_infinite_line_to_roi_local_for_e(seg, w_loc, h_loc):
+                try:
+                    x1, y1, x2, y2 = map(float, seg)
+                    dx, dy = (x2 - x1), (y2 - y1)
+                    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+                        return None
+                    candidates = []
+                    if abs(dx) >= 1e-9:
+                        for xk in (0.0, float(w_loc - 1)):
+                            t = (xk - x1) / dx
+                            yk = y1 + t * dy
+                            if 0.0 <= yk <= float(h_loc - 1):
+                                candidates.append((xk, yk))
+                    if abs(dy) >= 1e-9:
+                        for yk in (0.0, float(h_loc - 1)):
+                            t = (yk - y1) / dy
+                            xk = x1 + t * dx
+                            if 0.0 <= xk <= float(w_loc - 1):
+                                candidates.append((xk, yk))
+                    uniq = []
+                    for pt in candidates:
+                        if not any(abs(pt[0]-q[0]) < 0.5 and abs(pt[1]-q[1]) < 0.5 for q in uniq):
+                            uniq.append(pt)
+                    if len(uniq) < 2:
+                        return None
+                    pts = np.array(uniq, dtype=float)
+                    idx0, idx1 = 0, 1
+                    maxd = -1.0
+                    for i0 in range(len(pts)):
+                        for i1 in range(i0 + 1, len(pts)):
+                            d = float(np.hypot(pts[i1, 0] - pts[i0, 0], pts[i1, 1] - pts[i0, 1]))
+                            if d > maxd:
+                                maxd = d; idx0, idx1 = i0, i1
+                    a, b = pts[idx0], pts[idx1]
+                    return np.array([a[0], a[1], b[0], b[1]], dtype=float)
+                except Exception:
+                    return None
+
             def _ang_deg(seg):
                 x1,y1,x2,y2 = map(float, seg)
                 ang = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
                 return ang if ang <= 90.0 else 180.0 - ang
+
+            H_loc, W_loc = edges_base.shape[:2]
             for seg in (true_edges or []):
                 ang = _ang_deg(seg)
-                if ang >= (90.0 - vertical_tol_deg):
-                    x_mid = int(round(0.5 * (float(seg[0]) + float(seg[2]))))
-                    cv2.line(mask_lines, (x_mid, 0), (x_mid, roi_h - 1), 255, suppress_w)
-                elif ang <= h_tol_deg:
-                    y_mid = int(round(0.5 * (float(seg[1]) + float(seg[3]))))
-                    cv2.line(mask_lines, (0, y_mid), (roi_w - 1, y_mid), 255, suppress_w)
+                if ang >= (90.0 - vertical_tol_deg) or ang <= h_tol_deg:
+                    clipped = _clip_infinite_line_to_roi_local_for_e(seg, W_loc, H_loc)
+                    if clipped is None:
+                        continue
+                    x1, y1, x2, y2 = map(int, map(round, clipped))
+                    cv2.line(mask_lines, (x1, y1), (x2, y2), 255, suppress_w)
             if np.any(mask_lines):
                 edges_base[mask_lines > 0] = 0
         if dil_iter > 0:
@@ -4477,6 +4520,60 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
     roi_color = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
 
+    # 调试可视化：绘制 E 的“贯穿屏蔽带”（用于验证屏蔽区域是否覆盖到角落）
+    # 仅在显式开启时绘制，避免影响默认输出。
+    try:
+        draw_e_suppress_band = bool(params.get('DEFECT_DETECTION', {}).get('DRAW_E_SUPPRESS_BAND', False))
+    except Exception:
+        draw_e_suppress_band = False
+    if draw_e_suppress_band:
+        try:
+            p_def = params.get('DEFECT_DETECTION', {}) or {}
+            suppress_w = int(p_def.get('E_LINE_SUPPRESS_WIDTH_PX', 36) or 0)
+            suppress_w = max(1, min(512, suppress_w))
+            try:
+                vertical_tol_deg_vis = float(p_def.get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+            except Exception:
+                vertical_tol_deg_vis = 10.0
+            try:
+                h_tol_deg_vis = float(p_def.get('HORIZONTAL_ANGLE_TOL_DEG', 10.0))
+            except Exception:
+                h_tol_deg_vis = 10.0
+            try:
+                band_alpha = float(p_def.get('E_SUPPRESS_BAND_ALPHA', 0.25))
+            except Exception:
+                band_alpha = 0.25
+            band_alpha = max(0.0, min(1.0, band_alpha))
+
+            H_loc, W_loc = roi_gray.shape[:2]
+            overlay_band = roi_color.copy()
+            band_color = (0, 255, 255)  # BGR: 亮黄色
+
+            def _ang_deg_vis(seg):
+                x1, y1, x2, y2 = map(float, seg)
+                ang = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+                return ang if ang <= 90.0 else 180.0 - ang
+
+            for seg in (edges_for_drawing or []):
+                try:
+                    ang = _ang_deg_vis(seg)
+                    if ang >= (90.0 - vertical_tol_deg_vis) or ang <= h_tol_deg_vis:
+                        clipped = None
+                        try:
+                            clipped = _clip_infinite_line_to_roi_local(seg, W_loc, H_loc)
+                        except Exception:
+                            clipped = None
+                        if clipped is None:
+                            continue
+                        x1, y1, x2, y2 = map(int, map(round, clipped))
+                        cv2.line(overlay_band, (x1, y1), (x2, y2), band_color, thickness=suppress_w)
+                except Exception:
+                    continue
+
+            cv2.addWeighted(overlay_band, band_alpha, roi_color, 1.0 - band_alpha, 0, roi_color)
+        except Exception:
+            pass
+
     # 可视化：用亮黄色标出 Canny 边缘（用于缺角二次验证）
     # if binary_edges is not None:
     #     roi_color[binary_edges > 0] = [0, 255, 255]
@@ -4491,38 +4588,38 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     # 绘制主边直线、角点（移除调试打印）
     annotations_to_draw = []
-    # try:
-    #    for i, seg in enumerate(edges_for_drawing or []):
-    #        x1,y1,x2,y2 = map(float, seg)
-    #        dx, dy = (x2-x1), (y2-y1)
-    #        ang = abs(np.degrees(np.arctan2(dy, dx)))
-    #        if ang > 90.0: ang = 180.0 - ang
-    #        length_px = float(np.hypot(dx, dy))
-    #        length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
+    try:
+       for i, seg in enumerate(edges_for_drawing or []):
+           x1,y1,x2,y2 = map(float, seg)
+           dx, dy = (x2-x1), (y2-y1)
+           ang = abs(np.degrees(np.arctan2(dy, dx)))
+           if ang > 90.0: ang = 180.0 - ang
+           length_px = float(np.hypot(dx, dy))
+           length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
 
-    #        color = (200,200,200)
-    #        if ang >= 80.0:
-    #            color = (0,255,0)
-    #        elif ang <= 10.0:
-    #            color = (255,0,0)
-    #        cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
+           color = (200,200,200)
+           if ang >= 80.0:
+               color = (0,255,0)
+           elif ang <= 10.0:
+               color = (255,0,0)
+           cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
 
-    #        mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
-    #        try:
-    #            cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-    #        except Exception:
-    #            pass
+           mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
+           try:
+               cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+           except Exception:
+               pass
 
-    #    for (ii, jj, cp_arr) in (paired_corners or []):
-    #       try:
-    #           cx, cy = float(cp_arr[0]), float(cp_arr[1])
-    #           cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
-    #           cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
-    #       except Exception:
-    #           continue
+       for (ii, jj, cp_arr) in (paired_corners or []):
+          try:
+              cx, cy = float(cp_arr[0]), float(cp_arr[1])
+              cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
+              cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
+          except Exception:
+              continue
 
-    # except Exception:
-    #    pass
+    except Exception:
+       pass
     
     for defect_report in final_defects_for_report:
         defect = defect_report['raw_defect']

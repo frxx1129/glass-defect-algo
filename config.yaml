@@ -22,7 +22,7 @@
     "process_workers": 5,
     "roi_threads": 2,
     "auto_start": false,
-    "restart_interval_minutes": 1441,
+    "restart_interval_minutes": 1440,
     "auto_route_decision_hold_ms": 120
   },
   "alarm_light_params": {
@@ -63,14 +63,14 @@
     ],
     "unified_params": {
       "acquisition": {"width": 2448, "height": 2048, "frame_rate": 10},
-      "exposure": {"value_us": 285},
+      "exposure": {"value_us": 300},
       "gain": {"value_db": 1.2},
       "gamma": {"value": 1},
       "network": {"packet_size_bytes": 8996, "packet_delay_us": 100}
     }
   },
   "camera_rois": {
-    "0": "cam01_2025-12-10T11-05-59-030.webm_20251211_173331.451_roi_averaged_by_group.json",
+    "0": "cam-1_ts1765688746366_roi_averaged_by_group.json",
     "1": "cam2_roi_averaged_by_group.json",
     "2": "cam5_roi_averaged_by_group.json",
     "3": "cam4_roi_averaged_by_group.json",
@@ -93,9 +93,9 @@
   "rejection_controller": {"port": "COM5", "baud": 115200},
   "rejection_params": {"max_defect_size_mm": 20, "REJECTION_PULSE_MS": 100, "REJECTION_DELAY_S": 2},
   "hough_inspector_params": {
-    "PREPROCESSING": {"MEDIAN_BLUR_KSIZE": 11, "CLAHE_CLIP_LIMIT": 2.5, "CLAHE_GRID_SIZE": [8, 8], "CANNY_THRESHOLD_LOW": 25, "CANNY_THRESHOLD_HIGH": 85},
+    "PREPROCESSING": {"MEDIAN_BLUR_KSIZE": 17, "CLAHE_CLIP_LIMIT": 2.5 ,"CLAHE_GRID_SIZE": [8, 8], "CANNY_THRESHOLD_LOW": 20, "CANNY_THRESHOLD_HIGH": 80},
     "HOUGH_TRANSFORM": {"THRESHOLD": 35, "MIN_LINE_LENGTH_RATIO": 0.05, "MAX_LINE_GAP_MM": 5, "MAX_LINE_GAP": 30},
-    "LINE_MERGING": {"ANGLE_TOLERANCE": 1.5, "MAX_LATERAL_DISTANCE_MM": 5, "MAX_LATERAL_DISTANCE": 40, "TOP_N_EDGES": 5},
+    "LINE_MERGING": {"ANGLE_TOLERANCE": 1.5, "MAX_LATERAL_DISTANCE_MM": 5, "MAX_LATERAL_DISTANCE": 40, "TOP_N_EDGES": 6},
     "CRACK_CLASSIFICATION": {"ENDPOINT_SHIELD_RATIO": 0.1, "ENDPOINT_PROXIMITY_THRESHOLD_MM": 5.49},
     "DEFECT_DETECTION": {
       "MIN_DEFECT_SIZE_MM": 7.0,
@@ -104,15 +104,21 @@
       "FALSE_DEFECT_MAX_WIDTH": 8.0,
       "Q_CORNER_CONTOUR_MIN_DIST_PX": 10.0,
       "FALSE_DEFECT_MIN_ASPECT_RATIO": 5.0,
-      "ANGLE_DEVIATION_TOLERANCE": 6.0,
+      "ANGLE_DEVIATION_TOLERANCE": 15.0,
+      "Q_DEFECT_GRADIENT_THRESHOLD": 5.0,
+      "Q_DEFECT_SEARCH_WIDTH_PX": 3,
+      "Q_TRIANGLE_BRIGHTNESS_MARGIN": 10.0,
       "Q_CANNY_STRIPE_HALF_WIDTH_PX": 3,
-      "Q_TRIANGLE_MIN_AREA_MM2": 16.0,
+      "Q_TRIANGLE_MIN_AREA_MM2": 25.0,
+      "Q_PARALLELOGRAM_EXCLUDE_STRIPE_HALF_PX":10,
+      "Q_BRIGHTNESS_MIN_DIFF": 25.0,
       "SKEW_CURVED_REMOVE_LINE_THICKNESS_PX": 24,
       "SKEW_CURVED_MIN_ARC_LEN_PX": 700.0,
       "SKEW_CURVED_MAX_DEV_RATIO": 0.08,
+      "Q_LENGTH_RANGE_FILTER_ENABLE":True,
       "SHADOW_FILTER_MIN_EXTENT_RATIO": 0.25,
       "CORNER_MAX_PHYSICAL_GAP_MM": 5,
-      "VERTICAL_ANGLE_TOL_DEG": 5,
+      "VERTICAL_ANGLE_TOL_DEG": 15,
       "CORNER_MAX_PHYSICAL_GAP": 7,
       "CORNER_MIN_VIRTUAL_GAP": 7.0,
       "CORNER_MAX_EXTENSION_DIST_NORMAL_MM": 0.0,
