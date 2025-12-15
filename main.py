@@ -527,7 +527,39 @@ def main():
         """
         global processes, cam_stop_event, worker_stop_event, camera_proc_ref, worker_procs_ref
         try:
-            print("\n[主进程]: 子进程重启：开始重启相机与计算进程（执行冷启动式清理）...")
+            try:
+                ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                ts = ''
+            # 触发原因由调用方打印；这里统一输出重启前状态快照
+            try:
+                try:
+                    tq = task_queue.qsize()
+                except Exception:
+                    tq = None
+                try:
+                    rq = results_queue.qsize()
+                except Exception:
+                    rq = None
+                try:
+                    jq = rejection_queue.qsize()
+                except Exception:
+                    jq = None
+                try:
+                    cam_alive = bool(camera_proc_ref is not None and camera_proc_ref.is_alive())
+                except Exception:
+                    cam_alive = None
+                try:
+                    workers_alive = sum(1 for wp in (worker_procs_ref or []) if wp is not None and wp.is_alive())
+                except Exception:
+                    workers_alive = None
+                try:
+                    run_on = bool(run_event.is_set())
+                except Exception:
+                    run_on = None
+                print(f"\n[主进程]: 子进程重启：开始（{ts}） run_event={run_on} qsize(task/results/rej)={tq}/{rq}/{jq} alive(cam/workers)={cam_alive}/{workers_alive}")
+            except Exception:
+                print("\n[主进程]: 子进程重启：开始重启相机与计算进程（执行冷启动式清理）...")
             try:
                 run_event.clear()  # 暂停检测，避免新任务进队
             except Exception:
@@ -632,7 +664,11 @@ def main():
                     run_event.set()
                 except Exception:
                     pass
-                print("[主进程]: 子进程重启：相机就绪，已恢复检测。\n")
+                try:
+                    ts2 = time.strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    ts2 = ''
+                print(f"[主进程]: 子进程重启：相机就绪，已恢复检测（{ts2}）。\n")
             else:
                 print("[主进程]: 子进程重启：等待相机就绪超时（暂时暂停，待就绪自动恢复）。\n")
                 # 若超过超时后相机才就绪，自动恢复 run_event，避免长时间无处理又无日志。
@@ -733,6 +769,11 @@ def main():
 
     mem_recovering_flag = threading.Event()
 
+    try:
+        print(f"[主进程]: 内存监控已启用 threshold={mem_threshold_pct:.1f}% interval={mem_check_interval_s:.1f}s")
+    except Exception:
+        pass
+
     def _clear_caches_and_temp():
         cleared = {}
         def _drain_queue(q, name):
@@ -778,7 +819,30 @@ def main():
             if pct >= float(mem_threshold_pct) and not mem_recovering_flag.is_set():
                 mem_recovering_flag.set()
                 try:
-                    print(f"\n[主进程]: 检测到系统内存已用 {used_gb:.2f}/{total_gb:.2f} GB ({pct:.1f}%)，>= 阈值 {mem_threshold_pct}% ，暂停检测并执行清理...")
+                    try:
+                        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                    except Exception:
+                        ts = ''
+                    try:
+                        run_on = bool(run_event.is_set())
+                    except Exception:
+                        run_on = None
+                    try:
+                        tq = task_queue.qsize()
+                    except Exception:
+                        tq = None
+                    try:
+                        rq = results_queue.qsize()
+                    except Exception:
+                        rq = None
+                    try:
+                        jq = rejection_queue.qsize()
+                    except Exception:
+                        jq = None
+                    print(
+                        f"\n[主进程]: [内存看门狗] 触发 @ {ts} used={used_gb:.2f}/{total_gb:.2f}GB ({pct:.1f}%) >= {mem_threshold_pct}% "
+                        f"run_event={run_on} qsize(task/results/rej)={tq}/{rq}/{jq}"
+                    )
                 except Exception:
                     pass
                 try:
@@ -790,9 +854,21 @@ def main():
                     _restart_children(grace_seconds=5.0)
                 except Exception as e:
                     try:
-                        print(f"[主进程]: 内存超阈值重启子进程失败: {e}")
+                        print(f"[主进程]: [内存看门狗] 重启子进程失败: {e}")
                     except Exception:
                         pass
+                try:
+                    ts3 = time.strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    ts3 = ''
+                try:
+                    run_on2 = bool(run_event.is_set())
+                except Exception:
+                    run_on2 = None
+                try:
+                    print(f"[主进程]: [内存看门狗] 处理结束 @ {ts3} run_event={run_on2}")
+                except Exception:
+                    pass
                 mem_recovering_flag.clear()
 
     threading.Thread(target=_memory_watch_loop, daemon=True).start()
