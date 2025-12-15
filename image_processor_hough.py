@@ -61,7 +61,7 @@ _roi_frame_count = {}
 _roi_fences = {}
 _roi_glass_boundary_history = {}
 _roi_glass_boundaries = {}
-# 理想竖直线缓存: 允许检测到的理想直线在后续缺失时保留最多2帧
+# 理想竖直线缓存: 允许检测到的理想直线在后续缺失时保留若干帧(默认5帧，可配置)
 _roi_ideal_vertical_cache = {}
 
 def _update_glass_boundaries(roi_key, vertical_x_list, params):
@@ -693,59 +693,79 @@ def preprocess_for_hough_enhanced(roi_gray, params):
     blurred = cv2.medianBlur(roi_gray, p["MEDIAN_BLUR_KSIZE"])
     clahe = cv2.createCLAHE(clipLimit=p["CLAHE_CLIP_LIMIT"], tileGridSize=grid_size)
     enhanced_contrast = clahe.apply(blurred)
-    edges = cv2.Canny(enhanced_contrast, p["CANNY_THRESHOLD_LOW"], p["CANNY_THRESHOLD_HIGH"])
-    return denoise_edge_map(edges, params)
+    low = int(p.get("CANNY_THRESHOLD_LOW", 20))
+    high = int(p.get("CANNY_THRESHOLD_HIGH", 80))
+    if high <= low:
+        high = low + 1
+    edges = cv2.Canny(enhanced_contrast, low, high)
 
-def denoise_edge_map(edge_img: np.ndarray, params) -> np.ndarray:
-    """快速对 Canny 边缘图进行降噪：移除孤立像素与极小簇，减少离群点对后续检测干扰。
-    可配置 DEFECT_DETECTION 下参数：
-      CANNY_DENOISE_ENABLE (bool, 默认 True)
-      CANNY_DENOISE_MIN_NEIGHBORS (含自身的3x3邻域最少白点数, 默认 2)
-      CANNY_DENOISE_MIN_CLUSTER_PIXELS (连通域像素下限, 默认 5)
-      CANNY_DENOISE_MAX_ITER (最大迭代次数, 默认 1)
-    过程：
-      1) 3x3 邻域计数过滤孤立或过稀疏的点。
-      2) 连通域分析剔除过小簇。
-      3) 可迭代一次（避免频繁重计算）。
-    保持速度：全部操作在二值图上，卷积与 connectedComponentsO(像素数)。"""
+    # 兜底增强（提升 Hough 对弱/断边的敏感度）：
+    # 若 Canny 边缘过稀，则降低阈值再跑一次并合并，同时可选做轻微膨胀连接断裂。
     try:
-        pdef = params.get('DEFECT_DETECTION', {})
-        if not bool(pdef.get('CANNY_DENOISE_ENABLE', True)):
-            return edge_img
-        min_neighbors = int(pdef.get('CANNY_DENOISE_MIN_NEIGHBORS', 2))  # 3x3包含自身的白点数阈值
-        min_cluster = int(pdef.get('CANNY_DENOISE_MIN_CLUSTER_PIXELS', 15))
-        max_iter = int(pdef.get('CANNY_DENOISE_MAX_ITER', 1))
+        min_edge_ratio = float(p.get("HOUGH_MIN_EDGE_RATIO", 0.002))
     except Exception:
-        return edge_img
+        min_edge_ratio = 0.002
+    try:
+        edge_ratio = float(np.count_nonzero(edges)) / float(edges.size) if edges is not None and edges.size else 0.0
+    except Exception:
+        edge_ratio = 0.0
 
-    if edge_img is None or edge_img.size == 0:
-        return edge_img
-    # 转为二值（0/1）
-    bin_img = (edge_img > 0).astype(np.uint8)
-    H, W = bin_img.shape[:2]
-    if H*W <= 0:
-        return edge_img
-    kernel3 = np.ones((3,3), dtype=np.uint8)
-    work = bin_img.copy()
-    for _ in range(max(1, max_iter)):
-        # 邻域计数：保留计数>min_neighbors的点
-        neigh_counts = cv2.filter2D(work, -1, kernel3, borderType=cv2.BORDER_CONSTANT)
-        work = ((neigh_counts > min_neighbors) & (work > 0)).astype(np.uint8)
-        # 连通域剔除小簇
+    if edge_ratio < min_edge_ratio:
+        # 1) 降阈值补跑一遍 Canny（默认缩放 0.75）
         try:
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(work, connectivity=8)
-            if num_labels > 1:
-                mask_keep = np.zeros_like(work)
-                for lbl in range(1, num_labels):
-                    area = int(stats[lbl, cv2.CC_STAT_AREA])
-                    if area >= min_cluster:
-                        mask_keep[labels == lbl] = 1
-                work = mask_keep
+            scale = float(p.get("HOUGH_CANNY_FALLBACK_SCALE", 0.75))
+        except Exception:
+            scale = 0.75
+        low2 = int(max(0, round(low * scale)))
+        high2 = int(max(low2 + 1, round(high * scale)))
+        try:
+            edges2 = cv2.Canny(enhanced_contrast, low2, high2)
+            edges = cv2.bitwise_or(edges, edges2)
         except Exception:
             pass
-    # 恢复到 0/255 形式
-    out = (work * 255).astype(np.uint8)
-    return out
+
+        # 2) 轻微膨胀：连接断裂边缘，帮助 Hough 形成更长的可投票线段
+        try:
+            dil_iter = int(p.get("HOUGH_EDGE_DILATE_ITER", 1))
+        except Exception:
+            dil_iter = 1
+        if dil_iter > 0:
+            try:
+                ksz = p.get("HOUGH_EDGE_DILATE_KERNEL_PX", [3, 3])
+                kx = int(ksz[0]) if isinstance(ksz, (list, tuple)) and len(ksz) >= 2 else 3
+                ky = int(ksz[1]) if isinstance(ksz, (list, tuple)) and len(ksz) >= 2 else 3
+                if kx < 1: kx = 1
+                if ky < 1: ky = 1
+                if kx % 2 == 0: kx += 1
+                if ky % 2 == 0: ky += 1
+            except Exception:
+                kx, ky = 3, 3
+            try:
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
+                edges = cv2.dilate(edges, kernel, iterations=dil_iter)
+            except Exception:
+                pass
+
+    return edges
+
+
+def preprocess_for_defect_edges(roi_gray, params):
+    """用于缺陷检测的边缘图：只做基础预处理 + 一次 Canny，不做任何兜底膨胀/连通增强。
+
+    目的：
+    - 避免为了 Hough 敏感度加入的“补跑 + 膨胀”导致 Canny 过度粘连，从而让 E/Q 等依赖轮廓的检测漏检/误检。
+    """
+    p = params["PREPROCESSING"]
+    grid_size = tuple(p.get("CLAHE_GRID_SIZE", [8, 8]))
+    blurred = cv2.medianBlur(roi_gray, p["MEDIAN_BLUR_KSIZE"])
+    clahe = cv2.createCLAHE(clipLimit=p["CLAHE_CLIP_LIMIT"], tileGridSize=grid_size)
+    enhanced_contrast = clahe.apply(blurred)
+    low = int(p.get("CANNY_THRESHOLD_LOW", 20))
+    high = int(p.get("CANNY_THRESHOLD_HIGH", 80))
+    if high <= low:
+        high = low + 1
+    return cv2.Canny(enhanced_contrast, low, high)
+
 
 
 def _snap_line_to_canny(seg: np.ndarray, edge_img: np.ndarray, stripe_half_px: int,
@@ -1589,7 +1609,7 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
 
     return adjusted_edges
 
-def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: float, binary_edges=None):
+def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: float, binary_edges=None, dbg=None):
     p_defect = params["DEFECT_DETECTION"]; p_crack = params["CRACK_CLASSIFICATION"]
     num_edges = len(edges); roi_h, roi_w = roi_dims
     # 保留原始检测到的所有线段，用于后续“斜边异常(E)”对全量直线的扫描
@@ -2196,17 +2216,36 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         # 放宽可容纳的 Canny 范围：可选对边缘图做轻微膨胀，扩大可判定区域
         try:
             dil_iter = int(params.get('DEFECT_DETECTION', {}).get('E_CANNY_DILATE_ITER', 1))
-            dil_iter = max(0, min(dil_iter, 5))
+            # 允许更强的连通增强（由配置控制），避免被硬编码上限卡死
+            dil_iter = max(0, min(dil_iter, 10))
         except Exception:
             dil_iter = 1
-        # 利用已找到的近竖直/近水平主边，生成穿过 ROI 的宽线带并屏蔽其覆盖的 Canny 边缘，减少“被切成两块”时的误报
+        # 利用已找到的近竖直/近水平主边，生成穿过 ROI 的宽线带并屏蔽其覆盖的 Canny 边缘。
+        # 关键：先做（可选）膨胀再做屏蔽，避免“膨胀把已屏蔽的断开区域又重新连接起来”，从而漏检 E。
         edges_base = (binary_edges > 0).astype(np.uint8)
+        if dil_iter > 0:
+            try:
+                kernel_e = np.ones((3, 3), np.uint8)
+                edges_work = cv2.dilate(edges_base, kernel_e, iterations=dil_iter)
+            except Exception:
+                edges_work = edges_base
+        else:
+            edges_work = edges_base
         try:
             suppress_w = int(params.get('DEFECT_DETECTION', {}).get('E_LINE_SUPPRESS_WIDTH_PX', 36))
         except Exception:
             suppress_w = 36
         suppress_w = max(0, suppress_w)
-        if suppress_w > 0 and (true_edges is not None):
+
+        # 若做了膨胀，屏蔽带需要相应加宽，才能把“粘到主边上”的斜向 Canny 团块彻底断开
+        try:
+            extra_per_iter = int(params.get('DEFECT_DETECTION', {}).get('E_LINE_SUPPRESS_EXTRA_PX_PER_DILATE_ITER', 4))
+        except Exception:
+            extra_per_iter = 4
+        suppress_w_eff = int(max(0, suppress_w + max(0, dil_iter) * max(0, extra_per_iter)))
+
+        mask_lines = None
+        if suppress_w_eff > 0 and (true_edges is not None):
             mask_lines = np.zeros_like(edges_base, dtype=np.uint8)
             try:
                 h_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', 10.0))
@@ -2266,14 +2305,20 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     if clipped is None:
                         continue
                     x1, y1, x2, y2 = map(int, map(round, clipped))
-                    cv2.line(mask_lines, (x1, y1), (x2, y2), 255, suppress_w)
+                    cv2.line(mask_lines, (x1, y1), (x2, y2), 255, suppress_w_eff)
             if np.any(mask_lines):
-                edges_base[mask_lines > 0] = 0
-        if dil_iter > 0:
-            kernel_e = np.ones((3,3), np.uint8)
-            edges_for_e = cv2.dilate(edges_base, kernel_e, iterations=dil_iter)
-        else:
-            edges_for_e = edges_base
+                edges_work[mask_lines > 0] = 0
+        edges_for_e = edges_work
+
+        # DEBUG: 记录“屏蔽带过滤后仍存在的 Canny 边缘”，用于外层调试叠加显示
+        try:
+            if isinstance(dbg, dict):
+                dbg['e_edges_base'] = edges_base.copy()
+                dbg['e_edges_after_suppress'] = edges_for_e.copy()
+                dbg['e_mask_lines'] = mask_lines.copy() if isinstance(mask_lines, np.ndarray) else None
+        except Exception:
+            pass
+
         contours, _ = cv2.findContours(edges_for_e, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         try:
             min_area_px2 = _get_area_px2(params.get('DEFECT_DETECTION', {}), 'E_MIN_AREA_MM2', None, 4.0, pixels_per_mm)
@@ -2293,29 +2338,137 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         except Exception:
             border_touch_px = 8.0
         roi_h, roi_w = roi_gray.shape[:2]
+
+        # 角度容差：与全局保持一致（不引入 E 专用阈值）
+        try:
+            h_tol_deg_for_e = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', vertical_tol_deg))
+        except Exception:
+            h_tol_deg_for_e = vertical_tol_deg
+
+        def _pt_to_seg_dist(px, py, seg):
+            try:
+                x1, y1, x2, y2 = map(float, seg)
+                vx = x2 - x1
+                vy = y2 - y1
+                denom = vx * vx + vy * vy
+                if denom < 1e-9:
+                    return float(np.hypot(px - x1, py - y1))
+                t = ((px - x1) * vx + (py - y1) * vy) / denom
+                if t < 0.0:
+                    t = 0.0
+                elif t > 1.0:
+                    t = 1.0
+                qx = x1 + t * vx
+                qy = y1 + t * vy
+                return float(np.hypot(px - qx, py - qy))
+            except Exception:
+                return float('inf')
+
+        def _min_dist_to_main_edges(px, py, segs):
+            try:
+                best = float('inf')
+                for s in (segs or []):
+                    d = _pt_to_seg_dist(px, py, s)
+                    if d < best:
+                        best = d
+                return best
+            except Exception:
+                return float('inf')
+
+        # 若“主边集合”里出现了斜线（既不近水平也不近竖直），且贴近 ROI 边界，
+        # 直接作为 E 候选加入（解决：灰色 L0 这类斜线被当作主边但应算边缘异常）。
+        try:
+            enable_e_from_main = bool(params.get('DEFECT_DETECTION', {}).get('E_INCLUDE_SKEW_MAIN_EDGES', True))
+        except Exception:
+            enable_e_from_main = True
+        if enable_e_from_main and (true_edges is not None):
+            try:
+                h_tol_deg_local = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', 10.0))
+            except Exception:
+                h_tol_deg_local = 10.0
+            try:
+                min_len_px_for_main = _get_dist_px(params.get('DEFECT_DETECTION', {}), 'E_FROM_MAIN_EDGE_MIN_LEN_MM', None, 20.0, pixels_per_mm)
+            except Exception:
+                min_len_px_for_main = _mm_to_px(20.0, pixels_per_mm)
+            for seg in (true_edges or []):
+                try:
+                    x1, y1, x2, y2 = map(float, seg)
+                    dx = x2 - x1; dy = y2 - y1
+                    ang = abs(np.degrees(np.arctan2(dy, dx)))
+                    ang = ang if ang <= 90.0 else 180.0 - ang
+                    if ang <= h_tol_deg_local or ang >= (90.0 - vertical_tol_deg):
+                        continue
+                    L = float(np.hypot(dx, dy))
+                    if L < float(min_len_px_for_main):
+                        continue
+                    xmn = min(x1, x2); xmx = max(x1, x2)
+                    ymn = min(y1, y2); ymx = max(y1, y2)
+                    if min(xmn, ymn, float(roi_w - 1) - xmx, float(roi_h - 1) - ymx) > float(border_touch_px):
+                        continue
+                    pad = int(max(2, round(0.5 * max(1, suppress_w_eff))))
+                    X = int(max(0, math.floor(xmn) - pad))
+                    Y = int(max(0, math.floor(ymn) - pad))
+                    X2 = int(min(roi_w - 1, math.ceil(xmx) + pad))
+                    Y2 = int(min(roi_h - 1, math.ceil(ymx) + pad))
+                    # 使用 inclusive 坐标，确保 box_points 始终在 ROI 内
+                    aabb = np.array([[X, Y], [X2, Y], [X2, Y2], [X, Y2]], dtype=np.int32)
+                    skew_line_defects.append({'type': 'E', 'box_points': aabb, 'skew_angle_deg': float(90.0 - ang)})
+                except Exception:
+                    continue
+
         for cnt in contours:
-            area = float(cv2.contourArea(cnt))
-            if area < max(1.0, min_area_px2):
-                continue
+            # NOTE: 斜向“细长线状”异常的轮廓面积可能非常小（接近 0），
+            # 若先用 contourArea 过滤会漏检（你图里那条 45° 斜边就是典型）。
+            # 因此先做 minAreaRect，用“长边长度”做主要门槛；面积阈值仅作为噪声抑制的次要条件。
+            try:
+                area = float(cv2.contourArea(cnt))
+            except Exception:
+                area = 0.0
             rect = cv2.minAreaRect(cnt)
             (cx, cy), (w, h), angle_raw = rect
             if w < 1e-3 or h < 1e-3:
                 continue
-            if min(w, h) < max(1.0, min_side_px):
+            long_side = float(max(w, h))
+            short_side = float(min(w, h))
+            if long_side < max(1.0, float(min_side_px)):
                 continue
+            if area < max(1.0, float(min_area_px2)):
+                # 面积过小但长度足够：用周长做兜底，过滤极少像素的孤立噪点
+                try:
+                    perim = float(cv2.arcLength(cnt, True))
+                except Exception:
+                    perim = 0.0
+                # 对“线状轮廓”，周长通常至少与长边同量级；过小则更像噪点
+                if perim < max(8.0, 0.6 * long_side):
+                    continue
             ang = float(abs(angle_raw))
             if w < h:
                 ang = float(abs(angle_raw + 90.0))
             if ang > 90.0:
                 ang -= 90.0
-            if ang <= vertical_tol_deg or ang >= (90.0 - vertical_tol_deg):
+
+            # 角度过滤：E 仍只接受“明显斜向”的轮廓。
+            # 近水平/近竖直（<~10° 或 >~80°）一律过滤，避免把主边/边界残留误报为 E。
+            if ang <= float(h_tol_deg_for_e) or ang >= (90.0 - float(vertical_tol_deg)):
                 continue
             box = cv2.boxPoints(rect).astype(np.int32)
             xbb, ybb, wbb, hbb = cv2.boundingRect(box)
-            # 仅保留靠近 ROI 边界的斜边，过滤 ROI 内部的独立玻璃轮廓（如一刀切成两块时的中间角）
-            if min(xbb, ybb, roi_w - (xbb + wbb), roi_h - (ybb + hbb)) > max(1.0, border_touch_px):
-                continue
-            aabb = np.array([[xbb, ybb], [xbb + wbb, ybb], [xbb + wbb, ybb + hbb], [xbb, ybb + hbb]], dtype=np.int32)
+            # 过滤“明显远离玻璃边界”的内部轮廓：
+            # 旧逻辑只允许靠近 ROI 边界；但 ROI 边界不一定等于玻璃边界，导致你图里那种明显斜边（靠近主边但不靠近 ROI 边界）被误杀。
+            # 新逻辑：靠近 ROI 边界 OR 靠近已检测到的主边（outside suppression band ring）都允许。
+            border_dist = float(min(xbb, ybb, roi_w - (xbb + wbb), roi_h - (ybb + hbb)))
+            if border_dist > float(max(1.0, border_touch_px)):
+                dmin_main = _min_dist_to_main_edges(float(cx), float(cy), true_edges) if (true_edges is not None) else float('inf')
+                near_main_thr = float(max(2.0, 0.5 * float(max(0, suppress_w_eff)) + float(max(1.0, border_touch_px)) + 2.0))
+                if not (dmin_main <= near_main_thr):
+                    continue
+
+            # 使用 inclusive 坐标并夹紧到 ROI 内，避免检测框越界
+            x2b = int(min(roi_w - 1, xbb + wbb - 1))
+            y2b = int(min(roi_h - 1, ybb + hbb - 1))
+            x1b = int(max(0, xbb))
+            y1b = int(max(0, ybb))
+            aabb = np.array([[x1b, y1b], [x2b, y1b], [x2b, y2b], [x1b, y2b]], dtype=np.int32)
             skew_line_defects.append({
                 'type': 'E',
                 'box_points': aabb,
@@ -2390,7 +2543,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     corner_contour_q_defects = []
     try:
         kernel_qc = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
-        edges_qc = preprocess_for_hough_enhanced(roi_gray, params)
+        edges_qc = preprocess_for_defect_edges(roi_gray, params)
         edges_qc_dil = cv2.dilate(edges_qc, kernel_qc, iterations=1)
         cnts_qc, _ = cv2.findContours(edges_qc_dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if cnts_qc:
@@ -3100,7 +3253,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             return False
 
         # 准备边缘图
-        edges_pf = preprocess_for_hough_enhanced(roi_gray, params)
+        edges_pf = preprocess_for_defect_edges(roi_gray, params)
         filtered = []
         for nd in (rect_q_defects or []):
             try:
@@ -3625,7 +3778,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             
     # 新增：检测主边上的凹进/缺段，标记为缺角
     try:
-        edges_notch_img = preprocess_for_hough_enhanced(roi_gray, params)
+        edges_notch_img = preprocess_for_defect_edges(roi_gray, params)
         notch_defects = _detect_edge_notches(edges_notch_img, edges_for_drawing, pixels_per_mm, params)
         if notch_defects:
             corner_defects.extend(notch_defects)
@@ -3761,7 +3914,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     return edges_for_drawing, filtered_defects, paired_corners
 
 
-def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm):
+def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm, dbg_edges_after_suppress=None):
     # 兼容多种 ROI 表达：dict/list/tuple
     def _parse_roi(rt):
         if isinstance(rt, (list, tuple)) and len(rt) >= 4:
@@ -3798,7 +3951,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     roi_key_for_cache = (roi_id, w, h)
     
     p_hough = params["HOUGH_TRANSFORM"]
-    binary_edges = preprocess_for_hough_enhanced(roi_gray, params)
+    # 分离：Hough 用更敏感的边缘图；缺陷检测用更“干净”的原始边缘图，避免过度粘连
+    hough_edges = preprocess_for_hough_enhanced(roi_gray, params)
+    binary_edges = preprocess_for_defect_edges(roi_gray, params)
     # 保证传入 HoughLinesP 的参数为整数类型（OpenCV 要求 threshold 为 int，其他也用 int 更稳妥）
     min_len_pixels = roi_gray.shape[1] * p_hough.get("MIN_LINE_LENGTH_RATIO", 0.05)
     try:
@@ -3818,7 +3973,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         hough_threshold_i = 50
 
     raw_lines = cv2.HoughLinesP(
-        binary_edges,
+        hough_edges,
         1,
         np.pi / 180,
         hough_threshold_i,
@@ -3826,7 +3981,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         maxLineGap=max_line_gap_px_i,
     )
     
-    main_edges = merge_lines_and_get_main_edges(raw_lines, params, pixels_per_mm, edge_img=binary_edges)
+    main_edges = merge_lines_and_get_main_edges(raw_lines, params, pixels_per_mm, edge_img=hough_edges)
 
     # 运行时：根据上层注入的 DEFECT_DETECTION.Q_ENABLED 控制是否生成/绘制 Q
     try:
@@ -3955,6 +4110,14 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             cached_ideal_lines = [np.array(l, dtype=float) for l in cache_entry_ideal.get('lines')]
         except Exception:
             cached_ideal_lines = []
+
+    # 理想竖直线缓存帧数(默认5)
+    try:
+        ideal_cache_ttl = int(params.get('DEFECT_DETECTION', {}).get('B_IDEAL_VERTICAL_CACHE_TTL_FRAMES', 5))
+    except Exception:
+        ideal_cache_ttl = 5
+    if ideal_cache_ttl < 0:
+        ideal_cache_ttl = 0
     added_from_cache = False
     if enable_ev and binary_edges is not None and binary_edges.size > 0:
         try:
@@ -4019,10 +4182,10 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                         seg_new = np.array([x_new, 0.0, x_new, float(H_be - 1)], dtype=float)
                         main_edges.append(seg_new)
                         cached_ideal_lines.append(seg_new.copy())
-                    if cached_ideal_lines:
-                        _roi_ideal_vertical_cache[roi_key_for_cache] = {'lines': [c.tolist() for c in cached_ideal_lines], 'ttl': 2}
+                    if cached_ideal_lines and ideal_cache_ttl > 0:
+                        _roi_ideal_vertical_cache[roi_key_for_cache] = {'lines': [c.tolist() for c in cached_ideal_lines], 'ttl': ideal_cache_ttl}
                 elif cached_ideal_lines:
-                    # 没有检测到新的理想线，但有缓存，保留最多2帧
+                    # 没有检测到新的理想线，但有缓存，保留若干帧(见 ideal_cache_ttl)
                     try:
                         remaining = int(cache_entry_ideal.get('ttl', 0)) if cache_entry_ideal else 0
                     except Exception:
@@ -4098,7 +4261,22 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     intersections_frame.append((int(round(x_int)), int(round(y_int))))
     # 打印每帧交点信息（ROI级别）
     # 不再打印 intersections_frame 调试信息
-    edges_for_drawing, all_defects, paired_corners = find_and_analyze_defects(main_edges, roi_gray, roi_gray.shape, params, pixels_per_mm, binary_edges)
+    dbg_local = {} if dbg_edges_after_suppress is not None else None
+    edges_for_drawing, all_defects, paired_corners = find_and_analyze_defects(
+        main_edges,
+        roi_gray,
+        roi_gray.shape,
+        params,
+        pixels_per_mm,
+        binary_edges,
+        dbg=dbg_local,
+    )
+    if dbg_edges_after_suppress is not None and isinstance(dbg_edges_after_suppress, list):
+        try:
+            if 0 <= int(roi_idx) < len(dbg_edges_after_suppress):
+                dbg_edges_after_suppress[int(roi_idx)] = dbg_local
+        except Exception:
+            pass
 
     # 构建“主边端点扫描带”掩膜：长度默认20mm（可通过 DEFECT_DETECTION.L_ENDPOINT_BELT_LENGTH_MM 配置），
     # 宽度等于亮度扫描带宽 LUMINOSITY_SCAN_WIDTH_MM；用于过滤位于边端扫描带内的 L 型缺陷（视为误检）。
@@ -4523,7 +4701,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     # 调试可视化：绘制 E 的“贯穿屏蔽带”（用于验证屏蔽区域是否覆盖到角落）
     # 仅在显式开启时绘制，避免影响默认输出。
     try:
-        draw_e_suppress_band = bool(params.get('DEFECT_DETECTION', {}).get('DRAW_E_SUPPRESS_BAND', False))
+        draw_e_suppress_band = bool(params.get('DEFECT_DETECTION', {}).get('DRAW_E_SUPPRESS_BAND', True))
     except Exception:
         draw_e_suppress_band = False
     if draw_e_suppress_band:
@@ -4621,6 +4799,8 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     except Exception:
        pass
     
+    annotations_to_draw = []
+
     for defect_report in final_defects_for_report:
         defect = defect_report['raw_defect']
         color_bgr = DEFECT_COLORS_BGR.get(defect_report["type"], (255, 255, 255))
@@ -4802,9 +4982,12 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
     auto_workers = min(cpu_workers, len(template_rois))
     num_workers = auto_workers if roi_threads_cfg <= 0 else max(1, min(roi_threads_cfg, len(template_rois)))
 
+    # DEBUG：保存每个 ROI 的“屏蔽带过滤后仍存在的 Canny 边缘”，供末尾叠加显示
+    debug_e_edges_by_roi = [None] * (len(template_rois) if template_rois else 0)
+
     def _safe_roi_hough(i, r):
         try:
-            return process_roi_hough_based(i, r, image_gray, hough_params, pixels_per_mm)
+            return process_roi_hough_based(i, r, image_gray, hough_params, pixels_per_mm, dbg_edges_after_suppress=debug_e_edges_by_roi)
         except Exception as e:
             print(f"Error processing ROI {i}: {e}")
             # 兼容多种 ROI 表达，尽可能返回一个安全的占位 ROI
@@ -5027,5 +5210,70 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
     # 取消针对 E 类型的帧级竖直主边进入判定：恢复为仅依据是否有主边
     report["state_code"] = 1 if max_edges_found > 0 else 0
     # 移除跨帧输出：不再在报告中携带共享竖直边
+
+    # ===== DEBUG：在每张输出图上标出 ROI 区域 + Canny 边缘（需要时可整段注释掉） =====
+    # 说明：
+    # - 画绿色 ROI 框 + ROI 编号
+    # - 在 ROI 内用黄色半透明叠加显示 Canny 边缘
+    # - 默认开启；不需要时可把 DEBUG_DRAW_ROI_AND_CANNY 改为 False 或直接注释整段
+    try:
+        DEBUG_DRAW_ROI_AND_CANNY = True
+        if DEBUG_DRAW_ROI_AND_CANNY and template_rois:
+            def _parse_roi_for_debug(rt):
+                if isinstance(rt, (list, tuple)) and len(rt) >= 4:
+                    return int(rt[0]), int(rt[1]), int(rt[2]), int(rt[3])
+                if isinstance(rt, dict):
+                    if 'x' in rt or 'y' in rt or 'width' in rt or 'height' in rt:
+                        x0 = int(rt.get('x', 0)); y0 = int(rt.get('y', 0))
+                        w0 = int(rt.get('width', rt.get('w', 0)) or 0)
+                        h0 = int(rt.get('height', rt.get('h', 0)) or 0)
+                        return x0, y0, w0, h0
+                    if all(k in rt for k in ('left','top','right','bottom')):
+                        left = int(rt.get('left', 0)); top = int(rt.get('top', 0))
+                        right = int(rt.get('right', left)); bottom = int(rt.get('bottom', top))
+                        return left, top, max(0, right - left), max(0, bottom - top)
+                return 0, 0, 0, 0
+
+            H_img, W_img = image_gray.shape[:2]
+            roi_box_color = (0, 255, 0)
+            canny_color = (0, 255, 255)  # 黄色(BGR)
+            canny_after_suppress_color = (255, 0, 255)  # 紫色(BGR)：屏蔽带过滤后仍存在的边缘
+            canny_alpha = 0.55
+            for i, r in enumerate(template_rois):
+                rx, ry, rw, rh = _parse_roi_for_debug(r)
+                if rw <= 0 or rh <= 0:
+                    continue
+                if rx < 0 or ry < 0 or rx + rw > W_img or ry + rh > H_img:
+                    # 越界则跳过（避免写入越界）
+                    continue
+
+                # 1) ROI 框 + 编号
+                cv2.rectangle(final_image, (rx, ry), (rx + rw - 1, ry + rh - 1), roi_box_color, 2)
+                cv2.putText(final_image, f"ROI {i}", (rx + 4, ry + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, roi_box_color, 2, cv2.LINE_AA)
+
+                # 2) ROI 内 Canny 叠加
+                # - 黄色：原始缺陷检测 Canny
+                # - 紫色：经过“主边屏蔽带”过滤后仍存在的 Canny（更贴近 E/Q 等轮廓检测实际输入）
+                try:
+                    roi_gray = image_gray[ry:ry+rh, rx:rx+rw]
+                    dbg = debug_e_edges_by_roi[i] if isinstance(debug_e_edges_by_roi, list) and i < len(debug_e_edges_by_roi) else None
+                    if isinstance(dbg, dict) and isinstance(dbg.get('e_edges_base'), np.ndarray):
+                        edge_img = dbg.get('e_edges_base')
+                        edge_after = dbg.get('e_edges_after_suppress') if isinstance(dbg.get('e_edges_after_suppress'), np.ndarray) else None
+                    else:
+                        edge_img = preprocess_for_defect_edges(roi_gray, hough_params)
+                        edge_after = None
+                    if edge_img is None or edge_img.size == 0:
+                        continue
+                    roi_bgr = final_image[ry:ry+rh, rx:rx+rw]
+                    overlay = roi_bgr.copy()
+                    overlay[edge_img > 0] = canny_color
+                    if isinstance(edge_after, np.ndarray) and edge_after.shape[:2] == overlay.shape[:2]:
+                        overlay[edge_after > 0] = canny_after_suppress_color
+                    cv2.addWeighted(overlay, canny_alpha, roi_bgr, 1.0 - canny_alpha, 0, roi_bgr)
+                except Exception:
+                    continue
+    except Exception:
+        pass
     
     return report, final_image
