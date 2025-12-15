@@ -60,9 +60,9 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     except Exception:
         pass
     
-    # 进入/离开 去抖（帧）——避免算法偶发抖动导致反复进入/离开
-    # 默认帧数略降到3，在引入“进入最短时间”门槛后整体更稳且响应更快
-    ENTER_CONFIRM_FRAMES = int(getattr(shared_settings, 'enter_confirm_frames', 3))
+    # 进入/离开 去抖（帧）——用户要求“进入事件不加延迟，直接进入”。
+    # 因此进入确认帧固定为 1；离开仍保留去抖避免抖动。
+    ENTER_CONFIRM_FRAMES = 1
     LEAVE_CONFIRM_FRAMES = int(getattr(shared_settings, 'leave_confirm_frames', 3))
     presence_streak = 0
     absence_streak = 0
@@ -568,12 +568,6 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
 
         try:
             cam_index = result["camera_index"]
-            # 避免广播二进制缓冲区
-            ws_data = {k: v for k, v in result.items() if k not in ('annotated_image_buffer', 'raw_image_buffer')}
-            try:
-                asyncio.run_coroutine_threadsafe(connection_manager.broadcast(json.dumps(ws_data), cam_index), loop)
-            except Exception:
-                pass
 
             now_str = datetime.now().strftime('%Y-%m-%d')
             if now_str != last_reset_date_str:
@@ -610,6 +604,30 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
 
             last_camera_states[cam_index] = result['state_code']
             current_total_panes = int(np.sum(last_camera_states))
+
+            # 对外广播：仅在“玻璃进入事件(检测窗口)”内允许出现 NG。
+            # 说明：广播发生在进入判定逻辑之前，因此这里需要“预测”本帧是否将触发进入。
+            # - WAITING 且本帧将触发进入：允许按真实 NG/OK 广播（视为进入事件内的首帧）。
+            # - WAITING 且尚未触发进入：强制汇报 OK。
+            # - PANE_DETECTED 但 current_total_panes==0（离开去抖/空场）：强制汇报 OK。
+            ws_data = {k: v for k, v in result.items() if k not in ('annotated_image_buffer', 'raw_image_buffer')}
+            try:
+                will_enter_now = False
+                if machine_state == "WAITING_FOR_PANE" and current_total_panes > 0:
+                    next_presence = presence_streak + 1
+                    will_enter_now = (next_presence >= ENTER_CONFIRM_FRAMES)
+
+                in_detection_window = (machine_state == "PANE_DETECTED" and current_total_panes > 0) or will_enter_now
+
+                if not in_detection_window:
+                    if str(ws_data.get('image_status', 'OK')).upper() == 'NG':
+                        ws_data['image_status'] = 'OK'
+                        ws_data['defects'] = []
+                        ws_data['should_reject'] = False
+
+                asyncio.run_coroutine_threadsafe(connection_manager.broadcast(json.dumps(ws_data), cam_index), loop)
+            except Exception:
+                pass
 
             if machine_state == "PANE_DETECTED":
                 # 检测离开
@@ -717,8 +735,9 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 except Exception:
                     pass
 
-                # NG 帧处理
-                if result['image_status'] == 'NG':
+                # NG 帧处理：仅在“确有玻璃存在”(current_total_panes>0)时才允许记录NG。
+                # 这可避免离开去抖阶段(无玻璃但尚未退出状态)产生的空场误报被计入本片。
+                if current_total_panes > 0 and result['image_status'] == 'NG':
                     if current_pane_folder is None:
                         pane_start_ts = datetime.now()
                         raw_cid = shared_collection_id.value
@@ -770,7 +789,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 if np.sum(last_camera_states) > np.sum(max_complexity_snapshot):
                     max_complexity_snapshot = last_camera_states.copy()
 
-                auto_reject_ready = (shared_rejection_mode.value == 1 and result.get('should_reject', False))
+                auto_reject_ready = (current_total_panes > 0 and shared_rejection_mode.value == 1 and result.get('should_reject', False))
                 if auto_reject_ready:
                     expected = int(getattr(shared_settings, 'expected_cameras', num_cameras) or num_cameras)
                     marks = None
