@@ -67,55 +67,58 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
     
     last_paused_log_ts = 0.0
     last_results_full_log_ts = 0.0
-    while not stop_event.is_set():
-        if not run_event.is_set():
-            # 检测被暂停时，仍会持续从队列取数据以防队列堆积；这里补一条低频日志，避免“静默不处理”难定位。
-            now = time.time()
-            if now - last_paused_log_ts >= 30.0:
-                last_paused_log_ts = now
+    try:
+        while not stop_event.is_set():
+            if not run_event.is_set():
+                # 检测被暂停时，仍会持续从队列取数据以防队列堆积；这里补一条低频日志，避免“静默不处理”难定位。
+                now = time.time()
+                if now - last_paused_log_ts >= 30.0:
+                    last_paused_log_ts = now
+                    try:
+                        print(f"[计算进程 {process_index}]: run_event=OFF，暂停处理（仍在清空输入队列）")
+                    except Exception:
+                        pass
                 try:
-                    print(f"[计算进程 {process_index}]: run_event=OFF，暂停处理（仍在清空输入队列）")
-                except Exception:
-                    pass
-            try:
-                _ = task_queue.get(timeout=1)
-            except Empty:
-                pass
-            continue
-        try:
-            first_task = task_queue.get(timeout=1)
-        except Empty:
-            continue
-        try:
-            # 取消“只取最新”的合并策略：改为按入队顺序处理所有已取出的任务，避免丢弃旧帧
-            tasks_to_process = []
-            if first_task is not None:
-                tasks_to_process.append(first_task)
-            t0 = time.perf_counter()
-            drained = 0
-            # 继续在时间/数量预算内尽可能多取任务，但不去重/覆盖，保持 FIFO 处理
-            while drained < max(0, drain_max_n - 1) and (time.perf_counter() - t0) * 1000.0 < max(0, drain_budget_ms):
-                try:
-                    item = task_queue.get_nowait()
-                    tasks_to_process.append(item)
-                    drained += 1
+                    _ = task_queue.get(timeout=1)
                 except Empty:
-                    break
+                    pass
+                continue
 
-            for task_data in tasks_to_process:
-                cam_idx = task_data.get('cam_index')
-                if cam_idx is None:
-                    continue
-                frame_data = task_data.get('data')
-                if frame_data is None:
-                    continue
+            try:
+                first_task = task_queue.get(timeout=1)
+            except Empty:
+                continue
 
-                # 如果任务中直接提供了统一 ROI（模拟模式），优先使用
-                supplied_rois = task_data.get('rois')
-                if supplied_rois is not None and isinstance(supplied_rois, list) and len(supplied_rois) > 0:
-                    roi_cache[cam_idx] = supplied_rois
-                elif cam_idx not in roi_cache:
-                    roi_cache[cam_idx] = load_rois_for_cam(cam_idx)
+            try:
+                # 取消“只取最新”的合并策略：改为按入队顺序处理所有已取出的任务，避免丢弃旧帧
+                tasks_to_process = []
+                if first_task is not None:
+                    tasks_to_process.append(first_task)
+                t0 = time.perf_counter()
+                drained = 0
+                # 继续在时间/数量预算内尽可能多取任务，但不去重/覆盖，保持 FIFO 处理
+                while drained < max(0, drain_max_n - 1) and (time.perf_counter() - t0) * 1000.0 < max(0, drain_budget_ms):
+                    try:
+                        item = task_queue.get_nowait()
+                        tasks_to_process.append(item)
+                        drained += 1
+                    except Empty:
+                        break
+
+                for task_data in tasks_to_process:
+                    cam_idx = task_data.get('cam_index')
+                    if cam_idx is None:
+                        continue
+                    frame_data = task_data.get('data')
+                    if frame_data is None:
+                        continue
+
+                    # 如果任务中直接提供了统一 ROI（模拟模式），优先使用
+                    supplied_rois = task_data.get('rois')
+                    if supplied_rois is not None and isinstance(supplied_rois, list) and len(supplied_rois) > 0:
+                        roi_cache[cam_idx] = supplied_rois
+                    elif cam_idx not in roi_cache:
+                        roi_cache[cam_idx] = load_rois_for_cam(cam_idx)
                 
                 # 根据共享模式 (1=浅色,2=深色) 选择算法
                 try:
@@ -340,15 +343,23 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                         enqueued = False
                 except Exception:
                     enqueued = False
-                if not enqueued:
-                    now = time.time()
-                    if now - last_results_full_log_ts >= 5.0:
-                        last_results_full_log_ts = now
-                        try:
-                            # 不打印过多细节，避免刷屏；此日志用于定位“下游不消费/队列满”问题
-                            print(f"[计算进程 {process_index}]: ⚠️ results_queue 写入失败(可能已满)，已丢弃一帧结果")
-                        except Exception:
-                            pass
+                    if not enqueued:
+                        now = time.time()
+                        if now - last_results_full_log_ts >= 5.0:
+                            last_results_full_log_ts = now
+                            try:
+                                # 不打印过多细节，避免刷屏；此日志用于定位“下游不消费/队列满”问题
+                                print(f"[计算进程 {process_index}]: ⚠️ results_queue 写入失败(可能已满)，已丢弃一帧结果")
+                            except Exception:
+                                pass
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                traceback.print_exc()
+    except KeyboardInterrupt:
+        # Ctrl+C 触发时安静退出
+        try:
+            print(f"[计算进程 {process_index}]: 收到键盘中断，退出。")
         except Exception:
-            traceback.print_exc()
+            pass
 # --- END OF FILE processing_worker.py ---

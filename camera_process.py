@@ -199,6 +199,12 @@ def _camera_worker_process(cam_index: int, task_queue, stop_event, run_event, co
                     # free-run：无须触发，仅小睡避免空转
                     time.sleep(0.005)
 
+        except KeyboardInterrupt:
+            # Ctrl+C 触发时安静退出，交给 finally 做资源释放
+            try:
+                shared_states[cam_index] = {"status": "Stopping"}
+            except Exception:
+                pass
         except Exception as e:
             error_msg = traceback.format_exc()
             print(f"[相机进程 {cam_index}]: 出现异常: {e}")
@@ -530,6 +536,9 @@ def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, 
     try:
         while not stop_event.is_set():
             time.sleep(0.2)
+    except KeyboardInterrupt:
+        # Ctrl+C 触发时安静退出
+        pass
     finally:
         # 结束所有子进程
         print("[相机池]: 正在关闭所有相机进程...")

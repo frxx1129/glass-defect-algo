@@ -164,8 +164,22 @@ def main():
         print(f"\n[主进程]: 收到信号 {sig}，开始优雅关闭...")
         if stop_event:
             stop_event.set()
-        # 给2秒钟让子进程开始清理
-        time.sleep(2)
+        # 立即通知各子系统退出，避免 Ctrl+C 卡住太久
+        try:
+            if cam_stop_event:
+                cam_stop_event.set()
+        except Exception:
+            pass
+        try:
+            if worker_stop_event:
+                worker_stop_event.set()
+        except Exception:
+            pass
+        try:
+            if 'run_event' in globals() and run_event:
+                run_event.clear()
+        except Exception:
+            pass
     
     # 注册SIGINT(Ctrl+C)和SIGTERM(终止)信号处理器
     signal.signal(signal.SIGINT, signal_handler)
@@ -386,10 +400,12 @@ def main():
 
     # Queues for data flow
     queue_size_factor = int(system_params.get('queue_size_factor', 2) or 2)
-    task_queue = manager.Queue(maxsize=NUM_WORKERS * NUM_CAMERAS * queue_size_factor)
-    results_queue = manager.Queue(maxsize=NUM_WORKERS * NUM_CAMERAS * queue_size_factor)
-    rejection_queue = manager.Queue()
-    alarm_command_queue = manager.Queue() # <-- 为报警器创建跨进程队列
+    # 关键：高吞吐队列使用 multiprocessing.Queue，避免 Manager.Queue 在退出/高负载下卡在 managers IPC。
+    task_queue = multiprocessing.Queue(maxsize=NUM_WORKERS * NUM_CAMERAS * queue_size_factor)
+    results_queue = multiprocessing.Queue(maxsize=NUM_WORKERS * NUM_CAMERAS * queue_size_factor)
+    rejection_queue = multiprocessing.Queue()
+    # 报警器命令队列吞吐较低，保持简单同样用 multiprocessing.Queue
+    alarm_command_queue = multiprocessing.Queue()
     # 采集模式下的玻璃会话状态（跨进程） cam_idx -> {active:bool, start_ts:int, folder:str}
     data_sessions = manager.dict()
     
