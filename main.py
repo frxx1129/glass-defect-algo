@@ -989,6 +989,13 @@ def main():
                 print("[主进程]: HTTP客户端已关闭")
             except Exception as e:
                 print(f"[主进程]: 关闭HTTP客户端时出错: {e}")
+
+        # 最后关闭 Manager（在子进程尽量退出之后），避免退出时卡在 managers IPC。
+        try:
+            if 'manager' in locals() and manager is not None:
+                manager.shutdown()
+        except Exception:
+            pass
             
         print("[主进程]: 所有资源已释放，程序退出。")
         # 关闭日志文件（放在所有打印之后）
