@@ -65,8 +65,18 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
             print(f"[计算进程 {process_index}]: Cam{cam_idx} 加载ROI失败: {e}")
             return []
     
+    last_paused_log_ts = 0.0
+    last_results_full_log_ts = 0.0
     while not stop_event.is_set():
         if not run_event.is_set():
+            # 检测被暂停时，仍会持续从队列取数据以防队列堆积；这里补一条低频日志，避免“静默不处理”难定位。
+            now = time.time()
+            if now - last_paused_log_ts >= 30.0:
+                last_paused_log_ts = now
+                try:
+                    print(f"[计算进程 {process_index}]: run_event=OFF，暂停处理（仍在清空输入队列）")
+                except Exception:
+                    pass
             try:
                 _ = task_queue.get(timeout=1)
             except Empty:
@@ -316,7 +326,29 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                     # 提供未标注原图的 JPEG 字节给状态机线程做本地保存
                     result["raw_image_buffer"] = raw_buffer_encoded.tobytes()
                 # 采集模式下不保存 inspection_results 目录（主逻辑已有 storage_path，但这里只控制结果入队即可）
-                results_queue.put(result)
+                # 关键：避免 results_queue 满时永久阻塞，导致所有 worker 卡死 -> 系统表面存活但不再出图。
+                enqueued = False
+                try:
+                    results_queue.put(result, timeout=0.2)
+                    enqueued = True
+                except TypeError:
+                    # 兼容某些 QueueProxy 不支持 timeout 参数的情况
+                    try:
+                        results_queue.put_nowait(result)
+                        enqueued = True
+                    except Exception:
+                        enqueued = False
+                except Exception:
+                    enqueued = False
+                if not enqueued:
+                    now = time.time()
+                    if now - last_results_full_log_ts >= 5.0:
+                        last_results_full_log_ts = now
+                        try:
+                            # 不打印过多细节，避免刷屏；此日志用于定位“下游不消费/队列满”问题
+                            print(f"[计算进程 {process_index}]: ⚠️ results_queue 写入失败(可能已满)，已丢弃一帧结果")
+                        except Exception:
+                            pass
         except Exception:
             traceback.print_exc()
 # --- END OF FILE processing_worker.py ---

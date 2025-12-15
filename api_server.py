@@ -52,14 +52,72 @@ def create_app(num_cameras, shared_objects):
         app.state.run_event = threading.Event()
         if run_event_mp.is_set(): app.state.run_event.set()
 
+        # 手动暂停标记：只有 /control/stop 会置位；用于避免自动恢复误开启
+        app.state.manual_pause = threading.Event()
+        # 期望运行标记：只有当系统曾被“请求启动”（/control/start 或 初始 enable=1）时才会置位
+        app.state.desired_run = threading.Event()
+        if app.state.run_event.is_set():
+            app.state.desired_run.set()
+
+        # 自动恢复：run_event 连续 OFF 超过阈值则自动开启（除非 manual_pause 或 desired_run 未置位）
+        def auto_resume_guard():
+            try:
+                sys_params = getattr(shared_settings, 'system_params', None) or {}
+            except Exception:
+                sys_params = {}
+            try:
+                auto_resume_s = float(sys_params.get('auto_resume_run_event_off_seconds', 180.0) or 180.0) if isinstance(sys_params, dict) else 180.0
+            except Exception:
+                auto_resume_s = 180.0
+            auto_resume_s = max(10.0, float(auto_resume_s))
+            off_since = None
+            while not thread_stop_event.is_set():
+                try:
+                    desired = bool(app.state.desired_run.is_set())
+                    manual = bool(app.state.manual_pause.is_set())
+                    running = bool(app.state.run_event.is_set())
+                except Exception:
+                    desired = False; manual = False; running = True
+
+                if desired and (not manual) and (not running):
+                    if off_since is None:
+                        off_since = time.monotonic()
+                    else:
+                        if (time.monotonic() - off_since) >= auto_resume_s:
+                            try:
+                                app.state.run_event.set()
+                            except Exception:
+                                pass
+                            try:
+                                run_event_mp.set()
+                            except Exception:
+                                pass
+                            try:
+                                print(f"[主进程]: run_event 已 OFF 超过 {auto_resume_s:.0f}s（非手动暂停），已自动恢复检测")
+                            except Exception:
+                                pass
+                            off_since = None
+                else:
+                    off_since = None
+
+                time.sleep(0.5)
+
         def event_proxy():
             while not thread_stop_event.is_set():
-                if app.state.run_event.is_set(): run_event_mp.set()
-                else: run_event_mp.clear()
+                if app.state.run_event.is_set():
+                    run_event_mp.set()
+                    # 任意来源开启检测（含服务器初始 enable），都视为“期望运行”
+                    try:
+                        app.state.desired_run.set()
+                    except Exception:
+                        pass
+                else:
+                    run_event_mp.clear()
                 time.sleep(0.1)
 
         # Start all background threads
         threading.Thread(target=event_proxy, daemon=True).start()
+        threading.Thread(target=auto_resume_guard, daemon=True).start()
         threading.Thread(target=rejection_handler_thread, args=(queues['rejection'], rejection_controller, thread_stop_event, shared_settings), daemon=True).start()
         
         # --- 修改: 将 alarm_light_controller 作为新参数传递给状态机线程 ---
@@ -143,13 +201,33 @@ def create_app(num_cameras, shared_objects):
         return {"code": 200, "message": "获取相机状态成功", "data": dict(shared_camera_states)}
         
     @app.post("/control/start")
-    def start_detection(): 
+    def start_detection(request: Request):
+        app.state.manual_pause.clear()
+        app.state.desired_run.set()
         app.state.run_event.set()
+        try:
+            host = getattr(getattr(request, 'client', None), 'host', '<unknown>')
+        except Exception:
+            host = '<unknown>'
+        try:
+            print(f"[API]: 检测已启动 (/control/start) from {host} @ {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        except Exception:
+            pass
         return {"code": 200, "message": "检测已启动", "data": {"status": "running"}}
 
     @app.post("/control/stop")
-    def stop_detection(): 
+    def stop_detection(request: Request):
+        app.state.manual_pause.set()
+        app.state.desired_run.clear()
         app.state.run_event.clear()
+        try:
+            host = getattr(getattr(request, 'client', None), 'host', '<unknown>')
+        except Exception:
+            host = '<unknown>'
+        try:
+            print(f"[API]: 检测已暂停 (/control/stop) from {host} @ {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        except Exception:
+            pass
         return {"code": 200, "message": "检测已暂停", "data": {"status": "stopped"}}
 
     @app.get("/rejections")
