@@ -743,7 +743,11 @@ def main():
 
     # ============= 内存监控线程：超阈值(默认14GB)时暂停、清缓存并重启子进程 =============
     def _get_memory_usage() -> tuple[float|None, float|None]:
-        """返回 (used_gb, total_gb)。优先 psutil，回退 Windows GlobalMemoryStatusEx。"""
+        """返回 (used_gb, total_gb)。优先 psutil，回退 Windows GlobalMemoryStatusEx。
+
+        说明：这里是“系统内存”占用，仅作为最后的回退/兼容旧配置。
+        主监控以进程树(main.exe及其子进程)占用为准。
+        """
         try:
             import psutil  # type: ignore
             vm = psutil.virtual_memory()
@@ -774,6 +778,75 @@ def main():
                 return (None, None)
         return (None, None)
 
+    def _get_process_tree_memory_gb() -> float | None:
+        """返回 main.exe(当前进程) + 所有子进程的RSS内存占用(GB)。
+
+        - 优先使用 psutil 统计进程树，准确覆盖 multiprocessing 子进程；
+        - 若 psutil 不可用，则回退为仅统计当前进程（Windows API GetProcessMemoryInfo）。
+        """
+        # 1) 优先 psutil：统计当前进程 + 所有子进程（递归）
+        try:
+            import psutil  # type: ignore
+
+            proc = psutil.Process(os.getpid())
+            total_rss = 0
+            try:
+                total_rss += int(proc.memory_info().rss)
+            except Exception:
+                pass
+            try:
+                for ch in proc.children(recursive=True):
+                    try:
+                        total_rss += int(ch.memory_info().rss)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return float(total_rss) / float(1024 ** 3)
+        except Exception:
+            pass
+
+        # 2) 回退：Windows API 获取当前进程工作集（不含子进程）
+        try:
+            if os.name != 'nt':
+                return None
+            try:
+                psapi = ctypes.windll.psapi
+                kernel32 = ctypes.windll.kernel32
+            except Exception:
+                return None
+
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.c_ulong),
+                    ("PageFaultCount", ctypes.c_ulong),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            h_proc = kernel32.GetCurrentProcess()
+            ok = psapi.GetProcessMemoryInfo(h_proc, ctypes.byref(counters), counters.cb)
+            if not ok:
+                return None
+            return float(counters.WorkingSetSize) / float(1024 ** 3)
+        except Exception:
+            return None
+
+    # 进程树内存阈值：达到该值即重启子进程（默认 9GB，满足“main.exe 总内存占用达到9G就重启”）
+    try:
+        mem_restart_threshold_gb = float(system_params.get('memory_restart_threshold_gb', 9.0) or 9.0)
+    except Exception:
+        mem_restart_threshold_gb = 9.0
+
+    # 兼容旧配置：系统内存百分比阈值（仅作为无法获取进程占用时的最后回退）
     try:
         mem_threshold_pct = float(system_params.get('memory_pause_threshold_percent', 85.0) or 85.0)
     except Exception:
@@ -786,7 +859,10 @@ def main():
     mem_recovering_flag = threading.Event()
 
     try:
-        print(f"[主进程]: 内存监控已启用 threshold={mem_threshold_pct:.1f}% interval={mem_check_interval_s:.1f}s")
+        print(
+            f"[主进程]: 内存监控已启用 main_process_tree_threshold={mem_restart_threshold_gb:.2f}GB "
+            f"(fallback_system_threshold={mem_threshold_pct:.1f}%) interval={mem_check_interval_s:.1f}s"
+        )
     except Exception:
         pass
 
@@ -828,11 +904,27 @@ def main():
     def _memory_watch_loop():
         while not stop_event.is_set():
             time.sleep(max(1.0, mem_check_interval_s))
-            used_gb, total_gb = _get_memory_usage()
-            if used_gb is None or total_gb is None or total_gb <= 0:
-                continue
-            pct = (used_gb / total_gb) * 100.0
-            if pct >= float(mem_threshold_pct) and not mem_recovering_flag.is_set():
+
+            # 1) 主判定：进程树内存（main.exe + 子进程）
+            proc_gb = _get_process_tree_memory_gb()
+            trigger = False
+            trigger_reason = None
+            sys_used_gb, sys_total_gb = (None, None)
+            sys_pct = None
+
+            if proc_gb is not None and proc_gb >= float(mem_restart_threshold_gb):
+                trigger = True
+                trigger_reason = f"process_tree_memory_gb={proc_gb:.2f} >= {float(mem_restart_threshold_gb):.2f}"
+            else:
+                # 2) 回退：无法获得进程树内存时，兼容旧的系统内存百分比阈值
+                sys_used_gb, sys_total_gb = _get_memory_usage()
+                if sys_used_gb is not None and sys_total_gb is not None and sys_total_gb > 0:
+                    sys_pct = (sys_used_gb / sys_total_gb) * 100.0
+                    if sys_pct >= float(mem_threshold_pct):
+                        trigger = True
+                        trigger_reason = f"system_memory_pct={sys_pct:.1f}% >= {float(mem_threshold_pct):.1f}%"
+
+            if trigger and not mem_recovering_flag.is_set():
                 mem_recovering_flag.set()
                 try:
                     try:
@@ -855,8 +947,14 @@ def main():
                         jq = rejection_queue.qsize()
                     except Exception:
                         jq = None
+                    # 兼顾打印：优先打印进程树内存，若回退则打印系统内存
+                    extra = ""
+                    if proc_gb is not None:
+                        extra += f" process_tree={proc_gb:.2f}GB"
+                    if sys_used_gb is not None and sys_total_gb is not None and sys_pct is not None:
+                        extra += f" system_used={sys_used_gb:.2f}/{sys_total_gb:.2f}GB ({sys_pct:.1f}%)"
                     print(
-                        f"\n[主进程]: [内存看门狗] 触发 @ {ts} used={used_gb:.2f}/{total_gb:.2f}GB ({pct:.1f}%) >= {mem_threshold_pct}% "
+                        f"\n[主进程]: [内存看门狗] 触发 @ {ts} reason={trigger_reason}{extra} "
                         f"run_event={run_on} qsize(task/results/rej)={tq}/{rq}/{jq}"
                     )
                 except Exception:

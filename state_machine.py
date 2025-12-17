@@ -29,6 +29,14 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     current_pane_folder = None   # 当前玻璃的存储文件夹
     pane_ng_frame_counter = 0    # 当前玻璃 NG 帧计数
     last_pane_data = {}
+
+    # 防止单片玻璃长期/高频 NG 导致缓存无限增长：限制每片玻璃在内存中保留的 NG 帧数量
+    try:
+        max_ng_frames_buffered_per_pane = int(getattr(shared_settings, 'max_ng_frames_buffered_per_pane', 200) or 200)
+        if max_ng_frames_buffered_per_pane < 1:
+            max_ng_frames_buffered_per_pane = 200
+    except Exception:
+        max_ng_frames_buffered_per_pane = 200
     
     with stats_lock:
         last_reset_date_str, total_yield, total_rejections = yield_manager.load_stats()
@@ -753,6 +761,27 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         current_pane_folder = os.path.join(date_dir, f"pane_{pane_start_ts.strftime('%H%M%S')}_{cid_int}")
                         os.makedirs(current_pane_folder, exist_ok=True)
                         pane_ng_frame_counter = 0
+                    # 先尽早将原始整帧(若存在)落盘并从内存中移除，避免单片玻璃缓存占用过大
+                    try:
+                        raw_buf = result.get('raw_image_buffer')
+                        if raw_buf:
+                            ts = float(result.get('timestamp', time.time()) or time.time())
+                            cam_idx = int(result.get('camera_index', -1) or -1)
+                            day_dir = time.strftime('%Y-%m-%d', time.localtime(ts))
+                            out_dir = os.path.join(STORAGE_PATH, day_dir, 'original')
+                            os.makedirs(out_dir, exist_ok=True)
+                            ms = int(ts * 1000)
+                            out_name = f"cam{cam_idx}_ts{ms}.jpg"
+                            with open(os.path.join(out_dir, out_name), 'wb') as f:
+                                f.write(raw_buf)
+                            # 释放内存：后续不再依赖 raw_image_buffer
+                            try:
+                                result['raw_image_buffer'] = None
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        print(f"[状态机]: NG帧原图落盘失败: {e}")
+
                     current_pane_ng_buffer.append(result)
                     frame_ts = datetime.now()
                     temp_rej_details = {
@@ -761,6 +790,21 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     }
                     rpt = build_report_for_frame(result, temp_rej_details)
                     current_pane_reports.append(rpt)
+
+                    # 缓存上限：超过上限时丢弃最早帧，避免内存持续增长
+                    try:
+                        while len(current_pane_ng_buffer) > max_ng_frames_buffered_per_pane:
+                            dropped = current_pane_ng_buffer.pop(0)
+                            try:
+                                if isinstance(dropped, dict):
+                                    dropped.pop('annotated_image_buffer', None)
+                                    dropped.pop('raw_image_buffer', None)
+                            except Exception:
+                                pass
+                            if len(current_pane_reports) > 0:
+                                current_pane_reports.pop(0)
+                    except Exception:
+                        pass
                     try:
                         cam_disp = int(result['camera_index']) + 1
                     except Exception:
@@ -782,7 +826,11 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     try:
                         cam_i = int(result['camera_index'])
                         auto_ng_cams.add(cam_i)
-                        last_result_by_cam[cam_i] = result
+                        # 自动分路仅需要缺陷/ROI信息，不应长期持有大图像buffer
+                        slim = dict(result)
+                        slim.pop('annotated_image_buffer', None)
+                        slim.pop('raw_image_buffer', None)
+                        last_result_by_cam[cam_i] = slim
                     except Exception:
                         pass
 
