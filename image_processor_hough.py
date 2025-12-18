@@ -1071,6 +1071,31 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
         a = angle_deg % 180.0
         return min(a, 180.0 - a) <= h_tol_deg
     lines_np = np.array(lines).reshape(-int(len(lines)), 4)
+
+    # ===== 早期两主体(cluster)估计：用于“竖直粗边二次合并”防止跨玻璃误合并 =====
+    # 规则：只看全部线段中点的 x 方向最大间隙，超过阈值则划分左右两组。
+    try:
+        cluster_gap_px_early = _px_dist_mm('GLASS_CLUSTER_GAP_MM', 'GLASS_CLUSTER_GAP_PX', 40.0)
+    except Exception:
+        cluster_gap_px_early = 0.0
+    x_thresh_early = None
+    if cluster_gap_px_early and float(cluster_gap_px_early) > 0 and len(lines_np) >= 4:
+        try:
+            mids_all = np.array([[(l[0] + l[2]) * 0.5, (l[1] + l[3]) * 0.5] for l in lines_np], dtype=float)
+            order = np.argsort(mids_all[:, 0])
+            vals = mids_all[order, 0]
+            gaps = np.diff(vals)
+            if gaps.size > 0:
+                k = int(np.argmax(gaps))
+                if float(gaps[k]) >= float(cluster_gap_px_early):
+                    x_thresh_early = 0.5 * (float(vals[k]) + float(vals[k + 1]))
+        except Exception:
+            x_thresh_early = None
+
+    def _early_cluster_id_from_x(x_mid: float) -> int:
+        if x_thresh_early is None:
+            return 0
+        return 0 if float(x_mid) <= float(x_thresh_early) else 1
     angles = np.rad2deg(np.arctan2(lines_np[:, 3] - lines_np[:, 1], lines_np[:, 2] - lines_np[:, 0]))
     angles[angles < 0] += 180
     angle_clusters = {}
@@ -1179,6 +1204,13 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
                     if used[j_gp]:
                         continue
                     xj, xj_mad, yj0, yj1 = _group_stats(proximity_groups[j_gp])
+                    # 多玻璃：只在同 cluster 内做竖直粗边合并（避免两片玻璃靠近时被合并成一条）
+                    try:
+                        if x_thresh_early is not None:
+                            if _early_cluster_id_from_x(xi) != _early_cluster_id_from_x(xj):
+                                continue
+                    except Exception:
+                        pass
                     # 动态允许的横向阈值：max(静态阈值, scale*(xi_mad+xj_mad))，并受上限cap约束
                     dyn_lat_allow = max(float(vertical_thick_merge_px), vertical_thick_merge_scale * (xi_mad + xj_mad))
                     if vertical_thick_merge_cap_px and vertical_thick_merge_cap_px > 0:
@@ -1335,6 +1367,119 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
         merged_lines_with_scores.append({'line': final_merged_line, 'score': support_score})
     # 先按支持度排序（强边在前）
     merged_lines_with_scores.sort(key=lambda item: item['score'], reverse=True)
+
+    # ===== 竖直线“跨角度簇”二次合并（兜底） =====
+    # 目的：当角度差很小（如 <5°）但被 angle_clusters 分裂时，仍能将同一条粗竖边合并成单条。
+    # 注意：仅对“近竖直”线生效，并且若检测到两片玻璃（x_thresh_early 有效）则只在同 cluster 内合并。
+    try:
+        vertical_across_angle_merge = bool(params.get('LINE_MERGING', {}).get('VERTICAL_ACROSS_ANGLE_MERGE_ENABLE', True))
+    except Exception:
+        vertical_across_angle_merge = True
+    if vertical_across_angle_merge and merged_lines_with_scores and vertical_thick_merge_px and float(vertical_thick_merge_px) > 0:
+        try:
+            try:
+                v_merge_min_overlap_ratio = float(params.get('LINE_MERGING', {}).get('VERTICAL_THICK_MIN_OVERLAP_RATIO', 0.2))
+            except Exception:
+                v_merge_min_overlap_ratio = 0.2
+
+            def _seg_x_center(seg):
+                return 0.5 * (float(seg[0]) + float(seg[2]))
+
+            def _seg_y_span(seg):
+                y1 = float(seg[1]); y2 = float(seg[3])
+                return (min(y1, y2), max(y1, y2))
+
+            vertical_items = []
+            other_items = []
+            for it in merged_lines_with_scores:
+                seg = it['line']
+                sc = float(it.get('score', 0.0) or 0.0)
+                if _is_near_vertical(_angle_deg(seg)):
+                    vertical_items.append({'line': seg, 'score': sc})
+                else:
+                    other_items.append(it)
+
+            # 按 (cluster_id, x_center) 排序后做扫描合并
+            vertical_items.sort(key=lambda it: (_early_cluster_id_from_x(_seg_x_center(it['line'])), _seg_x_center(it['line'])))
+            merged_vertical = []
+            cur = None  # {'cluster': int, 'lines': [seg...], 'scores':[...], 'x_rep': float, 'y0': float, 'y1': float}
+
+            def _finalize_group(g):
+                if not g or not g.get('lines'):
+                    return None
+                # x 取加权平均，y 取全范围
+                w = float(sum(g['scores'])) if g['scores'] else 0.0
+                if w <= 1e-6:
+                    # 回退：取中位 x
+                    xs = [float(_seg_x_center(s)) for s in g['lines']]
+                    x_new = float(np.median(xs)) if xs else float(g.get('x_rep', 0.0))
+                else:
+                    x_new = float(sum(float(_seg_x_center(s)) * float(sc) for s, sc in zip(g['lines'], g['scores'])) / w)
+                y_min = float(min(_seg_y_span(s)[0] for s in g['lines']))
+                y_max = float(max(_seg_y_span(s)[1] for s in g['lines']))
+                sc_sum = float(sum(g['scores']))
+                return {'line': np.array([x_new, y_min, x_new, y_max], dtype=float), 'score': sc_sum}
+
+            def _overlap_ratio(a0, a1, b0, b1):
+                overlap = max(0.0, min(a1, b1) - max(a0, b0))
+                span = max(1.0, max(a1, b1) - min(a0, b0))
+                return float(overlap / span)
+
+            for it in vertical_items:
+                seg = it['line']
+                sc = float(it.get('score', 0.0) or 0.0)
+                x_c = float(_seg_x_center(seg))
+                y0, y1 = _seg_y_span(seg)
+                cid = int(_early_cluster_id_from_x(x_c))
+
+                if cur is None:
+                    cur = {'cluster': cid, 'lines': [seg], 'scores': [sc], 'x_rep': x_c, 'y0': y0, 'y1': y1}
+                    continue
+
+                # 不跨 cluster 合并
+                if int(cur.get('cluster', 0)) != cid:
+                    out = _finalize_group(cur)
+                    if out is not None:
+                        merged_vertical.append(out)
+                    cur = {'cluster': cid, 'lines': [seg], 'scores': [sc], 'x_rep': x_c, 'y0': y0, 'y1': y1}
+                    continue
+
+                # 动态横向合并阈值（复用 vertical_thick_merge_px / cap / scale 的思想，但用当前组内“厚度”近似）
+                try:
+                    xs_group = np.array([float(_seg_x_center(s)) for s in cur['lines']], dtype=float)
+                    x_mad = float(np.median(np.abs(xs_group - float(np.median(xs_group))))) * 2.0
+                except Exception:
+                    x_mad = 0.0
+                dyn_lat_allow = max(float(vertical_thick_merge_px), float(vertical_thick_merge_scale) * (float(x_mad) + 0.0))
+                if vertical_thick_merge_cap_px and float(vertical_thick_merge_cap_px) > 0:
+                    dyn_lat_allow = min(dyn_lat_allow, float(vertical_thick_merge_cap_px))
+
+                if abs(x_c - float(cur.get('x_rep', x_c))) <= float(dyn_lat_allow):
+                    # 需要足够 y 重叠，避免把同一竖边的“远离段”误并
+                    if _overlap_ratio(float(cur.get('y0', y0)), float(cur.get('y1', y1)), y0, y1) >= float(v_merge_min_overlap_ratio):
+                        cur['lines'].append(seg)
+                        cur['scores'].append(sc)
+                        # 更新代表统计
+                        cur['x_rep'] = float(np.median([float(_seg_x_center(s)) for s in cur['lines']]))
+                        cur['y0'] = float(min(float(cur.get('y0', y0)), y0))
+                        cur['y1'] = float(max(float(cur.get('y1', y1)), y1))
+                        continue
+
+                # 不能并入当前组：落地当前组，开启新组
+                out = _finalize_group(cur)
+                if out is not None:
+                    merged_vertical.append(out)
+                cur = {'cluster': cid, 'lines': [seg], 'scores': [sc], 'x_rep': x_c, 'y0': y0, 'y1': y1}
+
+            if cur is not None:
+                out = _finalize_group(cur)
+                if out is not None:
+                    merged_vertical.append(out)
+
+            merged_lines_with_scores = list(other_items) + list(merged_vertical)
+            merged_lines_with_scores.sort(key=lambda item: float(item.get('score', 0.0) or 0.0), reverse=True)
+        except Exception:
+            pass
 
     # 改进：取消原有“竖直与水平线段相交距离过滤”逻辑，仅对完全重合/重复的线段进行去重，保留几何直觉交叉
     # 新增参数：LINE_MERGING.DUPLICATE_MERGE_MAX_OFFSET_PX（默认 2.0）控制重合判定的平移容差
@@ -1504,12 +1649,113 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
             if candidate is not None:
                 # 替换 edges 中末尾（最弱）一条
                 edges[-1] = candidate
+
+    # 多玻璃/多主体：每个 cluster 至少保留一条近竖直主边（可配置，默认关闭以避免影响单玻璃场景）
+    try:
+        ensure_vertical_per_cluster = bool(params.get('LINE_MERGING', {}).get('ENSURE_VERTICAL_PER_CLUSTER', False))
+    except Exception:
+        ensure_vertical_per_cluster = False
+
+    if ensure_vertical_per_cluster and len(filtered) > 0 and len(edges) > 0:
+        try:
+            try:
+                v_tol = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+            except Exception:
+                v_tol = 10.0
+
+            def _a_deg_local(seg):
+                x1, y1, x2, y2 = map(float, seg)
+                ang = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+                if ang > 90.0:
+                    ang = 180.0 - ang
+                return ang
+
+            def _is_vertical_local(seg):
+                return _a_deg_local(seg) >= (90.0 - v_tol)
+
+            # 用 filtered（候选全集）来估计左右两片玻璃的分割阈值（只看 x 维度）
+            cluster_gap_px = _get_dist_px(params.get('LINE_MERGING', {}), 'GLASS_CLUSTER_GAP_MM', 'GLASS_CLUSTER_GAP_PX', 40.0, pixels_per_mm, default_px=0.0)
+            # 仅当候选足够多且 gap 阈值有效时才启用
+            if cluster_gap_px and float(cluster_gap_px) > 0 and len(filtered) >= 4:
+                mids_all = np.array([
+                    [0.5 * (float(it['line'][0]) + float(it['line'][2])), 0.5 * (float(it['line'][1]) + float(it['line'][3]))]
+                    for it in filtered
+                ], dtype=float)
+                order = np.argsort(mids_all[:, 0])
+                vals = mids_all[order, 0]
+                gaps = np.diff(vals)
+                if gaps.size > 0:
+                    k = int(np.argmax(gaps))
+                    if float(gaps[k]) >= float(cluster_gap_px):
+                        x_thresh = 0.5 * (float(vals[k]) + float(vals[k + 1]))
+
+                        def _cluster_id_from_seg(seg):
+                            mx = 0.5 * (float(seg[0]) + float(seg[2]))
+                            return 0 if mx <= x_thresh else 1
+
+                        # 统计当前 edges 在两个 cluster 内是否已有竖直主边
+                        edges_cluster = [_cluster_id_from_seg(e) for e in edges]
+                        has_v = {0: False, 1: False}
+                        for e, cid in zip(edges, edges_cluster):
+                            if _is_vertical_local(e):
+                                has_v[int(cid)] = True
+
+                        # 在 filtered 中找每个 cluster 的最强竖直候选
+                        existing_set = {tuple(map(float, e)) for e in edges}
+                        best_v = {0: None, 1: None}  # (score, seg)
+                        for it in filtered:
+                            seg = it['line']
+                            if not _is_vertical_local(seg):
+                                continue
+                            cid = int(_cluster_id_from_seg(seg))
+                            tseg = tuple(map(float, seg))
+                            if tseg in existing_set:
+                                continue
+                            sc = float(it.get('score', 0.0) or 0.0)
+                            cur = best_v.get(cid)
+                            if cur is None or sc > cur[0]:
+                                best_v[cid] = (sc, seg)
+
+                        # 用“替换最弱”策略插入，避免改变 edges 数量
+                        def _replace_weakest_for_cluster(target_cid: int, seg_new):
+                            # 优先替换同 cluster 内最弱的非竖直边；若不存在则替换同 cluster 内最弱边；再不行替换全局最弱边
+                            scores_in_edges = []
+                            for idx_e, e in enumerate(edges):
+                                # 从 filtered 里找近似匹配的 score（回退为长度）
+                                t = tuple(map(float, e))
+                                sc = None
+                                for it0 in filtered:
+                                    if tuple(map(float, it0['line'])) == t:
+                                        sc = float(it0.get('score', 0.0) or 0.0)
+                                        break
+                                if sc is None:
+                                    sc = float(np.hypot(float(e[2]) - float(e[0]), float(e[3]) - float(e[1])))
+                                scores_in_edges.append(sc)
+
+                            cand_idxs = [i for i, cid in enumerate(edges_cluster) if int(cid) == int(target_cid) and not _is_vertical_local(edges[i])]
+                            if not cand_idxs:
+                                cand_idxs = [i for i, cid in enumerate(edges_cluster) if int(cid) == int(target_cid)]
+                            if not cand_idxs:
+                                cand_idxs = list(range(len(edges)))
+                            idx_min = min(cand_idxs, key=lambda i: scores_in_edges[i])
+                            edges[idx_min] = seg_new
+
+                        for cid in (0, 1):
+                            if not has_v.get(cid, False) and best_v.get(cid) is not None:
+                                _replace_weakest_for_cluster(cid, best_v[cid][1])
+        except Exception:
+            pass
     m = len(edges)
     if m <= 1:
         return edges
 
     # 用于后续“交点裁剪”步骤的辅助：短延长容差与垂距/参数计算
     extend_margin_px_default = _mm_to_px(5.0, pixels_per_mm)
+    try:
+        ortho_extend_mm = float(params.get('LINE_MERGING', {}).get('INTERSECTION_ORTHO_EXTEND_MM', 30.0))
+    except Exception:
+        ortho_extend_mm = 30.0
+    extend_margin_px_ortho = _mm_to_px(ortho_extend_mm, pixels_per_mm)
     def _t_param_and_perp_dist(pt, a, b):
         v = b - a
         denom = float(np.dot(v, v))
@@ -1519,39 +1765,86 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
         proj = a + t * v
         return t, float(np.linalg.norm(pt - proj)), float(np.linalg.norm(v))
 
-    best_intersection = [None] * m  # (inter_pt, t_i, d_perp_i, len_i)
-    # 复用上面定义的 _t_param_and_perp_dist 与 extend 容差
-    def _inter_score(t: float):
-        # 优先选择落在段内的交点；若不在段内，选择距离[0,1]最近者
-        if 0.0 <= t <= 1.0:
-            return (0, 0.0)
-        # 距离[0,1]的外侧距离
-        return (1, min(abs(t - 0.0), abs(t - 1.0)))
+    # 每条线最多保留两个“端点交点”（靠近 t≈0 与 t≈1），用于将线段两端都裁剪到可靠交点。
+    # 这能避免多玻璃场景里：水平线/竖直线只被裁剪到一端，导致应相交的 L? 发生混叠。
+    best_intersection_0 = [None] * m  # (inter_pt, t_i, d_perp_i, len_i)
+    best_intersection_1 = [None] * m  # (inter_pt, t_i, d_perp_i, len_i)
 
-    # 简易两主体聚类：以边中点为依据，在 x 或 y 维度上寻找最大间隙；若大于阈值则分两组
+    def _inter_score_end(t: float, end: float):
+        # end 为 0.0 或 1.0：优先选择落在段内的交点；然后比较离目标端点的距离
+        inside = (0.0 <= t <= 1.0)
+        return (0 if inside else 1, abs(t - end))
+
+    # 多玻璃聚类：优先用“近竖直边”的 x 中点寻找最大间隙，得到 x_thresh。
+    # 同时引入 seam(-1) 标签：靠近 x_thresh 的竖直边（两片玻璃的公共分界）允许与两侧相交，避免被跨 cluster 规则阻断。
     cluster_gap_px = _px_dist_mm('GLASS_CLUSTER_GAP_MM', 'GLASS_CLUSTER_GAP_PX', 40.0, default_px=0.0)
-    mids = np.array([[(e[0]+e[2])/2.0, (e[1]+e[3])/2.0] for e in edges], dtype=float)
     labels = np.zeros((m,), dtype=int)
+    x_thresh = None
+    try:
+        v_tol = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+    except Exception:
+        v_tol = 10.0
+
+    def _ang_abs(seg):
+        x1, y1, x2, y2 = map(float, seg)
+        a = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+        if a > 90.0:
+            a = 180.0 - a
+        return a
+
+    def _is_vert(seg):
+        return _ang_abs(seg) >= (90.0 - float(v_tol))
+
     if m >= 4 and cluster_gap_px and cluster_gap_px > 0:
-        for dim in [0,1]:
-            order = np.argsort(mids[:,dim])
+        try:
+            vert_idx = [i for i, e in enumerate(edges) if _is_vert(e)]
+            if len(vert_idx) >= 2:
+                xs = np.array([0.5 * (float(edges[i][0]) + float(edges[i][2])) for i in vert_idx], dtype=float)
+                order = np.argsort(xs)
+                xs_sorted = xs[order]
+                gaps = np.diff(xs_sorted)
+                if gaps.size > 0 and float(np.max(gaps)) >= float(cluster_gap_px):
+                    k = int(np.argmax(gaps))
+                    x_thresh = 0.5 * (float(xs_sorted[k]) + float(xs_sorted[k + 1]))
+        except Exception:
+            x_thresh = None
+
+    # 若无法从竖直边可靠得到阈值，则回退到原来的“X/Y 最大间隙”策略
+    if x_thresh is None and m >= 4 and cluster_gap_px and cluster_gap_px > 0:
+        mids = np.array([[(e[0]+e[2])/2.0, (e[1]+e[3])/2.0] for e in edges], dtype=float)
+        for dim in [0, 1]:
+            order = np.argsort(mids[:, dim])
             vals = mids[order, dim]
             gaps = np.diff(vals)
             if gaps.size > 0:
                 k = int(np.argmax(gaps))
                 if gaps[k] >= float(cluster_gap_px):
-                    # 分割点在 k 与 k+1 之间
+                    x_thresh = 0.5 * (float(vals[k]) + float(vals[k + 1])) if dim == 0 else None
                     labels[order[:k+1]] = 0
                     labels[order[k+1:]] = 1
                     break
+
+    if x_thresh is not None:
+        seam_margin_px = max(float(extend_margin_px_default), 0.15 * float(cluster_gap_px))
+        for i, e in enumerate(edges):
+            mx = 0.5 * (float(e[0]) + float(e[2]))
+            # 靠近阈值的竖直边视为 seam：允许与两侧相交，减少“应该相交却被阻断”的混叠
+            if _is_vert(e) and abs(mx - float(x_thresh)) <= float(seam_margin_px):
+                labels[i] = -1
+            else:
+                labels[i] = 0 if mx <= float(x_thresh) else 1
+
+    def _cluster_compatible(i: int, j: int) -> bool:
+        # label=-1 代表 seam（共享边），允许与两侧相交
+        return (labels[i] == labels[j]) or (labels[i] == -1) or (labels[j] == -1)
 
     for i in range(m):
         li = edges[i]
         ai = np.array(li[:2], dtype=float); bi = np.array(li[2:], dtype=float)
         for j in range(i + 1, m):
             lj = edges[j]
-            # 禁止跨主体（两组）求交，避免第一片水平与第二片竖直相交
-            if labels[i] != labels[j]:
+            # 多主体：默认不跨组求交；但允许 seam(-1) 与两侧相交
+            if not _cluster_compatible(i, j):
                 continue
             aj = np.array(lj[:2], dtype=float); bj = np.array(lj[2:], dtype=float)
 
@@ -1581,31 +1874,50 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
             if diff_deg >= ortho_accept_deg:
                 # 近似竖直×水平：视为有交，不要求近线距离
                 near_line = True
+                # 同时放宽“段外延长”容差：竖边较短时允许延长到与水平边的交点
+                ext_tol_i = max(ext_tol_i, float(extend_margin_px_ortho) / len_i)
+                ext_tol_j = max(ext_tol_j, float(extend_margin_px_ortho) / len_j)
             within_i = (-ext_tol_i <= t_i <= 1.0 + ext_tol_i)
             within_j = (-ext_tol_j <= t_j <= 1.0 + ext_tol_j)
             if near_line and within_i and within_j:
-                score_i = _inter_score(t_i)
-                prev_i = best_intersection[i]
-                if (prev_i is None) or (score_i < _inter_score(prev_i[1])):
-                    best_intersection[i] = (inter.astype(float), t_i, d_perp_i, len_i)
-                score_j = _inter_score(t_j)
-                prev_j = best_intersection[j]
-                if (prev_j is None) or (score_j < _inter_score(prev_j[1])):
-                    best_intersection[j] = (inter.astype(float), t_j, d_perp_j, len_j)
+                # 端点 0
+                if t_i <= 0.5:
+                    prev_i0 = best_intersection_0[i]
+                    if (prev_i0 is None) or (_inter_score_end(t_i, 0.0) < _inter_score_end(prev_i0[1], 0.0)):
+                        best_intersection_0[i] = (inter.astype(float), t_i, d_perp_i, len_i)
+                else:
+                    prev_i1 = best_intersection_1[i]
+                    if (prev_i1 is None) or (_inter_score_end(t_i, 1.0) < _inter_score_end(prev_i1[1], 1.0)):
+                        best_intersection_1[i] = (inter.astype(float), t_i, d_perp_i, len_i)
+
+                if t_j <= 0.5:
+                    prev_j0 = best_intersection_0[j]
+                    if (prev_j0 is None) or (_inter_score_end(t_j, 0.0) < _inter_score_end(prev_j0[1], 0.0)):
+                        best_intersection_0[j] = (inter.astype(float), t_j, d_perp_j, len_j)
+                else:
+                    prev_j1 = best_intersection_1[j]
+                    if (prev_j1 is None) or (_inter_score_end(t_j, 1.0) < _inter_score_end(prev_j1[1], 1.0)):
+                        best_intersection_1[j] = (inter.astype(float), t_j, d_perp_j, len_j)
 
     adjusted_edges = []
     for idx, seg in enumerate(edges):
-        bi = best_intersection[idx]
-        if bi is None:
+        bi0 = best_intersection_0[idx]
+        bi1 = best_intersection_1[idx]
+        if bi0 is None and bi1 is None:
             adjusted_edges.append(seg)
             continue
-        inter_pt = bi[0]
-        p1 = np.array(seg[:2], dtype=float); p2 = np.array(seg[2:], dtype=float)
-        # 选择“交点到原始段最远端点”的新线段
-        d1 = float(np.linalg.norm(inter_pt - p1))
-        d2 = float(np.linalg.norm(inter_pt - p2))
-        far = p1 if d1 >= d2 else p2
-        adjusted_edges.append(np.array([inter_pt[0], inter_pt[1], far[0], far[1]], dtype=float))
+        p1 = np.array(seg[:2], dtype=float)
+        p2 = np.array(seg[2:], dtype=float)
+        # 有交点则分别裁剪两端（t≈0 对应 p1, t≈1 对应 p2）
+        if bi0 is not None:
+            p1 = bi0[0]
+        if bi1 is not None:
+            p2 = bi1[0]
+        # 防止退化
+        if float(np.hypot(p2[0] - p1[0], p2[1] - p1[1])) < 1.0:
+            adjusted_edges.append(seg)
+        else:
+            adjusted_edges.append(np.array([p1[0], p1[1], p2[0], p2[1]], dtype=float))
 
     return adjusted_edges
 
@@ -3981,7 +4293,29 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     hough_edges = preprocess_for_hough_enhanced(roi_gray, params)
     binary_edges = preprocess_for_defect_edges(roi_gray, params)
     # 保证传入 HoughLinesP 的参数为整数类型（OpenCV 要求 threshold 为 int，其他也用 int 更稳妥）
-    min_len_pixels = roi_gray.shape[1] * p_hough.get("MIN_LINE_LENGTH_RATIO", 0.05)
+    # Hough 最小线段长度：默认按 ROI 宽度比例（历史行为）。
+    # 多玻璃/横向长条 ROI 中竖边往往“受高度限制”，可改为 height/min_dim 来避免竖边被过滤。
+    try:
+        min_len_ratio = float(p_hough.get("MIN_LINE_LENGTH_RATIO", 0.05))
+    except Exception:
+        min_len_ratio = 0.05
+    try:
+        min_len_mode = str(p_hough.get("MIN_LINE_LENGTH_MODE", "width")).lower()
+    except Exception:
+        min_len_mode = "width"
+    try:
+        roi_h_loc, roi_w_loc = roi_gray.shape[:2]
+        if min_len_mode in ("height", "h"):
+            min_len_base = float(roi_h_loc)
+        elif min_len_mode in ("min", "min_dim", "mindim"):
+            min_len_base = float(min(roi_w_loc, roi_h_loc))
+        elif min_len_mode in ("diag", "diagonal"):
+            min_len_base = float(np.hypot(float(roi_w_loc), float(roi_h_loc)))
+        else:
+            min_len_base = float(roi_w_loc)
+    except Exception:
+        min_len_base = float(roi_gray.shape[1])
+    min_len_pixels = float(min_len_base) * float(min_len_ratio)
     try:
         min_len_pixels_i = int(max(1, round(float(min_len_pixels))))
     except Exception:
@@ -4091,7 +4425,48 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     except Exception:
                         continue
                 if appended:
-                    # 简单去重：若与现有主边距离很近则跳过
+                    # 优先使用跨 ROI 共享竖直边：若存在共享竖直边，则用其替换/吸收附近的本 ROI 竖线（避免同一位置多条竖线杂乱）
+                    try:
+                        prefer_global = bool(params.get('DEFECT_DETECTION', {}).get('CROSS_ROI_VERTICAL_PREFER_GLOBAL', True))
+                    except Exception:
+                        prefer_global = True
+                    try:
+                        replace_max_dist_px = float(_get_dist_px(params.get('DEFECT_DETECTION', {}), 'CROSS_ROI_VERTICAL_REPLACE_MAX_DIST_MM', 'CROSS_ROI_VERTICAL_REPLACE_MAX_DIST_PX', 10.0, pixels_per_mm, default_px=12.0))
+                    except Exception:
+                        replace_max_dist_px = 12.0
+                    try:
+                        min_y_overlap_ratio = float(params.get('DEFECT_DETECTION', {}).get('CROSS_ROI_VERTICAL_REPLACE_MIN_Y_OVERLAP_RATIO', 0.15))
+                    except Exception:
+                        min_y_overlap_ratio = 0.15
+
+                    def _seg_ang_deg(seg):
+                        x1, y1, x2, y2 = map(float, seg)
+                        dx = x2 - x1
+                        dy = y2 - y1
+                        ang = abs(np.degrees(np.arctan2(dy, dx)))
+                        if ang > 90.0:
+                            ang = 180.0 - ang
+                        return ang
+
+                    def _is_near_vertical_local(seg, tol_deg: float):
+                        try:
+                            return _seg_ang_deg(seg) >= (90.0 - float(tol_deg))
+                        except Exception:
+                            return False
+
+                    def _x_center(seg):
+                        return 0.5 * (float(seg[0]) + float(seg[2]))
+
+                    def _y_span(seg):
+                        y1 = float(seg[1]); y2 = float(seg[3])
+                        return (min(y1, y2), max(y1, y2))
+
+                    def _y_overlap_ratio(a0, a1, b0, b1):
+                        overlap = max(0.0, min(a1, b1) - max(a0, b0))
+                        span = max(1.0, max(a1, b1) - min(a0, b0))
+                        return float(overlap / span)
+
+                    # 简单去重：若与现有主边距离很近则跳过（perp dist 기준）
                     def _seg_perp_dist(a, b, c, d):
                         A = np.array([a, b], dtype=float); B = np.array([c, d], dtype=float)
                         v = B - A
@@ -4112,12 +4487,65 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             if dperp < best:
                                 best = dperp
                         return best
+
+                    # 先把 appended 自身按 x 聚合去重（避免同一条共享竖直线多次裁剪结果略有差异）
+                    appended.sort(key=lambda s: _x_center(s))
+                    appended_uniq = []
                     for cseg in appended:
+                        if not appended_uniq:
+                            appended_uniq.append(cseg)
+                            continue
+                        if abs(_x_center(cseg) - _x_center(appended_uniq[-1])) <= 1.0:
+                            # 合并 y 范围
+                            y0a, y1a = _y_span(appended_uniq[-1])
+                            y0b, y1b = _y_span(cseg)
+                            xc = _x_center(appended_uniq[-1])
+                            appended_uniq[-1] = np.array([xc, min(y0a, y0b), xc, max(y1a, y1b)], dtype=float)
+                        else:
+                            appended_uniq.append(cseg)
+
+                    appended_to_add = []
+                    for cseg in appended_uniq:
                         try:
                             d0 = _seg_perp_dist(cseg[0], cseg[1], cseg[2], cseg[3])
                         except Exception:
                             d0 = 1e9
-                        if d0 > 2.0:
+                        # 去重阈值放宽一点（原来 2px 太苛刻，容易导致“看起来同一条线”也不替换）
+                        if d0 > 3.0:
+                            appended_to_add.append(cseg)
+
+                    if appended_to_add:
+                        if prefer_global and main_edges:
+                            try:
+                                tol_v_pref = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
+                            except Exception:
+                                tol_v_pref = 10.0
+                            # 删除：与任一共享竖直边在 x 上接近、且 y 投影重叠足够的“近竖直”线段
+                            filtered_edges = []
+                            for e in main_edges:
+                                try:
+                                    if not _is_near_vertical_local(e, tol_v_pref):
+                                        filtered_edges.append(e)
+                                        continue
+                                    xe = _x_center(e)
+                                    y0e, y1e = _y_span(e)
+                                    drop = False
+                                    for cseg in appended_to_add:
+                                        xc = _x_center(cseg)
+                                        if abs(xe - xc) > float(replace_max_dist_px):
+                                            continue
+                                        y0c, y1c = _y_span(cseg)
+                                        if _y_overlap_ratio(y0e, y1e, y0c, y1c) >= float(min_y_overlap_ratio):
+                                            drop = True
+                                            break
+                                    if not drop:
+                                        filtered_edges.append(e)
+                                except Exception:
+                                    filtered_edges.append(e)
+                            main_edges = filtered_edges
+
+                        # 始终把共享竖直边加入 main_edges（在 prefer_global 时它将成为唯一的竖直代表）
+                        for cseg in appended_to_add:
                             main_edges.append(cseg)
         except Exception:
             pass
@@ -4733,7 +5161,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     if draw_e_suppress_band:
         try:
             p_def = params.get('DEFECT_DETECTION', {}) or {}
-            suppress_w = int(p_def.get('E_LINE_SUPPRESS_WIDTH_PX', 18) or 0)
+            suppress_w = int(p_def.get('E_LINE_SUPPRESS_WIDTH_PX', 8) or 0)
             suppress_w = max(1, min(512, suppress_w))
             try:
                 vertical_tol_deg_vis = float(p_def.get('VERTICAL_ANGLE_TOL_DEG', 10.0))
@@ -4791,39 +5219,39 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     alpha = p_vis["DEFECT_OVERLAY_ALPHA"]; beta = 1 - alpha
     
     # 绘制主边直线、角点（移除调试打印）
-    # annotations_to_draw = []
-    # try:
-    #    for i, seg in enumerate(edges_for_drawing or []):
-    #        x1,y1,x2,y2 = map(float, seg)
-    #        dx, dy = (x2-x1), (y2-y1)
-    #        ang = abs(np.degrees(np.arctan2(dy, dx)))
-    #        if ang > 90.0: ang = 180.0 - ang
-    #        length_px = float(np.hypot(dx, dy))
-    #        length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
+    annotations_to_draw = []
+    try:
+       for i, seg in enumerate(edges_for_drawing or []):
+           x1,y1,x2,y2 = map(float, seg)
+           dx, dy = (x2-x1), (y2-y1)
+           ang = abs(np.degrees(np.arctan2(dy, dx)))
+           if ang > 90.0: ang = 180.0 - ang
+           length_px = float(np.hypot(dx, dy))
+           length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
 
-    #        color = (200,200,200)
-    #        if ang >= 80.0:
-    #            color = (0,255,0)
-    #        elif ang <= 10.0:
-    #            color = (255,0,0)
-    #        cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
+           color = (200,200,200)
+           if ang >= 80.0:
+               color = (0,255,0)
+           elif ang <= 10.0:
+               color = (255,0,0)
+           cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
 
-    #        mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
-    #        try:
-    #            cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-    #        except Exception:
-    #            pass
+           mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
+           try:
+               cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+           except Exception:
+               pass
 
-    #    for (ii, jj, cp_arr) in (paired_corners or []):
-    #       try:
-    #           cx, cy = float(cp_arr[0]), float(cp_arr[1])
-    #           cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
-    #           cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
-    #       except Exception:
-    #           continue
+       for (ii, jj, cp_arr) in (paired_corners or []):
+          try:
+              cx, cy = float(cp_arr[0]), float(cp_arr[1])
+              cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
+              cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
+          except Exception:
+              continue
 
-    # except Exception:
-    #    pass
+    except Exception:
+       pass
     
     annotations_to_draw = []
 
@@ -5243,7 +5671,7 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
     # - 在 ROI 内用黄色半透明叠加显示 Canny 边缘
     # - 默认开启；不需要时可把 DEBUG_DRAW_ROI_AND_CANNY 改为 False 或直接注释整段
     try:
-        DEBUG_DRAW_ROI_AND_CANNY = False
+        DEBUG_DRAW_ROI_AND_CANNY = True
         if DEBUG_DRAW_ROI_AND_CANNY and template_rois:
             def _parse_roi_for_debug(rt):
                 if isinstance(rt, (list, tuple)) and len(rt) >= 4:
