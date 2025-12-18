@@ -840,11 +840,11 @@ def main():
         except Exception:
             return None
 
-    # 进程树内存阈值：达到该值即重启子进程（默认 9GB，满足“main.exe 总内存占用达到9G就重启”）
+    # 进程树内存阈值：达到该值即重启子进程（默认 8GB，满足“main.exe 总内存占用达到9G就重启”）
     try:
-        mem_restart_threshold_gb = float(system_params.get('memory_restart_threshold_gb', 9.0) or 9.0)
+        mem_restart_threshold_gb = float(system_params.get('memory_restart_threshold_gb', 8.0) or 8.0)
     except Exception:
-        mem_restart_threshold_gb = 9.0
+        mem_restart_threshold_gb = 8.0
 
     # 兼容旧配置：系统内存百分比阈值（仅作为无法获取进程占用时的最后回退）
     try:

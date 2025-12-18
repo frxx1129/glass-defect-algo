@@ -5220,40 +5220,40 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     # 绘制主边直线、角点（移除调试打印）
     annotations_to_draw = []
-    try:
-       for i, seg in enumerate(edges_for_drawing or []):
-           x1,y1,x2,y2 = map(float, seg)
-           dx, dy = (x2-x1), (y2-y1)
-           ang = abs(np.degrees(np.arctan2(dy, dx)))
-           if ang > 90.0: ang = 180.0 - ang
-           length_px = float(np.hypot(dx, dy))
-           length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
+    # try:
+    #    for i, seg in enumerate(edges_for_drawing or []):
+    #        x1,y1,x2,y2 = map(float, seg)
+    #        dx, dy = (x2-x1), (y2-y1)
+    #        ang = abs(np.degrees(np.arctan2(dy, dx)))
+    #        if ang > 90.0: ang = 180.0 - ang
+    #        length_px = float(np.hypot(dx, dy))
+    #        length_mm = (length_px / float(pixels_per_mm)) if pixels_per_mm else 0.0
 
-           color = (200,200,200)
-           if ang >= 80.0:
-               color = (0,255,0)
-           elif ang <= 10.0:
-               color = (255,0,0)
-           cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
+    #        color = (200,200,200)
+    #        if ang >= 80.0:
+    #            color = (0,255,0)
+    #        elif ang <= 10.0:
+    #            color = (255,0,0)
+    #        cv2.line(roi_color, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), color, 1)
 
-           mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
-           try:
-               cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-           except Exception:
-               pass
+    #        mx, my = int(round((x1+x2)/2.0)), int(round((y1+y2)/2.0))
+    #        try:
+    #            cv2.putText(roi_color, f"L{i}", (mx+3, my-3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    #        except Exception:
+    #            pass
 
-       for (ii, jj, cp_arr) in (paired_corners or []):
-          try:
-              cx, cy = float(cp_arr[0]), float(cp_arr[1])
-              cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
-              cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
-          except Exception:
-              continue
+    #    for (ii, jj, cp_arr) in (paired_corners or []):
+    #       try:
+    #           cx, cy = float(cp_arr[0]), float(cp_arr[1])
+    #           cv2.circle(roi_color, (int(round(cx)), int(round(cy))), 5, (255,0,255), -1)
+    #           cv2.putText(roi_color, f"C({ii},{jj})", (int(round(cx))+4, int(round(cy))-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,255), 1, cv2.LINE_AA)
+    #       except Exception:
+    #           continue
 
-    except Exception:
-       pass
+    # except Exception:
+    #    pass
     
-    annotations_to_draw = []
+    # annotations_to_draw = []
 
     for defect_report in final_defects_for_report:
         defect = defect_report['raw_defect']
@@ -5671,7 +5671,7 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
     # - 在 ROI 内用黄色半透明叠加显示 Canny 边缘
     # - 默认开启；不需要时可把 DEBUG_DRAW_ROI_AND_CANNY 改为 False 或直接注释整段
     try:
-        DEBUG_DRAW_ROI_AND_CANNY = True
+        DEBUG_DRAW_ROI_AND_CANNY = False
         if DEBUG_DRAW_ROI_AND_CANNY and template_rois:
             def _parse_roi_for_debug(rt):
                 if isinstance(rt, (list, tuple)) and len(rt) >= 4:
