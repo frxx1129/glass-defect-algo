@@ -244,34 +244,134 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         return 0
 
     def _estimate_piece_count(cam_vertical_counts: dict, expected_cams: int) -> int:
-        """依据全相机竖直边总量估计玻璃片数，并优先参考中间相机的分割线。"""
-        try:
-            total_edges = int(sum(max(0, int(cnt or 0)) for cnt in cam_vertical_counts.values()))
-        except Exception:
-            total_edges = 0
-        if total_edges <= 0:
-            return 1
-        try:
-            rough = int(round(total_edges / 2.0))
-        except Exception:
-            rough = 1
-        rough = max(1, min(4, rough if rough >= 1 else 1))
+        """
+        依据中间相机的竖直线数量来推断玻璃切片数。
+        
+        核心原理：
+        - 边缘相机（第一个和最后一个）看到的是玻璃的外边缘（与切片数无关）
+        - 中间相机正常情况下看不到竖直边（玻璃是连续的）
+        - 只有在有切割线时，中间相机才会看到竖直线：
+          · 切2片（1刀）: 中间相机看到 2 条竖直线（切割处的左右两边）
+          · 切3片（2刀）: 中间相机看到 4 条竖直线
+          · 切4片（3刀）: 中间相机看到 6 条竖直线
+        
+        公式：切片数 = (中间相机竖直线总数 / 2) + 1
+        
+        约束：
+        - 排除边缘相机的竖直线（它们只是玻璃外边缘，不反映切割）
+        - 若无证据，默认为1片
+        
+        相机配置：
+        - Line2/Line3: 5台相机 (index 0,1,2,3,4)，边缘相机为 0 和 4
+        - Line1: 4台相机 (index 0,1,2,3)，边缘相机为 0 和 3
+        """
         try:
             n = int(expected_cams or 0)
-            center = (n - 1) / 2.0 if n > 0 else 0.0
-            center_edges = 0
-            for ci, cnt in cam_vertical_counts.items():
+            if n <= 0:
+                return 1
+            
+            # 定义边缘相机索引
+            first_cam = 0
+            last_cam = max(0, n - 1)
+            
+            # 统计中间相机的竖直线总数
+            middle_cam_lines = 0
+            middle_cams_with_lines = 0  # 有竖直线的中间相机数量
+            
+            for ci_str, cnt in cam_vertical_counts.items():
                 try:
-                    if abs(float(ci) - center) <= 1.0:
-                        center_edges += max(0, int(cnt or 0))
+                    ci = int(ci_str)
+                    line_count = max(0, int(cnt or 0))
+                    
+                    # 跳过边缘相机
+                    if ci == first_cam or ci == last_cam:
+                        continue
+                    
+                    # 累计中间相机的竖直线
+                    if line_count > 0:
+                        # 约束A：限制单个相机的最大有效竖直线数量
+                        # 防止某个相机因划痕等误检出大量竖直线导致切片数高估
+                        # 限制为4条（即单个相机最多贡献2刀/3片的证据）
+                        line_count = min(line_count, 4)
+                        
+                        middle_cam_lines += line_count
+                        middle_cams_with_lines += 1
                 except Exception:
                     continue
-            if center_edges > 0:
-                center_cuts = int(round(center_edges / 2.0))
-                rough = max(rough, min(4, center_cuts + 1))
+            
+            # 根据中间相机竖直线总数推断切片数
+            if middle_cam_lines == 0:
+                # 中间相机没有看到竖直线 -> 不切（1片）
+                return 1
+            
+            # 切片数 = (竖直线数 / 2) + 1
+            # 例如：2条线 -> 2片，4条线 -> 3片，6条线 -> 4片
+            piece_count = (middle_cam_lines // 2) + 1
+            
+            # 限制在合理范围 [1, 4]
+            piece_count = max(1, min(4, piece_count))
+            
+            # 额外验证：检查有竖直线的中间相机数量是否合理
+            # - 切2片：通常1-2个中间相机有竖直线
+            # - 切3片：通常2-3个中间相机有竖直线
+            # - 切4片：通常3个中间相机都有竖直线
+            # 如果出现不一致，可能是误检，需要保守处理
+            if piece_count >= 3 and middle_cams_with_lines <= 1:
+                # 只有1个中间相机有6条以上竖直线 -> 可能是误检，保守为2片
+                piece_count = 2
+            
+            return piece_count
+            
         except Exception:
             pass
-        return rough
+        return 1
+
+    def _estimate_piece_count_with_validation(cam_vertical_counts: dict, expected_cams: int, 
+                                               last_result_by_cam: dict) -> int:
+        """
+        增强版分片估计：在 _estimate_piece_count 基础上，增加基于缺陷分布的验证。
+        
+        验证逻辑：
+        - 如果估计为N片，但所有缺陷都集中在边缘相机，可能更可信
+        - 如果估计为1片，但缺陷在中间相机且有竖直边交叉，可能低估了
+        """
+        base_estimate = _estimate_piece_count(cam_vertical_counts, expected_cams)
+        
+        try:
+            n = int(expected_cams or 0)
+            first_cam = 0
+            last_cam = max(0, n - 1)
+            
+            # 统计有缺陷的相机数量（区分边缘/中间）
+            edge_cams_with_defects = set()
+            middle_cams_with_defects = set()
+            
+            for ci, res in last_result_by_cam.items():
+                try:
+                    ci_int = int(ci)
+                    defects = res.get('defects', [])
+                    if defects and len(defects) > 0:
+                        if ci_int == first_cam or ci_int == last_cam:
+                            edge_cams_with_defects.add(ci_int)
+                        else:
+                            middle_cams_with_defects.add(ci_int)
+                except Exception:
+                    continue
+            
+            # 验证：如果估计为1片，但多个中间相机有缺陷，可能需要上调
+            # （可能是中间相机的竖直线漏检了）
+            if base_estimate == 1 and len(middle_cams_with_defects) >= 2:
+                # 多个中间相机有缺陷但没检测到竖直线，可能是切2片
+                return 2
+            
+            # 验证：如果估计 >= 3片，但只有边缘相机有缺陷
+            # 这种情况估计可能是准确的（边缘片有问题）
+            
+        except Exception:
+            pass
+        
+        return base_estimate
+
 
     def _gather_defect_centers_for_cam(result_obj: dict) -> list[float]:
         """提取单相机内缺陷的 x 中心（像素）。优先 location(x,width)，否则 center[0]；无法得到返回空。"""
@@ -847,13 +947,11 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             vertical_counts[ci] = _count_near_vertical_per_cam(res)
                         piece_count_override = None
                         if vertical_counts:
-                            current_total_vertical = int(sum(int(v or 0) for v in vertical_counts.values()))
-                            if current_total_vertical > pane_max_total_vertical_count:
-                                pane_max_total_vertical_count = current_total_vertical
-                            try:
-                                piece_count_override = max(1, min(4, int(round(pane_max_total_vertical_count / 2.0))))
-                            except Exception:
-                                piece_count_override = 1
+                            # 使用增强版分片估计：基于"哪些相机出现多条竖直线"推断
+                            # 而非简单计数总竖直线
+                            piece_count_override = _estimate_piece_count_with_validation(
+                                vertical_counts, expected, last_result_by_cam
+                            )
                             marks = _decide_marks_by_pieces_and_positions(
                                 vertical_counts, last_result_by_cam, expected, shared_settings,
                                 piece_count_override=piece_count_override
@@ -902,7 +1000,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                     alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
                                 except Exception:
                                     pass
-                            print(f"    [状态机]: 自动剔废触发，marks={marks}，counts={log_counts}")
+                            print(f"    [状态机]: 自动剔废触发，marks={marks}，piece_count={piece_count_override}，counts={log_counts}")
                         else:
                             # 已经标记过剔除的玻璃，后续帧继续入队但不再增加计数
                             print(f"    [状态机]: 自动剔废再次触发（仅硬件），marks={marks}，counts={log_counts}")
