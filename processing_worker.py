@@ -168,6 +168,18 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                         rt['current_cam_idx'] = cam_idx
                     except Exception:
                         pass
+                    # 注入 lineName 和 cam_index 到 hough_inspector_params 供不检测区域使用
+                    try:
+                        line_name_rt = str(getattr(shared_settings, 'lineName', '') or conf_local.get('lineName', ''))
+                        hip = conf_local.setdefault('hough_inspector_params', {})
+                        hip['_RUNTIME_LINE_NAME'] = line_name_rt
+                        hip['_RUNTIME_CAM_INDEX'] = cam_idx
+                        # 同步到深色参数（如果使用深色模式）
+                        hid = conf_local.setdefault('hough_inspector_dark_params', {})
+                        hid['_RUNTIME_LINE_NAME'] = line_name_rt
+                        hid['_RUNTIME_CAM_INDEX'] = cam_idx
+                    except Exception:
+                        pass
                 except Exception:
                     conf_local = config
 

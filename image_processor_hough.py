@@ -42,6 +42,127 @@ def _get_font(font_size=36):
 ANNOTATION_FONT = _get_font(font_size=32)
 import math
 
+
+# ====================================================================================
+# --- 不检测区域配置 (Line2/Line3 cam3 专用) ---
+# ====================================================================================
+# 以下区域内的边缘将被屏蔽，仅当 lineName 为 Line2 或 Line3 且 cam_index == 2 时生效
+# 区域坐标为原始图像坐标系（全图坐标，非 ROI 内部坐标）
+# 使用 exclusion_zone_annotator.py 工具标注后，将输出复制到此处
+
+# Line2 cam3 exclusion zones - 简化版本 (4个框架，每框架4边)
+LINE2_CAM3_EXCLUSION_ZONES = [
+    # ===== 左上框架 (x:815-1098, y:470-709) =====
+    {"x": 815, "y": 470, "width": 283, "height": 45},   # 顶部边
+    {"x": 815, "y": 669, "width": 283, "height": 40},   # 底部边
+    {"x": 815, "y": 470, "width": 35, "height": 239},   # 左边
+    {"x": 1080, "y": 470, "width": 18, "height": 239},  # 右边
+    
+    # ===== 右上框架 (x:1518-1818, y:469-702) =====
+    {"x": 1518, "y": 469, "width": 300, "height": 50},  # 顶部边
+    {"x": 1518, "y": 667, "width": 300, "height": 35},  # 底部边
+    {"x": 1518, "y": 469, "width": 32, "height": 233},  # 左边
+    {"x": 1778, "y": 469, "width": 40, "height": 233},  # 右边
+    
+    # ===== 左下框架 (x:826-1099, y:1015-1220) =====
+    {"x": 826, "y": 1015, "width": 273, "height": 40},  # 顶部边
+    {"x": 826, "y": 1195, "width": 273, "height": 25},  # 底部边
+    {"x": 826, "y": 1015, "width": 25, "height": 205},  # 左边
+    {"x": 1082, "y": 1015, "width": 17, "height": 205}, # 右边
+    
+    # ===== 右下框架 (x:1476-1809, y:1013-1220) =====
+    {"x": 1476, "y": 1013, "width": 333, "height": 35}, # 顶部边
+    {"x": 1536, "y": 1196, "width": 273, "height": 20}, # 底部边
+    {"x": 1527, "y": 1013, "width": 40, "height": 207}, # 左边
+    {"x": 1786, "y": 1013, "width": 23, "height": 207}, # 右边
+]
+
+# Line3 cam3 exclusion zones - 简化版本 (4个框架，每框架4边)
+LINE3_CAM3_EXCLUSION_ZONES = [
+    # ===== 左上框架 (x:730-1001, y:389-598) =====
+    {"x": 730, "y": 389, "width": 271, "height": 45},   # 顶部边
+    {"x": 738, "y": 563, "width": 267, "height": 35},   # 底部边
+    {"x": 730, "y": 389, "width": 28, "height": 209},   # 左边
+    {"x": 964, "y": 389, "width": 37, "height": 209},   # 右边
+    
+    # ===== 右上框架 (x:1397-1654, y:375-574) =====
+    {"x": 1404, "y": 375, "width": 250, "height": 35},  # 顶部边
+    {"x": 1408, "y": 539, "width": 246, "height": 35},  # 底部边
+    {"x": 1397, "y": 375, "width": 35, "height": 199},  # 左边
+    {"x": 1634, "y": 375, "width": 20, "height": 199},  # 右边
+    
+    # ===== 左下框架 (x:744-1009, y:902-1074) =====
+    {"x": 756, "y": 902, "width": 253, "height": 25},   # 顶部边
+    {"x": 745, "y": 1049, "width": 281, "height": 25},  # 底部边
+    {"x": 744, "y": 902, "width": 35, "height": 172},   # 左边
+    {"x": 984, "y": 902, "width": 25, "height": 172},   # 右边
+    
+    # ===== 右下框架 (x:1423-1683, y:880-1066) =====
+    {"x": 1423, "y": 880, "width": 260, "height": 30},  # 顶部边
+    {"x": 1425, "y": 1046, "width": 256, "height": 20}, # 底部边
+    {"x": 1423, "y": 880, "width": 25, "height": 186},  # 左边
+    {"x": 1653, "y": 880, "width": 30, "height": 186},  # 右边
+]
+
+
+def get_exclusion_zones(line_name: str, cam_index: int) -> list:
+    """
+    获取指定产线和相机的不检测区域列表
+    
+    Args:
+        line_name: 产线名称，如 "Line2", "Line3"
+        cam_index: 相机索引（逻辑索引），cam3 对应 index=2
+    
+    Returns:
+        不检测区域列表，每个区域为 {"x": int, "y": int, "width": int, "height": int}
+    """
+    if line_name == "Line2" and cam_index == 2:
+        return LINE2_CAM3_EXCLUSION_ZONES
+    elif line_name == "Line3" and cam_index == 2:
+        return LINE3_CAM3_EXCLUSION_ZONES
+    return []
+
+
+def apply_exclusion_zones_to_edges(edge_img, roi_x: int, roi_y: int, zones: list):
+    """
+    将不检测区域内的边缘像素清零
+    
+    Args:
+        edge_img: Canny 边缘图像（ROI 内部坐标系）
+        roi_x: ROI 左上角 x 坐标（全图坐标）
+        roi_y: ROI 左上角 y 坐标（全图坐标）
+        zones: 不检测区域列表（全图坐标系）
+    
+    Returns:
+        处理后的边缘图像（不检测区域内的边缘已被清零）
+    """
+    if not zones or edge_img is None:
+        return edge_img
+    
+    import numpy as np
+    result = edge_img.copy()
+    roi_h, roi_w = result.shape[:2]
+    
+    for zone in zones:
+        # 获取不检测区域的全图坐标
+        zx = zone.get('x', 0)
+        zy = zone.get('y', 0)
+        zw = zone.get('width', 0)
+        zh = zone.get('height', 0)
+        
+        # 转换为 ROI 内部坐标
+        local_x1 = max(0, zx - roi_x)
+        local_y1 = max(0, zy - roi_y)
+        local_x2 = min(roi_w, zx + zw - roi_x)
+        local_y2 = min(roi_h, zy + zh - roi_y)
+        
+        # 如果区域与 ROI 有交集，则清零
+        if local_x2 > local_x1 and local_y2 > local_y1:
+            result[local_y1:local_y2, local_x1:local_x2] = 0
+    
+    return result
+
+
 # ====================================================================================
 # --- 水平延长“栅栏”历史缓存 (基于前若干帧竖直边位置) ---
 # ====================================================================================
@@ -2544,7 +2665,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         else:
             edges_work = edges_base
         try:
-            suppress_w = int(params.get('DEFECT_DETECTION', {}).get('E_LINE_SUPPRESS_WIDTH_PX', 36))
+            suppress_w = int(params.get('DEFECT_DETECTION', {}).get('E_LINE_SUPPRESS_WIDTH_PX', 18))
         except Exception:
             suppress_w = 36
         suppress_w = max(0, suppress_w)
@@ -4292,6 +4413,18 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     # 分离：Hough 用更敏感的边缘图；缺陷检测用更“干净”的原始边缘图，避免过度粘连
     hough_edges = preprocess_for_hough_enhanced(roi_gray, params)
     binary_edges = preprocess_for_defect_edges(roi_gray, params)
+    
+    # 应用不检测区域遮罩（仅对 Line2/Line3 的 cam3 生效）
+    # 从 params 中获取 lineName 和 cam_index（由上层调用者注入）
+    try:
+        _line_name = params.get('_RUNTIME_LINE_NAME', '')
+        _cam_index = params.get('_RUNTIME_CAM_INDEX', -1)
+        _exclusion_zones = get_exclusion_zones(_line_name, _cam_index)
+        if _exclusion_zones:
+            hough_edges = apply_exclusion_zones_to_edges(hough_edges, x, y, _exclusion_zones)
+            binary_edges = apply_exclusion_zones_to_edges(binary_edges, x, y, _exclusion_zones)
+    except Exception:
+        pass
     # 保证传入 HoughLinesP 的参数为整数类型（OpenCV 要求 threshold 为 int，其他也用 int 更稳妥）
     # Hough 最小线段长度：默认按 ROI 宽度比例（历史行为）。
     # 多玻璃/横向长条 ROI 中竖边往往“受高度限制”，可改为 height/min_dim 来避免竖边被过滤。
