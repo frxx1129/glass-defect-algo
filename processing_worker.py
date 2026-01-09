@@ -125,10 +125,23 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                     algo_mode = int(getattr(shared_settings, 'algorithm_mode', 1))
                 except Exception:
                     algo_mode = 1
-                # 在进入处理器前，根据“仅头尾相机启用 Q”策略，为本次调用构造局部配置副本并注入运行时开关
-                conf_local = copy.deepcopy(config) if isinstance(config, dict) else config
+                # 在进入处理器前，根据"仅头尾相机启用 Q"策略，为本次调用构造局部配置副本并注入运行时开关
+                # 优化：避免每帧 deepcopy 整个 config，仅浅拷贝并局部修改需要变更的嵌套字典
+                if isinstance(config, dict):
+                    conf_local = dict(config)  # 浅拷贝顶层
+                    # 仅对需要修改的嵌套字典做浅拷贝
+                    if 'hough_inspector_params' in config and isinstance(config['hough_inspector_params'], dict):
+                        conf_local['hough_inspector_params'] = dict(config['hough_inspector_params'])
+                        if 'DEFECT_DETECTION' in conf_local['hough_inspector_params']:
+                            conf_local['hough_inspector_params']['DEFECT_DETECTION'] = dict(conf_local['hough_inspector_params']['DEFECT_DETECTION'])
+                    if 'hough_inspector_dark_params' in config and isinstance(config['hough_inspector_dark_params'], dict):
+                        conf_local['hough_inspector_dark_params'] = dict(config['hough_inspector_dark_params'])
+                        if 'DEFECT_DETECTION' in conf_local['hough_inspector_dark_params']:
+                            conf_local['hough_inspector_dark_params']['DEFECT_DETECTION'] = dict(conf_local['hough_inspector_dark_params']['DEFECT_DETECTION'])
+                else:
+                    conf_local = config
                 try:
-                    cam_setup = conf_local.get('camera_setup', {}) or {}
+                    cam_setup = config.get('camera_setup', {}) or {}
                     total_cams_rt = int(cam_setup.get('expected_cameras', 0) or 0)
                     if total_cams_rt <= 0:
                         try:
@@ -137,7 +150,7 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                             total_cams_rt = 0
                     if total_cams_rt <= 0:
                         try:
-                            cro = conf_local.get('camera_rois', {}) or {}
+                            cro = config.get('camera_rois', {}) or {}
                             if isinstance(cro, dict):
                                 total_cams_rt = len(cro.keys())
                             elif isinstance(cro, list):
@@ -170,7 +183,7 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                         pass
                     # 注入 lineName 和 cam_index 到 hough_inspector_params 供不检测区域使用
                     try:
-                        line_name_rt = str(getattr(shared_settings, 'lineName', '') or conf_local.get('lineName', ''))
+                        line_name_rt = str(getattr(shared_settings, 'lineName', '') or config.get('lineName', ''))
                         hip = conf_local.setdefault('hough_inspector_params', {})
                         hip['_RUNTIME_LINE_NAME'] = line_name_rt
                         hip['_RUNTIME_CAM_INDEX'] = cam_idx

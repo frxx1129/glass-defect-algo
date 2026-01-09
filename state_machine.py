@@ -9,6 +9,57 @@ from datetime import datetime
 import yield_manager
 from server_comms import send_report_to_server, send_reports_batch_to_server, fetch_collection_id_from_server, fetch_initial_state_from_server, broadcast_rejections, broadcast_yield_and_rejections
 
+# --- 内存状态获取辅助函数 ---
+def _get_process_tree_memory_gb() -> float | None:
+    """返回当前进程 + 所有子进程的 RSS 内存占用 (GB)。优先 psutil，回退 Windows API。"""
+    # 1) 优先 psutil - 可以准确统计进程树
+    try:
+        import psutil
+        proc = psutil.Process(os.getpid())
+        total_rss = 0
+        try:
+            total_rss += int(proc.memory_info().rss)
+        except Exception:
+            pass
+        try:
+            for ch in proc.children(recursive=True):
+                try:
+                    total_rss += int(ch.memory_info().rss)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if total_rss > 0:
+            return float(total_rss) / float(1024 ** 3)
+    except Exception:
+        pass
+    
+    # 2) 回退: Windows API 获取当前进程内存（不含子进程）
+    try:
+        import ctypes
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_ulong),
+                ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+        h_proc = ctypes.windll.kernel32.GetCurrentProcess()
+        if ctypes.windll.psapi.GetProcessMemoryInfo(h_proc, ctypes.byref(counters), counters.cb):
+            return float(counters.WorkingSetSize) / float(1024 ** 3)
+    except Exception:
+        pass
+    
+    return None
+
 def results_and_state_machine_thread(num_cameras, results_queue, connection_manager, stop_event, loop, shared_settings, counters, queues, flags, machine_state_shared, stats_lock, metadata, run_event_proxy, http_client, alarm_light_controller):
     print("[状态机线程]: 已启动。")
     
@@ -95,6 +146,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     last_result_by_cam = {}        # 最近一帧NG结果（含缺陷坐标）的引用
     # 新增：按整片玻璃周期统计的“竖直边总数”的最大值（跨相机求和，跨时刻取最大）
     pane_max_total_vertical_count = 0
+    # 新增：已打印的切片数（用于避免重复打印）
+    last_printed_piece_count = 0
 
     def _get_line_mark_info(shared_settings):
         """获取当前产线的标记映射信息：
@@ -245,21 +298,24 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
 
     def _estimate_piece_count(cam_vertical_counts: dict, expected_cams: int) -> int:
         """
-        依据中间相机的竖直线数量来推断玻璃切片数。
+        依据中间相机是否看到竖直边来推断玻璃切片数。
         
-        核心原理：
-        - 边缘相机（第一个和最后一个）看到的是玻璃的外边缘（与切片数无关）
-        - 中间相机正常情况下看不到竖直边（玻璃是连续的）
-        - 只有在有切割线时，中间相机才会看到竖直线：
-          · 切2片（1刀）: 中间相机看到 2 条竖直线（切割处的左右两边）
-          · 切3片（2刀）: 中间相机看到 4 条竖直线
-          · 切4片（3刀）: 中间相机看到 6 条竖直线
+        简化逻辑：
+        - 排除边缘两个相机（第一个和最后一个）
+        - 中间有几个相机看到了竖直边，就认为玻璃切了几次
+        - 切片数 = 看到竖直边的中间相机数 + 1
+        - 5相机时最大4片，4相机时最大3片
         
-        公式：切片数 = (中间相机竖直线总数 / 2) + 1
+        示例（5相机配置，边缘为cam0和cam4，中间为cam1,cam2,cam3）：
+        - 0个中间相机看到竖直边 -> 1片（不切）
+        - 1个中间相机看到竖直边 -> 2片（切1刀）
+        - 2个中间相机看到竖直边 -> 3片（切2刀）
+        - 3个中间相机看到竖直边 -> 4片（切3刀，最大）
         
-        约束：
-        - 排除边缘相机的竖直线（它们只是玻璃外边缘，不反映切割）
-        - 若无证据，默认为1片
+        示例（4相机配置，边缘为cam0和cam3，中间为cam1,cam2）：
+        - 0个中间相机看到竖直边 -> 1片（不切）
+        - 1个中间相机看到竖直边 -> 2片（切1刀）
+        - 2个中间相机看到竖直边 -> 3片（切2刀，最大）
         
         相机配置：
         - Line2/Line3: 5台相机 (index 0,1,2,3,4)，边缘相机为 0 和 4
@@ -274,9 +330,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             first_cam = 0
             last_cam = max(0, n - 1)
             
-            # 统计中间相机的竖直线总数
-            middle_cam_lines = 0
-            middle_cams_with_lines = 0  # 有竖直线的中间相机数量
+            # 统计有竖直边的中间相机数量
+            middle_cams_with_vertical = 0
             
             for ci_str, cnt in cam_vertical_counts.items():
                 try:
@@ -287,38 +342,19 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     if ci == first_cam or ci == last_cam:
                         continue
                     
-                    # 累计中间相机的竖直线
-                    if line_count > 0:
-                        # 约束A：限制单个相机的最大有效竖直线数量
-                        # 防止某个相机因划痕等误检出大量竖直线导致切片数高估
-                        # 限制为4条（即单个相机最多贡献2刀/3片的证据）
-                        line_count = min(line_count, 4)
-                        
-                        middle_cam_lines += line_count
-                        middle_cams_with_lines += 1
+                    # 只要该中间相机看到了竖直边（>=1条），就计数
+                    if line_count >= 1:
+                        middle_cams_with_vertical += 1
                 except Exception:
                     continue
             
-            # 根据中间相机竖直线总数推断切片数
-            if middle_cam_lines == 0:
-                # 中间相机没有看到竖直线 -> 不切（1片）
-                return 1
+            # 切片数 = 看到竖直边的中间相机数 + 1
+            piece_count = middle_cams_with_vertical + 1
             
-            # 切片数 = (竖直线数 / 2) + 1
-            # 例如：2条线 -> 2片，4条线 -> 3片，6条线 -> 4片
-            piece_count = (middle_cam_lines // 2) + 1
-            
-            # 限制在合理范围 [1, 4]
-            piece_count = max(1, min(4, piece_count))
-            
-            # 额外验证：检查有竖直线的中间相机数量是否合理
-            # - 切2片：通常1-2个中间相机有竖直线
-            # - 切3片：通常2-3个中间相机有竖直线
-            # - 切4片：通常3个中间相机都有竖直线
-            # 如果出现不一致，可能是误检，需要保守处理
-            if piece_count >= 3 and middle_cams_with_lines <= 1:
-                # 只有1个中间相机有6条以上竖直线 -> 可能是误检，保守为2片
-                piece_count = 2
+            # 根据相机数量限制最大切片数
+            # 5相机: 最大4片; 4相机: 最大3片
+            max_pieces = 4 if n >= 5 else 3
+            piece_count = max(1, min(max_pieces, piece_count))
             
             return piece_count
             
@@ -329,48 +365,12 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     def _estimate_piece_count_with_validation(cam_vertical_counts: dict, expected_cams: int, 
                                                last_result_by_cam: dict) -> int:
         """
-        增强版分片估计：在 _estimate_piece_count 基础上，增加基于缺陷分布的验证。
+        分片估计：直接调用 _estimate_piece_count。
         
-        验证逻辑：
-        - 如果估计为N片，但所有缺陷都集中在边缘相机，可能更可信
-        - 如果估计为1片，但缺陷在中间相机且有竖直边交叉，可能低估了
+        简化后的逻辑已经足够直接（中间相机有几个看到竖直边就切几刀），
+        不再需要额外的验证逻辑。
         """
-        base_estimate = _estimate_piece_count(cam_vertical_counts, expected_cams)
-        
-        try:
-            n = int(expected_cams or 0)
-            first_cam = 0
-            last_cam = max(0, n - 1)
-            
-            # 统计有缺陷的相机数量（区分边缘/中间）
-            edge_cams_with_defects = set()
-            middle_cams_with_defects = set()
-            
-            for ci, res in last_result_by_cam.items():
-                try:
-                    ci_int = int(ci)
-                    defects = res.get('defects', [])
-                    if defects and len(defects) > 0:
-                        if ci_int == first_cam or ci_int == last_cam:
-                            edge_cams_with_defects.add(ci_int)
-                        else:
-                            middle_cams_with_defects.add(ci_int)
-                except Exception:
-                    continue
-            
-            # 验证：如果估计为1片，但多个中间相机有缺陷，可能需要上调
-            # （可能是中间相机的竖直线漏检了）
-            if base_estimate == 1 and len(middle_cams_with_defects) >= 2:
-                # 多个中间相机有缺陷但没检测到竖直线，可能是切2片
-                return 2
-            
-            # 验证：如果估计 >= 3片，但只有边缘相机有缺陷
-            # 这种情况估计可能是准确的（边缘片有问题）
-            
-        except Exception:
-            pass
-        
-        return base_estimate
+        return _estimate_piece_count(cam_vertical_counts, expected_cams)
 
 
     def _gather_defect_centers_for_cam(result_obj: dict) -> list[float]:
@@ -397,12 +397,16 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
 
     def _decide_marks_by_pieces_and_positions(cam_vertical_counts: dict, last_result_by_cam: dict, expected_cams: int, shared_settings, piece_count_override: int | None = None) -> list[int] | None:
         """
-        依据估计的切片数（1~4）以及缺陷位置，返回需要触发的'标记'集合：
-                - 1 切 2 块 -> 允许 {0,1,2}，优先给出属于缺陷所在块的标记（1=最右，2=最左）；
-                    中间相机(5路的cam2)用相机内 X 坐标区分左右（像素小->左->2，像素大->右->1）。
-                - 2 切 3 块 -> 允许 {0,1,2,3}，按全局位置映射至 1/2/3（1=最右，3=最左）；
-                - 3 切 4 块 -> 允许 {0,1,2,3,4}，按全局位置映射至 1..4（1=最右，4=最左）；
-        - 若无法判定，兜底 [0]。
+        依据估计的切片数（1~3）以及缺陷位置，返回需要触发的'标记'集合：
+        - 1片（不切）-> [0] 整片撤清
+        - 2片（切1刀）-> 左片标记2，右片标记1
+        - 3片（切2刀）-> 左片标记3，中片标记2，右片标记1
+        
+        标记约定（max_mark=3）：
+        - 0: 整片撤清
+        - 1: 最右边的片
+        - 2: 中间的片（3片时）或左边的片（2片时）
+        - 3: 最左边的片（仅3片时）
         """
         piece_count = piece_count_override if isinstance(piece_count_override, int) and piece_count_override >= 1 else _estimate_piece_count(cam_vertical_counts, expected_cams)
         if piece_count <= 1:
@@ -412,7 +416,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         n = int(expected_cams or 0)
         center = (n - 1) / 2.0 if n > 0 else 1.5
 
-        # 收集“每个缺陷”的全局位置参数，简化为 (cam_index, x_center_px or None)
+        # 收集"每个缺陷"的全局位置参数，简化为 (cam_index, x_center_px or None)
         samples: list[tuple[int, float | None]] = []
         for ci, res in last_result_by_cam.items():
             try:
@@ -435,38 +439,71 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         marks: set[int] = set()
         max_mark, _ = _get_line_mark_info(shared_settings)
 
-        # 将全局范围 [0,1] 均分为 piece_count 份；边界位于 i/piece_count
-        def _global_piece_index(ci: int, x_px: float | None) -> int:
-            # 计算全局位置 g ∈ [0,1]：g ≈ (ci + local_u)/n
-            if n <= 0:
-                return 1
-            if x_px is not None and cam_w > 1e-6:
-                local_u = min(1.0, max(0.0, x_px / cam_w))
-            else:
-                # 无 x 或无 cam_width：只按相机索引粗分
-                local_u = 0.5
-            g = (float(ci) + local_u) / float(n)
-            idx = int(np.floor(g * piece_count)) + 1
-            idx = min(max(1, idx), piece_count)
-            return idx
-
         for ci, x in samples:
             if piece_count == 2:
+                # 切2片：左片(标记2) | 右片(标记1)
                 if ci < center:
-                    marks.add(2)
+                    marks.add(2)  # 左片
                 elif ci > center:
-                    marks.add(1)
+                    marks.add(1)  # 右片
                 else:
                     # 中间相机：按 x 分左右
                     if x is not None and cam_w > 1e-6:
                         marks.add(2 if x < (cam_w / 2.0) else 1)
                     else:
                         marks.add(1)
-            elif piece_count in (3, 4):
-                idx = _global_piece_index(ci, x)
-                marks.add(piece_count - idx + 1)
+            elif piece_count == 3:
+                # 切3片：左片(标记3) | 中片(标记2) | 右片(标记1)
+                # 根据相机位置分配到三个区域
+                # 5相机: cam0,cam1->左片, cam2->中片, cam3,cam4->右片
+                # 4相机: cam0->左片, cam1,cam2->中片（需x坐标细分）, cam3->右片
+                if n == 5:
+                    if ci <= 1:
+                        marks.add(3)  # 左片
+                    elif ci == 2:
+                        marks.add(2)  # 中片
+                    else:  # ci >= 3
+                        marks.add(1)  # 右片
+                elif n == 4:
+                    if ci == 0:
+                        marks.add(3)  # 左片
+                    elif ci == 3:
+                        marks.add(1)  # 右片
+                    else:  # ci in (1, 2)
+                        # 中间两个相机按位置细分
+                        if ci == 1:
+                            # cam1: 偏左 -> 左片或中片
+                            if x is not None and cam_w > 1e-6 and x < cam_w / 2:
+                                marks.add(3)  # 左片
+                            else:
+                                marks.add(2)  # 中片
+                        else:  # ci == 2
+                            # cam2: 偏右 -> 中片或右片
+                            if x is not None and cam_w > 1e-6 and x > cam_w / 2:
+                                marks.add(1)  # 右片
+                            else:
+                                marks.add(2)  # 中片
+                else:
+                    marks.add(2)  # 默认中片
+            elif piece_count == 4 and n == 5:
+                # 切4片（仅5相机）：片1(标记4) | 片2(标记3) | 片3(标记2) | 片4(标记1)
+                # cam0->片1, cam1->片2, cam2->片2或片3(按x), cam3->片3, cam4->片4
+                if ci == 0:
+                    marks.add(min(4, max_mark))  # 片1（最左）
+                elif ci == 1:
+                    marks.add(3)  # 片2
+                elif ci == 2:
+                    # cam2按x坐标细分
+                    if x is not None and cam_w > 1e-6:
+                        marks.add(3 if x < cam_w / 2 else 2)
+                    else:
+                        marks.add(2)  # 默认片3
+                elif ci == 3:
+                    marks.add(2)  # 片3
+                else:  # ci == 4
+                    marks.add(1)  # 片4（最右）
             else:
-                marks.add(piece_count)
+                marks.add(0)  # 兜底整片
 
         # 将标记限制在 [1..max_mark] 范围内（0 保留为整片撤清，非此处产生）
         final_marks = sorted({m for m in marks if 1 <= m <= max_mark})
@@ -752,7 +789,16 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         continue
 
                     if absence_streak >= LEAVE_CONFIRM_FRAMES:
-                        print("--- [状态机]: 玻璃离开事件 ---")
+                        _mem_gb = _get_process_tree_memory_gb()
+                        _mem_str = f" | 内存: {_mem_gb:.2f}GB" if _mem_gb is not None else ""
+                        # 计算并打印本片玻璃的切片数
+                        try:
+                            vertical_counts = {str(ci): _count_near_vertical_per_cam(res) for ci, res in last_result_by_cam.items()}
+                            expected = int(num_cameras or 5)
+                            final_piece_count = _estimate_piece_count(vertical_counts, expected)
+                            print(f"--- [状态机]: 玻璃离开事件 (切{final_piece_count}片) ---{_mem_str}")
+                        except Exception:
+                            print(f"--- [状态机]: 玻璃离开事件 ---{_mem_str}")
                         machine_state = "WAITING_FOR_PANE"
                         machine_state_shared.value = 0
                         # 采集模式下：关闭跨相机 pane 激活标记
@@ -802,7 +848,16 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                 # 超时强制退出：玻璃处于检测状态超过 pane_max_duration_s
                 try:
                     if pane_enter_time_s is not None and (time.time() - pane_enter_time_s) >= pane_max_duration_s:
-                        print(f"--- [状态机]: 玻璃检测超时（>{pane_max_duration_s:.1f}s），强制退出 ---")
+                        _mem_gb = _get_process_tree_memory_gb()
+                        _mem_str = f" | 内存: {_mem_gb:.2f}GB" if _mem_gb is not None else ""
+                        # 计算并打印本片玻璃的切片数
+                        try:
+                            vertical_counts = {str(ci): _count_near_vertical_per_cam(res) for ci, res in last_result_by_cam.items()}
+                            expected = int(num_cameras or 5)
+                            final_piece_count = _estimate_piece_count(vertical_counts, expected)
+                            print(f"--- [状态机]: 玻璃检测超时（>{pane_max_duration_s:.1f}s），强制退出 (切{final_piece_count}片) ---{_mem_str}")
+                        except Exception:
+                            print(f"--- [状态机]: 玻璃检测超时（>{pane_max_duration_s:.1f}s），强制退出 ---{_mem_str}")
                         machine_state = "WAITING_FOR_PANE"
                         machine_state_shared.value = 0
                         try:
@@ -931,6 +986,22 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         slim.pop('annotated_image_buffer', None)
                         slim.pop('raw_image_buffer', None)
                         last_result_by_cam[cam_i] = slim
+                        
+                        # 实时计算并打印切片数（仅在切片数变化时打印）
+                        try:
+                            expected = int(getattr(shared_settings, 'expected_cameras', num_cameras) or num_cameras)
+                            vert_counts = {str(ci): _count_near_vertical_per_cam(res) for ci, res in last_result_by_cam.items()}
+                            current_piece_count = _estimate_piece_count(vert_counts, expected)
+                            if current_piece_count != last_printed_piece_count:
+                                last_printed_piece_count = current_piece_count
+                                # 统计哪些中间相机看到了竖直边
+                                first_cam, last_cam = 0, max(0, expected - 1)
+                                cams_with_vert = [ci for ci, cnt in vert_counts.items() if int(ci) != first_cam and int(ci) != last_cam and int(cnt) >= 1]
+                                if cams_with_vert:
+                                    cams_str = ','.join([f'cam{c}' for c in sorted(int(c) for c in cams_with_vert)])
+                                    print(f"    [状态机]: 检测到切{current_piece_count}片 ({cams_str}看到竖直边)")
+                        except Exception:
+                            pass
                     except Exception:
                         pass
 
@@ -1000,10 +1071,15 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                     alarm_light_controller.set_rejection_state(shared_settings.rejection_buzz_duration_s)
                                 except Exception:
                                     pass
-                            print(f"    [状态机]: 自动剔废触发，marks={marks}，piece_count={piece_count_override}，counts={log_counts}")
+                            # 简化打印：cam{x}检测到缺陷，触发撤清{y}
+                            ng_cam_str = ','.join([f'cam{c}' for c in sorted(auto_ng_cams)])
+                            mark_str = ','.join([str(m) for m in marks])
+                            print(f"    [状态机]: {ng_cam_str}检测到缺陷，触发撤清{mark_str} (切{piece_count_override}片)")
                         else:
                             # 已经标记过剔除的玻璃，后续帧继续入队但不再增加计数
-                            print(f"    [状态机]: 自动剔废再次触发（仅硬件），marks={marks}，counts={log_counts}")
+                            # 后续帧只做硬件剔废，简化打印
+                            mark_str = ','.join([str(m) for m in marks])
+                            print(f"    [状态机]: 再次触发撤清{mark_str}")
 
                 if manual_reject_flag.value:
                     is_current_event_rejected = True
@@ -1025,7 +1101,9 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         shared_rejection_counter.value = total_rejections
                         yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
                     broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
-                    print("    [状态机]: 即时手动剔废触发！")
+                    # 手动剔废简化打印
+                    route_str = str(route) if route else '0'
+                    print(f"    [状态机]: 手动触发撤清{route_str}")
                     if current_pane_ng_buffer and current_pane_reports:
                         try:
                             for res_item in current_pane_ng_buffer:
@@ -1102,16 +1180,20 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         # 重置自动分路聚合状态
                         auto_ng_cams.clear(); last_result_by_cam.clear()
                         pane_max_total_vertical_count = 0
+                        last_printed_piece_count = 0
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):
                             try:
                                 alarm_light_controller.set_normal_state()
                             except Exception:
                                 pass
                         pane_enter_time_s = time.time()
+                        # 获取内存状态用于显示
+                        _mem_gb = _get_process_tree_memory_gb()
+                        _mem_str = f" | 内存: {_mem_gb:.2f}GB" if _mem_gb is not None else ""
                         if first_presence_cam_idx is not None:
-                            print(f"--- [状态机]: 玻璃进入事件 (触发: 相机{first_presence_cam_idx + 1} ROI{first_presence_roi_idx}) ---")
+                            print(f"--- [状态机]: 玻璃进入事件 (触发: 相机{first_presence_cam_idx + 1} ROI{first_presence_roi_idx}) ---{_mem_str}")
                         else:
-                            print("--- [状态机]: 玻璃进入事件 (触发: 未捕获) ---")
+                            print(f"--- [状态机]: 玻璃进入事件 (触发: 未捕获) ---{_mem_str}")
                 else:
                     # 连续无玻璃：重置帧计数
                     presence_streak = 0

@@ -52,56 +52,56 @@ import math
 
 # Line2 cam3 exclusion zones - 简化版本 (4个框架，每框架4边)
 LINE2_CAM3_EXCLUSION_ZONES = [
-    # ===== 左上框架 (x:815-1098, y:470-709) =====
-    {"x": 815, "y": 470, "width": 283, "height": 45},   # 顶部边
-    {"x": 815, "y": 669, "width": 283, "height": 40},   # 底部边
-    {"x": 815, "y": 470, "width": 35, "height": 239},   # 左边
-    {"x": 1080, "y": 470, "width": 18, "height": 239},  # 右边
+    # ===== 左上框架 =====
+    {"x": 822, "y": 462, "width": 295, "height": 61},   # 顶部边
+    {"x": 808, "y": 655, "width": 310, "height": 83},   # 底部边
+    {"x": 819, "y": 469, "width": 49, "height": 264},   # 左边
+    {"x": 1071, "y": 452, "width": 44, "height": 290},  # 右边
     
-    # ===== 右上框架 (x:1518-1818, y:469-702) =====
-    {"x": 1518, "y": 469, "width": 300, "height": 50},  # 顶部边
-    {"x": 1518, "y": 667, "width": 300, "height": 35},  # 底部边
-    {"x": 1518, "y": 469, "width": 32, "height": 233},  # 左边
-    {"x": 1778, "y": 469, "width": 40, "height": 233},  # 右边
+    # ===== 右上框架 =====
+    {"x": 1512, "y": 460, "width": 308, "height": 54},  # 顶部边
+    {"x": 1506, "y": 667, "width": 305, "height": 71},  # 底部边
+    {"x": 1498, "y": 462, "width": 46, "height": 293},  # 左边
+    {"x": 1742, "y": 465, "width": 78, "height": 271},  # 右边
     
-    # ===== 左下框架 (x:826-1099, y:1015-1220) =====
-    {"x": 826, "y": 1015, "width": 273, "height": 40},  # 顶部边
-    {"x": 826, "y": 1195, "width": 273, "height": 25},  # 底部边
-    {"x": 826, "y": 1015, "width": 25, "height": 205},  # 左边
-    {"x": 1082, "y": 1015, "width": 17, "height": 205}, # 右边
+    # ===== 左下框架 =====
+    {"x": 820, "y": 989, "width": 317, "height": 68},   # 顶部边
+    {"x": 826, "y": 1187, "width": 286, "height": 68},  # 底部边
+    {"x": 824, "y": 1001, "width": 73, "height": 225},  # 左边
+    {"x": 1058, "y": 979, "width": 46, "height": 274},  # 右边
     
-    # ===== 右下框架 (x:1476-1809, y:1013-1220) =====
-    {"x": 1476, "y": 1013, "width": 333, "height": 35}, # 顶部边
-    {"x": 1536, "y": 1196, "width": 273, "height": 20}, # 底部边
-    {"x": 1527, "y": 1013, "width": 40, "height": 207}, # 左边
-    {"x": 1786, "y": 1013, "width": 23, "height": 207}, # 右边
+    # ===== 右下框架 =====
+    {"x": 1536, "y": 972, "width": 274, "height": 71},  # 顶部边
+    {"x": 1544, "y": 1165, "width": 264, "height": 69}, # 底部边
+    {"x": 1500, "y": 984, "width": 63, "height": 252},  # 左边
+    {"x": 1754, "y": 1027, "width": 51, "height": 203}, # 右边
 ]
 
 # Line3 cam3 exclusion zones - 简化版本 (4个框架，每框架4边)
 LINE3_CAM3_EXCLUSION_ZONES = [
-    # ===== 左上框架 (x:730-1001, y:389-598) =====
-    {"x": 730, "y": 389, "width": 271, "height": 45},   # 顶部边
-    {"x": 738, "y": 563, "width": 267, "height": 35},   # 底部边
-    {"x": 730, "y": 389, "width": 28, "height": 209},   # 左边
-    {"x": 964, "y": 389, "width": 37, "height": 209},   # 右边
+    # ===== 左上框架 =====
+    {"x": 745, "y": 409, "width": 259, "height": 22},   # 顶部边
+    {"x": 754, "y": 552, "width": 233, "height": 49},   # 底部边
+    {"x": 744, "y": 419, "width": 69, "height": 175},   # 左边
+    {"x": 950, "y": 411, "width": 47, "height": 204},   # 右边
     
-    # ===== 右上框架 (x:1397-1654, y:375-574) =====
-    {"x": 1404, "y": 375, "width": 250, "height": 35},  # 顶部边
-    {"x": 1408, "y": 539, "width": 246, "height": 35},  # 底部边
-    {"x": 1397, "y": 375, "width": 35, "height": 199},  # 左边
-    {"x": 1634, "y": 375, "width": 20, "height": 199},  # 右边
+    # ===== 右上框架 =====
+    {"x": 1406, "y": 382, "width": 261, "height": 32},  # 顶部边
+    {"x": 1387, "y": 537, "width": 266, "height": 63},  # 底部边
+    {"x": 1394, "y": 380, "width": 37, "height": 213},  # 左边
+    {"x": 1619, "y": 368, "width": 34, "height": 215},  # 右边
     
-    # ===== 左下框架 (x:744-1009, y:902-1074) =====
-    {"x": 756, "y": 902, "width": 253, "height": 25},   # 顶部边
-    {"x": 745, "y": 1049, "width": 281, "height": 25},  # 底部边
-    {"x": 744, "y": 902, "width": 35, "height": 172},   # 左边
-    {"x": 984, "y": 902, "width": 25, "height": 172},   # 右边
+    # ===== 左下框架 =====
+    {"x": 742, "y": 890, "width": 281, "height": 80},   # 顶部边 (向下拓展)
+    {"x": 749, "y": 1064, "width": 269, "height": 78},  # 底部边
+    {"x": 737, "y": 906, "width": 63, "height": 216},   # 左边
+    {"x": 948, "y": 870, "width": 80, "height": 268},   # 右边
     
-    # ===== 右下框架 (x:1423-1683, y:880-1066) =====
-    {"x": 1423, "y": 880, "width": 260, "height": 30},  # 顶部边
-    {"x": 1425, "y": 1046, "width": 256, "height": 20}, # 底部边
-    {"x": 1423, "y": 880, "width": 25, "height": 186},  # 左边
-    {"x": 1653, "y": 880, "width": 30, "height": 186},  # 右边
+    # ===== 右下框架 =====
+    {"x": 1414, "y": 851, "width": 278, "height": 46},  # 顶部边
+    {"x": 1394, "y": 1054, "width": 298, "height": 71}, # 底部边
+    {"x": 1406, "y": 873, "width": 51, "height": 252},  # 左边
+    {"x": 1616, "y": 834, "width": 56, "height": 302},  # 右边
 ]
 
 
@@ -185,6 +185,28 @@ _roi_glass_boundaries = {}
 # 理想竖直线缓存: 允许检测到的理想直线在后续缺失时保留若干帧(默认5帧，可配置)
 _roi_ideal_vertical_cache = {}
 
+# 全局缓存大小限制，防止内存无限增长
+_CACHE_MAX_ENTRIES = 50
+
+def reset_global_caches():
+    """重置所有全局缓存以释放内存。可在每片玻璃处理完成后或内存压力时调用。"""
+    global _roi_vertical_history, _roi_frame_count, _roi_fences
+    global _roi_glass_boundary_history, _roi_glass_boundaries, _roi_ideal_vertical_cache
+    _roi_vertical_history.clear()
+    _roi_frame_count.clear()
+    _roi_fences.clear()
+    _roi_glass_boundary_history.clear()
+    _roi_glass_boundaries.clear()
+    _roi_ideal_vertical_cache.clear()
+
+def _prune_cache_if_needed(cache_dict, max_entries=_CACHE_MAX_ENTRIES):
+    """如果缓存条目超过限制，删除最早的条目（简单 FIFO）。"""
+    if len(cache_dict) > max_entries:
+        # 删除超出部分的条目（保留最新的 max_entries 个）
+        keys_to_remove = list(cache_dict.keys())[:-max_entries]
+        for k in keys_to_remove:
+            cache_dict.pop(k, None)
+
 def _update_glass_boundaries(roi_key, vertical_x_list, params):
     """记录多玻璃之间的候选分隔线(边界), 与栅栏不同: 边界是两块玻璃之间的中线。
     当帧内存在至少两条近竖直边且最大间隙>=配置阈值时, 取该最大间隙的中点作为候选边界。累积若干帧后取中位数稳定化。
@@ -222,6 +244,9 @@ def _update_glass_boundaries(roi_key, vertical_x_list, params):
             _roi_glass_boundaries[roi_key] = mid_pt
         # 生成后清空历史以释放内存
         _roi_glass_boundary_history[roi_key] = []
+        # 防止缓存无限增长
+        _prune_cache_if_needed(_roi_glass_boundaries)
+        _prune_cache_if_needed(_roi_glass_boundary_history)
 
 def _get_glass_boundary(roi_key):
     return _roi_glass_boundaries.get(roi_key, None)
@@ -271,6 +296,10 @@ def _update_vertical_fences(roi_key, vertical_x_list, params):
             _roi_fences[roi_key] = []
         # 生成后清空历史以释放内存
         _roi_vertical_history[roi_key] = []
+        # 防止缓存无限增长
+        _prune_cache_if_needed(_roi_fences)
+        _prune_cache_if_needed(_roi_vertical_history)
+        _prune_cache_if_needed(_roi_frame_count)
 
 def _get_fences_for_roi(roi_key):
     return _roi_fences.get(roi_key, [])

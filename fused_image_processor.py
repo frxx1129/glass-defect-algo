@@ -37,11 +37,15 @@ def _scale_numeric(value, scale):
 
 
 def _adjust_params_for_dark(params: Dict[str, Any]) -> Dict[str, Any]:
-
-    p = copy.deepcopy(params) if isinstance(params, dict) else {}
+    # 优化：避免 deepcopy，仅浅拷贝需要修改的嵌套字典
+    if not isinstance(params, dict):
+        return {}
+    p = dict(params)  # 浅拷贝顶层
 
     # 1) Canny 阈值提升至 40/105（严格键名）
     try:
+        if 'PREPROCESSING' in params:
+            p['PREPROCESSING'] = dict(params['PREPROCESSING'])
         pre = p.setdefault('PREPROCESSING', {})
         pre['CANNY_THRESHOLD_LOW'] = 40
         pre['CANNY_THRESHOLD_HIGH'] = 105
@@ -50,6 +54,8 @@ def _adjust_params_for_dark(params: Dict[str, Any]) -> Dict[str, Any]:
 
     # 2) HOUGH 阶段阈值整体下调至默认的 85%
     try:
+        if 'HOUGH_TRANSFORM' in params:
+            p['HOUGH_TRANSFORM'] = dict(params['HOUGH_TRANSFORM'])
         hough = p.setdefault('HOUGH_TRANSFORM', {})
         if 'THRESHOLD' in hough and isinstance(hough['THRESHOLD'], (int, float)):
             hough['THRESHOLD'] = _scale_numeric(hough['THRESHOLD'], 0.85)
@@ -57,6 +63,8 @@ def _adjust_params_for_dark(params: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
     # 3) 获取 DEFECT_DETECTION
+    if 'DEFECT_DETECTION' in params:
+        p['DEFECT_DETECTION'] = dict(params['DEFECT_DETECTION'])
     dd = p.setdefault('DEFECT_DETECTION', {})
 
     # 3.1 崩边(B)过滤参数 ×1.5（仅保留算法中仍使用的键；不含 B->L 重分类）
@@ -78,8 +86,9 @@ def _adjust_params_for_dark(params: Dict[str, Any]) -> Dict[str, Any]:
 def _run_dark(image_gray, rois, full_config):
     """深色玻璃：仅基于浅色参数集做运行时调整，不再读取独立 dark 参数。"""
     try:
-        cfg = copy.deepcopy(full_config)
-        base_params = cfg.get('hough_inspector_params')
+        # 优化：避免 deepcopy 整个 config，仅浅拷贝顶层并替换需要修改的部分
+        cfg = dict(full_config) if isinstance(full_config, dict) else {}
+        base_params = full_config.get('hough_inspector_params')
         if base_params is None:
             raise ValueError("'hough_inspector_params' missing in config")
         cfg['hough_inspector_params'] = _adjust_params_for_dark(base_params)

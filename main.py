@@ -111,12 +111,13 @@ def _ensure_single_instance_and_job():
 
 def main():
     """Main function to initialize shared resources, start child processes, and run the API server."""
-    # --- 日志重定向：将控制台输出同时写入 error.log（每次启动覆盖重建） ---
+    # --- 日志重定向：将控制台输出同时写入 error_<timestamp>.log（每次启动新建，避免覆盖） ---
     log_file = None
     try:
         # 在打包场景使用可执行文件目录，否则使用脚本所在目录
         base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
-        log_path = os.path.join(base_dir, 'error.log')
+        log_timestamp = time.strftime('%Y%m%d_%H%M%S')
+        log_path = os.path.join(base_dir, f'error_{log_timestamp}.log')
         log_file = open(log_path, mode='w', encoding='utf-8')
 
         class _Tee:
