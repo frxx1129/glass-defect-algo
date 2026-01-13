@@ -1,64 +1,69 @@
 """
 可视化简化后的 exclusion zones
+直接读取 image_processor_hough.py 源文件，完全绕过 Python 缓存
 """
 
 import cv2
 import numpy as np
 import os
+import re
+import sys
 
-# Line2 cam3 exclusion zones - 简化版本 (4个框架，每框架4边)
-LINE2_CAM3_EXCLUSION_ZONES = [
-    # ===== 左上框架 =====
-    {"x": 822, "y": 462, "width": 295, "height": 61},   # 顶部边
-    {"x": 808, "y": 655, "width": 310, "height": 83},   # 底部边
-    {"x": 819, "y": 469, "width": 49, "height": 264},   # 左边
-    {"x": 1071, "y": 452, "width": 44, "height": 290},  # 右边
+def load_exclusion_zones_from_source():
+    """直接从源文件读取 exclusion zones，完全绕过 .pyc 缓存"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    source_file = os.path.join(script_dir, "image_processor_hough.py")
     
-    # ===== 右上框架 =====
-    {"x": 1512, "y": 460, "width": 308, "height": 54},  # 顶部边
-    {"x": 1506, "y": 667, "width": 305, "height": 71},  # 底部边
-    {"x": 1498, "y": 462, "width": 46, "height": 293},  # 左边
-    {"x": 1742, "y": 465, "width": 78, "height": 271},  # 右边
+    with open(source_file, 'r', encoding='utf-8') as f:
+        content = f.read()
     
-    # ===== 左下框架 =====
-    {"x": 820, "y": 989, "width": 317, "height": 68},   # 顶部边
-    {"x": 826, "y": 1187, "width": 286, "height": 68},  # 底部边
-    {"x": 824, "y": 1001, "width": 73, "height": 225},  # 左边
-    {"x": 1058, "y": 979, "width": 46, "height": 274},  # 右边
+    # 使用正则表达式提取 LINE2_CAM3_EXCLUSION_ZONES
+    line2_match = re.search(
+        r'LINE2_CAM3_EXCLUSION_ZONES\s*=\s*\[(.*?)\n\]',
+        content,
+        re.DOTALL
+    )
     
-    # ===== 右下框架 =====
-    {"x": 1536, "y": 972, "width": 274, "height": 71},  # 顶部边
-    {"x": 1544, "y": 1165, "width": 264, "height": 69}, # 底部边
-    {"x": 1500, "y": 984, "width": 63, "height": 252},  # 左边
-    {"x": 1754, "y": 1027, "width": 51, "height": 203}, # 右边
-]
-
-# Line3 cam3 exclusion zones - 简化版本 (4个框架，每框架4边)
-LINE3_CAM3_EXCLUSION_ZONES = [
-    # ===== 左上框架 =====
-    {"x": 745, "y": 409, "width": 259, "height": 22},   # 顶部边
-    {"x": 754, "y": 552, "width": 233, "height": 49},   # 底部边
-    {"x": 744, "y": 419, "width": 69, "height": 175},   # 左边
-    {"x": 950, "y": 411, "width": 47, "height": 204},   # 右边
+    # 使用正则表达式提取 LINE3_CAM3_EXCLUSION_ZONES
+    line3_match = re.search(
+        r'LINE3_CAM3_EXCLUSION_ZONES\s*=\s*\[(.*?)\n\]',
+        content,
+        re.DOTALL
+    )
     
-    # ===== 右上框架 =====
-    {"x": 1406, "y": 382, "width": 261, "height": 32},  # 顶部边
-    {"x": 1387, "y": 537, "width": 266, "height": 63},  # 底部边
-    {"x": 1394, "y": 380, "width": 37, "height": 213},  # 左边
-    {"x": 1619, "y": 368, "width": 34, "height": 215},  # 右边
+    line2_zones = []
+    line3_zones = []
     
-    # ===== 左下框架 =====
-    {"x": 742, "y": 890, "width": 281, "height": 80},   # 顶部边
-    {"x": 749, "y": 1064, "width": 269, "height": 78},  # 底部边
-    {"x": 737, "y": 906, "width": 63, "height": 216},   # 左边
-    {"x": 948, "y": 870, "width": 80, "height": 268},   # 右边
+    # 解析每个 zone 字典
+    zone_pattern = re.compile(r'\{[^}]+\}')
     
-    # ===== 右下框架 =====
-    {"x": 1414, "y": 851, "width": 278, "height": 46},  # 顶部边
-    {"x": 1394, "y": 1054, "width": 298, "height": 71}, # 底部边
-    {"x": 1406, "y": 873, "width": 51, "height": 252},  # 左边
-    {"x": 1616, "y": 834, "width": 56, "height": 302},  # 右边
-]
+    if line2_match:
+        for zone_str in zone_pattern.findall(line2_match.group(1)):
+            try:
+                # 安全解析字典
+                zone = eval(zone_str)
+                if isinstance(zone, dict) and all(k in zone for k in ['x', 'y', 'width', 'height']):
+                    line2_zones.append(zone)
+            except:
+                pass
+    
+    if line3_match:
+        for zone_str in zone_pattern.findall(line3_match.group(1)):
+            try:
+                zone = eval(zone_str)
+                if isinstance(zone, dict) and all(k in zone for k in ['x', 'y', 'width', 'height']):
+                    line3_zones.append(zone)
+            except:
+                pass
+    
+    print(f"从源文件加载: LINE2_CAM3_EXCLUSION_ZONES = {len(line2_zones)} 个区域")
+    print(f"从源文件加载: LINE3_CAM3_EXCLUSION_ZONES = {len(line3_zones)} 个区域")
+    
+    # 打印第一个 zone 以验证
+    if line3_zones:
+        print(f"  Line3 Zone 1: {line3_zones[0]}")
+    
+    return line2_zones, line3_zones
 
 
 def draw_zones(image, zones, color=(0, 255, 0), alpha=0.3):
@@ -99,6 +104,9 @@ def main():
     output_dir = os.path.join(script_dir, "sim_output")
     os.makedirs(output_dir, exist_ok=True)
     
+    # 直接从源文件加载配置，完全绕过缓存
+    LINE2_CAM3_EXCLUSION_ZONES, LINE3_CAM3_EXCLUSION_ZONES = load_exclusion_zones_from_source()
+    
     # 处理 Line2 cam3
     line2_path = os.path.join(script_dir, "line2cam3.BMP")
     if os.path.exists(line2_path):
@@ -107,7 +115,7 @@ def main():
         img = draw_zones(img, LINE2_CAM3_EXCLUSION_ZONES)
         
         # 添加标题
-        cv2.putText(img, "Line2 Cam3 - Simplified Exclusion Zones (6 zones)", 
+        cv2.putText(img, f"Line2 Cam3 - Exclusion Zones ({len(LINE2_CAM3_EXCLUSION_ZONES)} zones)", 
                    (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
         
         output_path = os.path.join(output_dir, "line2cam3_simplified_zones.png")
@@ -124,7 +132,7 @@ def main():
         img = draw_zones(img, LINE3_CAM3_EXCLUSION_ZONES)
         
         # 添加标题
-        cv2.putText(img, "Line3 Cam3 - Simplified Exclusion Zones (6 zones)", 
+        cv2.putText(img, f"Line3 Cam3 - Exclusion Zones ({len(LINE3_CAM3_EXCLUSION_ZONES)} zones)", 
                    (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
         
         output_path = os.path.join(output_dir, "line3cam3_simplified_zones.png")

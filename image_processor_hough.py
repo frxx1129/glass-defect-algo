@@ -79,29 +79,22 @@ LINE2_CAM3_EXCLUSION_ZONES = [
 
 # Line3 cam3 exclusion zones - 简化版本 (4个框架，每框架4边)
 LINE3_CAM3_EXCLUSION_ZONES = [
-    # ===== 左上框架 =====
-    {"x": 745, "y": 409, "width": 259, "height": 22},   # 顶部边
-    {"x": 754, "y": 552, "width": 233, "height": 49},   # 底部边
-    {"x": 744, "y": 419, "width": 69, "height": 175},   # 左边
-    {"x": 950, "y": 411, "width": 47, "height": 204},   # 右边
-    
-    # ===== 右上框架 =====
-    {"x": 1406, "y": 382, "width": 261, "height": 32},  # 顶部边
-    {"x": 1387, "y": 537, "width": 266, "height": 63},  # 底部边
-    {"x": 1394, "y": 380, "width": 37, "height": 213},  # 左边
-    {"x": 1619, "y": 368, "width": 34, "height": 215},  # 右边
-    
-    # ===== 左下框架 =====
-    {"x": 742, "y": 890, "width": 281, "height": 80},   # 顶部边 (向下拓展)
-    {"x": 749, "y": 1064, "width": 269, "height": 78},  # 底部边
-    {"x": 737, "y": 906, "width": 63, "height": 216},   # 左边
-    {"x": 948, "y": 870, "width": 80, "height": 268},   # 右边
-    
-    # ===== 右下框架 =====
-    {"x": 1414, "y": 851, "width": 278, "height": 46},  # 顶部边
-    {"x": 1394, "y": 1054, "width": 298, "height": 71}, # 底部边
-    {"x": 1406, "y": 873, "width": 51, "height": 252},  # 左边
-    {"x": 1616, "y": 834, "width": 56, "height": 302},  # 右边
+    {"x": 733, "y": 406, "width": 32, "height": 197},
+    {"x": 735, "y": 395, "width": 267, "height": 40},
+    {"x": 972, "y": 397, "width": 25, "height": 211},
+    {"x": 735, "y": 559, "width": 273, "height": 44},
+    {"x": 1390, "y": 378, "width": 58, "height": 213},
+    {"x": 1595, "y": 368, "width": 64, "height": 221},
+    {"x": 1397, "y": 366, "width": 261, "height": 39},
+    {"x": 1390, "y": 532, "width": 274, "height": 46},
+    {"x": 742, "y": 884, "width": 35, "height": 225},
+    {"x": 745, "y": 877, "width": 283, "height": 92},
+    {"x": 974, "y": 875, "width": 46, "height": 228},
+    {"x": 747, "y": 1064, "width": 271, "height": 30},
+    {"x": 1411, "y": 872, "width": 44, "height": 225},
+    {"x": 1409, "y": 855, "width": 269, "height": 49},
+    {"x": 1645, "y": 855, "width": 35, "height": 233},
+    {"x": 1418, "y": 1037, "width": 266, "height": 56}
 ]
 
 
@@ -162,6 +155,168 @@ def apply_exclusion_zones_to_edges(edge_img, roi_x: int, roi_y: int, zones: list
     
     return result
 
+
+
+def is_line_in_exclusion_zones(line_seg, roi_x: int, roi_y: int, zones: list, overlap_threshold: float = 0.5) -> bool:
+    """
+    检查一条直线是否主要位于 exclusion zones 内
+    
+    Args:
+        line_seg: 直线线段 [x1, y1, x2, y2]，ROI 内部坐标系
+        roi_x: ROI 左上角 x 坐标（全图坐标）
+        roi_y: ROI 左上角 y 坐标（全图坐标）
+        zones: 不检测区域列表（全图坐标系）
+        overlap_threshold: 重叠比例阈值，超过此值则认为直线主要在 exclusion zone 内
+    
+    Returns:
+        True 如果直线主要在 exclusion zones 内（应被过滤），否则 False
+    """
+    if not zones or line_seg is None:
+        return False
+    
+    try:
+        x1, y1, x2, y2 = map(float, line_seg)
+        # 转换为全图坐标
+        gx1, gy1 = x1 + roi_x, y1 + roi_y
+        gx2, gy2 = x2 + roi_x, y2 + roi_y
+        
+        line_len = float(np.hypot(gx2 - gx1, gy2 - gy1))
+        if line_len < 1.0:
+            return False
+        
+        # 采样直线上的点，检查有多少比例在 exclusion zones 内
+        num_samples = max(10, int(line_len / 5.0))  # 每 5 像素一个采样点
+        in_zone_count = 0
+        
+        for i in range(num_samples + 1):
+            t = float(i) / float(num_samples)
+            px = gx1 + t * (gx2 - gx1)
+            py = gy1 + t * (gy2 - gy1)
+            
+            # 检查点是否在某个 exclusion zone 内
+            for zone in zones:
+                zx = zone.get('x', 0)
+                zy = zone.get('y', 0)
+                zw = zone.get('width', 0)
+                zh = zone.get('height', 0)
+                
+                if zx <= px <= zx + zw and zy <= py <= zy + zh:
+                    in_zone_count += 1
+                    break
+        
+        overlap_ratio = float(in_zone_count) / float(num_samples + 1)
+        return overlap_ratio >= overlap_threshold
+    except Exception:
+        return False
+
+
+def filter_lines_in_exclusion_zones(lines: list, roi_x: int, roi_y: int, zones: list, overlap_threshold: float = 0.5) -> list:
+    """
+    过滤掉主要位于 exclusion zones 内的直线
+    
+    Args:
+        lines: 直线列表，每条直线为 [x1, y1, x2, y2]，ROI 内部坐标系
+        roi_x: ROI 左上角 x 坐标（全图坐标）
+        roi_y: ROI 左上角 y 坐标（全图坐标）
+        zones: 不检测区域列表（全图坐标系）
+        overlap_threshold: 重叠比例阈值
+    
+    Returns:
+        过滤后的直线列表
+    """
+    if not zones or not lines:
+        return lines
+    
+    filtered = []
+    for line in lines:
+        if not is_line_in_exclusion_zones(line, roi_x, roi_y, zones, overlap_threshold):
+            filtered.append(line)
+    return filtered
+
+
+def clip_lines_at_exclusion_zones(lines: list, roi_x: int, roi_y: int, zones: list, min_segment_len: float = 20.0) -> list:
+    """
+    裁剪穿过 exclusion zones 的直线，将其在 zone 边界处切断。
+    
+    一条直线穿过 exclusion zone 时，会被切成多个片段，每个片段都完全在 exclusion zones 之外。
+    
+    Args:
+        lines: 直线列表，每条直线为 [x1, y1, x2, y2]，ROI 内部坐标系
+        roi_x: ROI 左上角 x 坐标（全图坐标）
+        roi_y: ROI 左上角 y 坐标（全图坐标）
+        zones: 不检测区域列表（全图坐标系）
+        min_segment_len: 最小保留片段长度（像素），太短的片段会被丢弃
+    
+    Returns:
+        裁剪后的直线列表（可能比原直线多，因为一条直线可能被切成多段）
+    """
+    if not zones or not lines:
+        return lines
+    
+    def _point_in_any_zone(px, py, zones):
+        """检查点(全图坐标)是否在任一 exclusion zone 内"""
+        for zone in zones:
+            zx = zone.get('x', 0)
+            zy = zone.get('y', 0)
+            zw = zone.get('width', 0)
+            zh = zone.get('height', 0)
+            if zx <= px <= zx + zw and zy <= py <= zy + zh:
+                return True
+        return False
+    
+    result = []
+    for line in lines:
+        try:
+            x1, y1, x2, y2 = map(float, line)
+            # 转换为全图坐标
+            gx1, gy1 = x1 + roi_x, y1 + roi_y
+            gx2, gy2 = x2 + roi_x, y2 + roi_y
+            
+            line_len = float(np.hypot(gx2 - gx1, gy2 - gy1))
+            if line_len < 1.0:
+                continue
+            
+            # 沿直线采样，找出所有在 exclusion zones 外的片段
+            num_samples = max(50, int(line_len / 2.0))  # 每 2 像素采样一次
+            segments = []  # 存储 (t_start, t_end) 对
+            current_start = None
+            
+            for i in range(num_samples + 1):
+                t = float(i) / float(num_samples)
+                px = gx1 + t * (gx2 - gx1)
+                py = gy1 + t * (gy2 - gy1)
+                
+                in_zone = _point_in_any_zone(px, py, zones)
+                
+                if not in_zone:
+                    if current_start is None:
+                        current_start = t
+                else:
+                    if current_start is not None:
+                        # 结束当前片段
+                        t_end = float(i - 1) / float(num_samples)
+                        segments.append((current_start, t_end))
+                        current_start = None
+            
+            # 处理最后一个片段
+            if current_start is not None:
+                segments.append((current_start, 1.0))
+            
+            # 将每个片段转换回 ROI 坐标并添加到结果
+            for t_start, t_end in segments:
+                seg_x1 = x1 + t_start * (x2 - x1)
+                seg_y1 = y1 + t_start * (y2 - y1)
+                seg_x2 = x1 + t_end * (x2 - x1)
+                seg_y2 = y1 + t_end * (y2 - y1)
+                
+                seg_len = float(np.hypot(seg_x2 - seg_x1, seg_y2 - seg_y1))
+                if seg_len >= min_segment_len:
+                    result.append(np.array([seg_x1, seg_y1, seg_x2, seg_y2], dtype=float))
+        except Exception:
+            # 出错时保留原直线
+            result.append(line)
+    
+    return result
 
 # ====================================================================================
 # --- 水平延长“栅栏”历史缓存 (基于前若干帧竖直边位置) ---
@@ -2797,6 +2952,17 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                     edges_for_e[mask_lines > 0] = 0
             except Exception:
                 pass
+            # 重新应用 exclusion zones 屏蔽，避免 MORPH_CLOSE 将边缘扩展进入屏蔽区域
+            try:
+                _line_name_e = params.get('_RUNTIME_LINE_NAME', '')
+                _cam_index_e = params.get('_RUNTIME_CAM_INDEX', -1)
+                _roi_x_e = int(params.get('_RUNTIME_ROI_X', 0))
+                _roi_y_e = int(params.get('_RUNTIME_ROI_Y', 0))
+                _exclusion_zones_e = get_exclusion_zones(_line_name_e, _cam_index_e)
+                if _exclusion_zones_e and edges_for_e is not None:
+                    edges_for_e = apply_exclusion_zones_to_edges(edges_for_e, _roi_x_e, _roi_y_e, _exclusion_zones_e)
+            except Exception:
+                pass
 
         # DEBUG: 记录“屏蔽带过滤后仍存在的 Canny 边缘”，用于外层调试叠加显示
         try:
@@ -4445,6 +4611,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     # 应用不检测区域遮罩（仅对 Line2/Line3 的 cam3 生效）
     # 从 params 中获取 lineName 和 cam_index（由上层调用者注入）
+    _exclusion_zones = []
     try:
         _line_name = params.get('_RUNTIME_LINE_NAME', '')
         _cam_index = params.get('_RUNTIME_CAM_INDEX', -1)
@@ -4504,6 +4671,15 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     )
     
     main_edges = merge_lines_and_get_main_edges(raw_lines, params, pixels_per_mm, edge_img=hough_edges)
+
+    # 裁剪穿过 exclusion zones 的主边（在 zone 边界处切断）
+    # 这是必要的，因为 Hough 变换的 maxLineGap 参数允许直线跨越空白区域
+    if _exclusion_zones and main_edges:
+        # before_count = len(main_edges)
+        main_edges = clip_lines_at_exclusion_zones(main_edges, x, y, _exclusion_zones, min_segment_len=20.0)
+        # after_count = len(main_edges)
+
+
 
     # 运行时：根据上层注入的 DEFECT_DETECTION.Q_ENABLED 控制是否生成/绘制 Q
     try:
@@ -4864,6 +5040,16 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             else:
                 _roi_ideal_vertical_cache.pop(roi_key_for_cache, None)
     # 计算本帧（该 ROI）主边之间的有效相交点（仅在本 ROI 范围内）
+    # 在此之前，再次对所有主边（包括恢复的缓存边和共享边）进行 exclusion zones 裁剪
+    if _exclusion_zones and main_edges:
+        before_count = len(main_edges)
+        main_edges = clip_lines_at_exclusion_zones(main_edges, x, y, _exclusion_zones, min_segment_len=20.0)
+        after_count = len(main_edges)
+        if before_count != after_count:
+            # 这里的数量变化可能不明显，因为 clip 可能会把一条线变成多条，或者只是缩短，也可能删除短线
+            # 但为了调试，我们还是打印一下
+            pass # print(f"    [DEBUG] 最终裁剪主边: {before_count} -> {after_count} (exclusion zones)")
+
     intersections_frame = []
     if main_edges and len(main_edges) >= 2:
         H_roi, W_roi = roi_gray.shape[:2]
@@ -4877,6 +5063,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     intersections_frame.append((int(round(x_int)), int(round(y_int))))
     # 打印每帧交点信息（ROI级别）
     # 不再打印 intersections_frame 调试信息
+    # 注入 ROI 全局坐标，便于在 E 类型缺陷检测中重新应用 exclusion zones
+    params['_RUNTIME_ROI_X'] = x
+    params['_RUNTIME_ROI_Y'] = y
     dbg_local = {} if dbg_edges_after_suppress is not None else None
     edges_for_drawing, all_defects, paired_corners = find_and_analyze_defects(
         main_edges,
@@ -4946,6 +5135,42 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         
         # --- MODIFICATION START: Introduce a flag to mark defects for filtering ---
         should_be_filtered = False
+
+        # --- EXCLUSION ZONES CHECK FOR TYPE 'E' ---
+        # 如果是 'E' 类型缺陷，检查其位置是否与 exclusion zones 重叠
+        if defect['type'] == 'E' and _exclusion_zones:
+            try:
+                # 收集缺陷的关键点（全局坐标）
+                check_points = []
+                if 'box_points' in defect:
+                    box = defect.get('box_points')
+                    if isinstance(box, (list, np.ndarray)):
+                        # box_points 是 ROI 局部坐标，需转换为全局
+                        for pt in box:
+                            check_points.append((float(pt[0]) + x, float(pt[1]) + y))
+                elif 'center' in defect:
+                    c = defect.get('center')
+                    check_points.append((float(c[0]) + x, float(c[1]) + y))
+                
+                # 检查任一点是否在 exclusion zones 内
+                for px, py in check_points:
+                    in_zone = False
+                    for zone in _exclusion_zones:
+                        zx = zone.get('x', 0)
+                        zy = zone.get('y', 0)
+                        zw = zone.get('width', 0)
+                        zh = zone.get('height', 0)
+                        if zx <= px <= zx + zw and zy <= py <= zy + zh:
+                            in_zone = True
+                            break
+                    if in_zone:
+                        should_be_filtered = True
+                        # print(f"    [DEBUG] 过滤 E 缺陷: 点({px:.1f},{py:.1f}) 在 exclusion zone 内")
+                        break
+            except Exception:
+                pass
+        # --- END EXCLUSION ZONES CHECK ---
+
         # --- MODIFICATION END ---
         if defect['type'] in ('X', 'E'):
             # 支持两种 X：
@@ -5287,6 +5512,11 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         vertical_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('VERTICAL_ANGLE_TOL_DEG', 10.0))
     except Exception:
         vertical_tol_deg = 10.0
+    # 近水平容忍角度：角度 <= tol 视为近水平（默认与竖直相同）
+    try:
+        horizontal_tol_deg = float(params.get('DEFECT_DETECTION', {}).get('HORIZONTAL_ANGLE_TOL_DEG', vertical_tol_deg))
+    except Exception:
+        horizontal_tol_deg = vertical_tol_deg
     def _line_angle_deg(line):
         x1, y1, x2, y2 = map(float, line)
         dx, dy = (x2 - x1), (y2 - y1)
@@ -5295,19 +5525,27 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
             ang = 180.0 - ang
         return ang  # [0,90]
     near_vertical_count = 0
+    near_horizontal_count = 0
     try:
         for e in main_edges:
             ang = _line_angle_deg(e)
             if ang >= (90.0 - vertical_tol_deg):
                 near_vertical_count += 1
+            elif ang <= horizontal_tol_deg:
+                near_horizontal_count += 1
     except Exception:
         near_vertical_count = 0
+        near_horizontal_count = 0
+
+    # edges_found 只统计水平或竖直的有效主边，用于更精准的玻璃存在判定
+    valid_edges_found = near_vertical_count + near_horizontal_count
 
     roi_report = {
         "roi_idx": roi_idx, "x": x, "y": y, "w": w, "h": h,
         "defects": [d.copy() for d in final_defects_for_report],
-        "edges_found": len(main_edges),
-        "near_vertical_line_count": int(near_vertical_count)
+        "edges_found": valid_edges_found,  # 修改为只统计水平/竖直主边
+        "near_vertical_line_count": int(near_vertical_count),
+        "near_horizontal_line_count": int(near_horizontal_count)
     }
     for d in roi_report['defects']:
         d.pop('raw_defect', None)
@@ -5586,8 +5824,14 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
     if not hough_params:
         raise ValueError("Configuration error: 'hough_inspector_params' section not found in the config file.")
 
+
     sys_params = config.get('system_params', {})
     pixels_per_mm = float(sys_params.get('pixels_per_mm', 1.0))
+
+    # 获取 Exclusion Zones (用于预处理阶段过滤共享竖直边)
+    _line_name_run = hough_params.get('_RUNTIME_LINE_NAME', '')
+    _cam_index_run = hough_params.get('_RUNTIME_CAM_INDEX', -1)
+    _exclusion_zones_run = get_exclusion_zones(_line_name_run, _cam_index_run)
 
     try:
         roi_threads_cfg = int(sys_params.get('roi_threads', 0) or 0)
@@ -5704,6 +5948,12 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
                     maxLineGap=max_line_gap_px_i,
                 )
                 merged = merge_lines_and_get_main_edges(raw, hough_params, pixels_per_mm, edge_img=edge_img)
+                
+                # 预处理阶段：对 merged 列表应用 exclusion zones 屏蔽
+                if _exclusion_zones_run and merged:
+                    # 使用较小的 segments 丢弃阈值（如10px），避免过度碎片化，但要切断穿过区域
+                    merged = clip_lines_at_exclusion_zones(merged, rx, ry, _exclusion_zones_run, min_segment_len=10.0)
+
                 for seg in merged:
                     try:
                         x1,y1,x2,y2 = map(float, seg)

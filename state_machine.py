@@ -350,12 +350,32 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             
             # 切片数 = 看到竖直边的中间相机数 + 1
             piece_count = middle_cams_with_vertical + 1
+
+            # 特殊情况处理：若配置为 5 相机但只有 Cam3 (index 2) 看到且 expected_cams=5，
+            # 逻辑上 middle_cams_with_vertical=1 -> quantity=2. Correct.
+            # 但若用户测试时仅用单一相机 Cam3，且 num_cameras=1, 则 expected 可能为 1
+            # 此时 first=0, last=0. ci=2. ci!=first, ci!=last. middle+=1. quantity=2. Correct.
+            
+            # 兜底：如果检测到 vertical edge 的数量 > 0 但 middle_cams 為 0 (都被过滤了)
+            # 检查是否有相机 index 2 (中间相机) 看到 vertical edge
+            if middle_cams_with_vertical == 0:
+                # 检查是否存在 index=2 的相机看到了竖直边（针对 Line3 Cam3 测试）
+                # 即使 expected_cams 配置偏差，Cam3 物理上是中间，应算切分
+                if cam_vertical_counts.get('2', 0) >= 1 or cam_vertical_counts.get('3', 0) >= 1:
+                     # 再次确认不是边缘 (针对 expected_cams 极小的情况，cam 2 可能是边缘?)
+                     # 在 Line3 (5 cam) 中, 0,4 是边缘. 2 是中间.
+                     # 只要 index 2 有竖直边，且 expected_cams >= 3，它就一定是中间
+                     if n >= 3:
+                         if cam_vertical_counts.get('2', 0) >= 1:
+                             middle_cams_with_vertical += 1
+            
+            piece_count = middle_cams_with_vertical + 1
             
             # 根据相机数量限制最大切片数
             # 5相机: 最大4片; 4相机: 最大3片
             max_pieces = 4 if n >= 5 else 3
             piece_count = max(1, min(max_pieces, piece_count))
-            
+
             return piece_count
             
         except Exception:
@@ -374,21 +394,40 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
 
 
     def _gather_defect_centers_for_cam(result_obj: dict) -> list[float]:
-        """提取单相机内缺陷的 x 中心（像素）。优先 location(x,width)，否则 center[0]；无法得到返回空。"""
+        """提取单相机内缺陷的 x 中心（像素）。
+        
+        优先级：
+        1. location['x'] - 这是全局坐标，直接表示缺陷位置
+        2. raw_defect['center'][0] - 备选方案，从原始缺陷对象获取
+        3. defect['center'][0] - 进一步备选
+        """
         xs = []
         try:
             for d in result_obj.get('defects', []):
                 loc = d.get('location', {}) if isinstance(d.get('location'), dict) else {}
-                if 'x' in loc and 'width' in loc:
+                # 优先使用 location['x'] - 这是已经转换到全局坐标的 x 位置
+                if 'x' in loc:
                     try:
-                        xs.append(float(loc.get('x', 0) or 0) + float(loc.get('width', 0) or 0) / 2.0)
-                        continue
+                        x_val = float(loc.get('x', 0) or 0)
+                        if x_val > 0:  # 有效的 x 坐标
+                            xs.append(x_val)
+                            continue
                     except Exception:
                         pass
-                c = d.get('center')
+                # 备选：从 raw_defect 中获取 center
+                raw = d.get('raw_defect', {}) if isinstance(d.get('raw_defect'), dict) else {}
+                c = raw.get('center')
                 if isinstance(c, (list, tuple)) and len(c) >= 2:
                     try:
                         xs.append(float(c[0]))
+                        continue
+                    except Exception:
+                        pass
+                # 进一步备选：直接从 defect 顶层获取 center
+                c2 = d.get('center')
+                if isinstance(c2, (list, tuple)) and len(c2) >= 2:
+                    try:
+                        xs.append(float(c2[0]))
                     except Exception:
                         pass
         except Exception:
