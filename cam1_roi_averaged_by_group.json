@@ -1,0 +1,19 @@
+{
+    "group_with_2_rois": {
+        "source_image_count": 1,
+        "averaged_rois": [
+            {
+                "x": 407,
+                "y": 449,
+                "width": 2021,
+                "height": 195
+            },
+            {
+                "x": 416,
+                "y": 1005,
+                "width": 2013,
+                "height": 166
+            }
+        ]
+    }
+}

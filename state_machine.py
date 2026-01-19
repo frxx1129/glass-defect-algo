@@ -75,6 +75,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     machine_state = "WAITING_FOR_PANE"
     machine_state_shared.value = 0 
     last_camera_states = np.zeros(num_cameras, dtype=np.int32)
+    last_camera_vertical_flags = np.zeros(num_cameras, dtype=bool)
+    last_camera_horizontal_flags = np.zeros(num_cameras, dtype=bool)
     current_pane_ng_buffer = []  # 收集该片玻璃所有 NG 帧的原始结果（含图像缓冲）
     current_pane_reports = []    # 收集该片玻璃所有 NG 报告（即时写入 JSON）
     current_pane_folder = None   # 当前玻璃的存储文件夹
@@ -146,6 +148,10 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
     last_result_by_cam = {}        # 最近一帧NG结果（含缺陷坐标）的引用
     # 新增：按整片玻璃周期统计的“竖直边总数”的最大值（跨相机求和，跨时刻取最大）
     pane_max_total_vertical_count = 0
+    # 新增：每个相机在当前玻璃周期内看到的最大竖直边数量（key: cam_idx int, value: int）
+    last_vertical_counts_by_cam = {}
+    # 新增：记录每个相机看到竖直边的具体位置信息（key: cam_idx int, value: set of strings）
+    last_vertical_details_by_cam = {}
     # 新增：已打印的切片数（用于避免重复打印）
     last_printed_piece_count = 0
 
@@ -317,7 +323,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         - 1个中间相机看到竖直边 -> 2片（切1刀）
         - 2个中间相机看到竖直边 -> 3片（切2刀，最大）
         
-        相机配置：
+        相机配置（内部索引为0-based，websocket URL为1-based但内部转换为0-based）：
         - Line2/Line3: 5台相机 (index 0,1,2,3,4)，边缘相机为 0 和 4
         - Line1: 4台相机 (index 0,1,2,3)，边缘相机为 0 和 3
         """
@@ -326,7 +332,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             if n <= 0:
                 return 1
             
-            # 定义边缘相机索引
+            # 定义边缘相机索引（0-based，内部表示）
             first_cam = 0
             last_cam = max(0, n - 1)
             
@@ -356,14 +362,14 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             # 但若用户测试时仅用单一相机 Cam3，且 num_cameras=1, 则 expected 可能为 1
             # 此时 first=0, last=0. ci=2. ci!=first, ci!=last. middle+=1. quantity=2. Correct.
             
-            # 兜底：如果检测到 vertical edge 的数量 > 0 但 middle_cams 為 0 (都被过滤了)
-            # 检查是否有相机 index 2 (中间相机) 看到 vertical edge
+            # 兜底：如果检测到 vertical edge 的数量 > 0 但 middle_cams 为 0 (都被过滤了)
+            # 检查是否有中间相机看到 vertical edge（0-based索引）
             if middle_cams_with_vertical == 0:
-                # 检查是否存在 index=2 的相机看到了竖直边（针对 Line3 Cam3 测试）
-                # 即使 expected_cams 配置偏差，Cam3 物理上是中间，应算切分
+                # 检查是否存在 index=2 的相机看到了竖直边（针对 Line3 Cam3 测试，0-based: cam3=index2）
+                # 即使 expected_cams 配置偏差，Cam3（index 2）物理上是中间，应算切分
                 if cam_vertical_counts.get('2', 0) >= 1 or cam_vertical_counts.get('3', 0) >= 1:
-                     # 再次确认不是边缘 (针对 expected_cams 极小的情况，cam 2 可能是边缘?)
-                     # 在 Line3 (5 cam) 中, 0,4 是边缘. 2 是中间.
+                     # 再次确认不是边缘 (针对 expected_cams 极小的情况)
+                     # 在 Line3 (5 cam, 0-based) 中, 0和4 是边缘. 2 是中间.
                      # 只要 index 2 有竖直边，且 expected_cams >= 3，它就一定是中间
                      if n >= 3:
                          if cam_vertical_counts.get('2', 0) >= 1:
@@ -663,7 +669,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         nonlocal machine_state, last_camera_states, current_pane_ng_buffer, current_pane_reports, current_pane_folder
         nonlocal pane_ng_frame_counter, max_complexity_snapshot, is_current_event_rejected, manual_reject_active_mode
         nonlocal rejection_details, saved_for_this_pane, presence_streak, absence_streak, pane_enter_time_s
-        nonlocal auto_ng_cams, last_result_by_cam, pane_max_total_vertical_count
+        nonlocal auto_ng_cams, last_result_by_cam, pane_max_total_vertical_count, last_vertical_counts_by_cam, last_vertical_details_by_cam
+        nonlocal last_camera_vertical_flags, last_camera_horizontal_flags
         try:
             machine_state = "WAITING_FOR_PANE"
             machine_state_shared.value = 0
@@ -671,6 +678,8 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             pass
         try:
             last_camera_states[:] = 0
+            last_camera_vertical_flags[:] = False
+            last_camera_horizontal_flags[:] = False
         except Exception:
             pass
         try:
@@ -693,7 +702,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
         first_presence_cam_idx = None
         first_presence_roi_idx = None
         try:
-            auto_ng_cams.clear(); last_result_by_cam.clear()
+            auto_ng_cams.clear(); last_result_by_cam.clear(); last_vertical_counts_by_cam.clear(); last_vertical_details_by_cam.clear()
         except Exception:
             pass
         pane_max_total_vertical_count = 0
@@ -785,9 +794,45 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             if cam_index >= len(last_camera_states):
                 last_camera_states = np.pad(last_camera_states, (0, cam_index - len(last_camera_states) + 1), 'constant')
                 max_complexity_snapshot = np.pad(max_complexity_snapshot, (0, cam_index - len(max_complexity_snapshot) + 1), 'constant')
+                last_camera_vertical_flags = np.pad(last_camera_vertical_flags, (0, cam_index - len(last_camera_vertical_flags) + 1), 'constant')
+                last_camera_horizontal_flags = np.pad(last_camera_horizontal_flags, (0, cam_index - len(last_camera_horizontal_flags) + 1), 'constant')
 
             last_camera_states[cam_index] = result['state_code']
+            
+            # --- 更新当前相机的（本帧）竖直/水平 状态位 ---
+            _frame_v_cnt = 0
+            _frame_h_cnt = 0
+            for _r in result.get('rois', []) or []:
+                try:
+                    _ef = int(_r.get('edges_found', 0) or 0)
+                    _vl = int(_r.get('near_vertical_line_count', 0) or 0)
+                    _frame_v_cnt += _vl
+                    _frame_h_cnt += max(0, _ef - _vl)
+                except Exception:
+                    pass
+            last_camera_vertical_flags[cam_index] = (_frame_v_cnt > 0)
+            last_camera_horizontal_flags[cam_index] = (_frame_h_cnt > 0)
+
             current_total_panes = int(np.sum(last_camera_states))
+
+            # --- 计算新的进入触发条件 ---
+            # 条件：(两侧任一相机看到竖直边) AND (所有任一相机看到水平边)
+            _n_current_cams = len(last_camera_states)
+            _exp_cams = int(getattr(shared_settings, 'expected_cameras', _n_current_cams) or _n_current_cams)
+            # 边缘相机索引：0-based，内部表示 (cam0=0, camN-1=N-1)
+            _idx_first = 0
+            _idx_last = max(0, _exp_cams - 1)
+            
+            _has_side_vert = False
+            if _idx_first < len(last_camera_vertical_flags) and last_camera_vertical_flags[_idx_first]:
+                _has_side_vert = True
+            if _idx_last < len(last_camera_vertical_flags) and last_camera_vertical_flags[_idx_last]:
+                _has_side_vert = True
+                
+            _has_any_horz = np.any(last_camera_horizontal_flags)
+            
+            # 新的进入触发标记
+            entry_trigger = (_has_side_vert and _has_any_horz)
 
             # 对外广播：仅在“玻璃进入事件(检测窗口)”内允许出现 NG。
             # 说明：广播发生在进入判定逻辑之前，因此这里需要“预测”本帧是否将触发进入。
@@ -797,7 +842,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
             ws_data = {k: v for k, v in result.items() if k not in ('annotated_image_buffer', 'raw_image_buffer')}
             try:
                 will_enter_now = False
-                if machine_state == "WAITING_FOR_PANE" and current_total_panes > 0:
+                if machine_state == "WAITING_FOR_PANE" and entry_trigger:
                     next_presence = presence_streak + 1
                     will_enter_now = (next_presence >= ENTER_CONFIRM_FRAMES)
 
@@ -832,9 +877,10 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         _mem_str = f" | 内存: {_mem_gb:.2f}GB" if _mem_gb is not None else ""
                         # 计算并打印本片玻璃的切片数
                         try:
-                            vertical_counts = {str(ci): _count_near_vertical_per_cam(res) for ci, res in last_result_by_cam.items()}
+                            # 离开时优先使用累计的最大竖直边计数
+                            vertical_counts_str = {str(ci): cnt for ci, cnt in last_vertical_counts_by_cam.items()}
                             expected = int(num_cameras or 5)
-                            final_piece_count = _estimate_piece_count(vertical_counts, expected)
+                            final_piece_count = _estimate_piece_count(vertical_counts_str, expected)
                             print(f"--- [状态机]: 玻璃离开事件 (切{final_piece_count}片) ---{_mem_str}")
                         except Exception:
                             print(f"--- [状态机]: 玻璃离开事件 ---{_mem_str}")
@@ -877,7 +923,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                             broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
                         is_current_event_rejected = False
                         # 重置自动分路聚合状态
-                        auto_ng_cams.clear(); last_result_by_cam.clear()
+                        auto_ng_cams.clear(); last_result_by_cam.clear(); last_vertical_counts_by_cam.clear()
                         pane_max_total_vertical_count = 0
                         pane_enter_time_s = None
                         continue
@@ -891,9 +937,9 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         _mem_str = f" | 内存: {_mem_gb:.2f}GB" if _mem_gb is not None else ""
                         # 计算并打印本片玻璃的切片数
                         try:
-                            vertical_counts = {str(ci): _count_near_vertical_per_cam(res) for ci, res in last_result_by_cam.items()}
+                            vertical_counts_str = {str(ci): cnt for ci, cnt in last_vertical_counts_by_cam.items()}
                             expected = int(num_cameras or 5)
-                            final_piece_count = _estimate_piece_count(vertical_counts, expected)
+                            final_piece_count = _estimate_piece_count(vertical_counts_str, expected)
                             print(f"--- [状态机]: 玻璃检测超时（>{pane_max_duration_s:.1f}s），强制退出 (切{final_piece_count}片) ---{_mem_str}")
                         except Exception:
                             print(f"--- [状态机]: 玻璃检测超时（>{pane_max_duration_s:.1f}s），强制退出 ---{_mem_str}")
@@ -930,7 +976,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                                 yield_manager.save_stats(last_reset_date_str, total_yield, total_rejections)
                             broadcast_yield_and_rejections(shared_settings, shared_collection_id, shared_yield_counter, shared_rejection_counter, http_client)
                         is_current_event_rejected = False
-                        auto_ng_cams.clear(); last_result_by_cam.clear()
+                        auto_ng_cams.clear(); last_result_by_cam.clear(); last_vertical_counts_by_cam.clear()
                         pane_max_total_vertical_count = 0
                         pane_enter_time_s = None
                         continue
@@ -1000,6 +1046,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                     except Exception:
                         pass
                     try:
+                        # 文件名使用 1-based 索引，与前端一致（内部0对应前端cam1）
                         cam_disp = int(result['camera_index']) + 1
                     except Exception:
                         cam_disp = result.get('camera_index', 'X')
@@ -1025,45 +1072,81 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         slim.pop('annotated_image_buffer', None)
                         slim.pop('raw_image_buffer', None)
                         last_result_by_cam[cam_i] = slim
-                        
-                        # 实时计算并打印切片数（仅在切片数变化时打印）
-                        try:
-                            expected = int(getattr(shared_settings, 'expected_cameras', num_cameras) or num_cameras)
-                            vert_counts = {str(ci): _count_near_vertical_per_cam(res) for ci, res in last_result_by_cam.items()}
-                            current_piece_count = _estimate_piece_count(vert_counts, expected)
-                            if current_piece_count != last_printed_piece_count:
-                                last_printed_piece_count = current_piece_count
-                                # 统计哪些中间相机看到了竖直边
-                                first_cam, last_cam = 0, max(0, expected - 1)
-                                cams_with_vert = [ci for ci, cnt in vert_counts.items() if int(ci) != first_cam and int(ci) != last_cam and int(cnt) >= 1]
-                                if cams_with_vert:
-                                    cams_str = ','.join([f'cam{c}' for c in sorted(int(c) for c in cams_with_vert)])
-                                    print(f"    [状态机]: 检测到切{current_piece_count}片 ({cams_str}看到竖直边)")
-                        except Exception:
-                            pass
                     except Exception:
                         pass
 
                 if np.sum(last_camera_states) > np.sum(max_complexity_snapshot):
                     max_complexity_snapshot = last_camera_states.copy()
 
+                # --- 实时更新竖直边计数（此时机覆盖所有帧，包括 OK 帧）---
+                if current_total_panes > 0:
+                    try:
+                        c_idx = int(result.get('camera_index', -1))
+                        if c_idx >= 0:
+                            v_cnt = _count_near_vertical_per_cam(result)
+                            # 使用 max 累积该相机在本片玻璃内的最大竖直边数
+                            last_vertical_counts_by_cam[c_idx] = max(last_vertical_counts_by_cam.get(c_idx, 0), v_cnt)
+                            
+                            if v_cnt > 0:
+                                try:
+                                    _rois = result.get('rois', [])
+                                    _found_details = set()
+                                    _cam_w = float(getattr(shared_settings, 'cam_width', 2448) or 2448)
+                                    _cam_h = float(getattr(shared_settings, 'cam_height', 2048) or 2048)
+                                    for _r in _rois:
+                                        if int(_r.get('near_vertical_line_count', 0) or 0) > 0:
+                                            _rx, _ry = int(_r.get('x',0)), int(_r.get('y',0))
+                                            _rw, _rh = int(_r.get('w',0)), int(_r.get('h',0))
+                                            _cx, _cy = _rx + _rw/2.0, _ry + _rh/2.0
+                                            _h_pos = "左" if _cx < (_cam_w/2.0) else "右"
+                                            _v_pos = "上" if _cy < (_cam_h/2.0) else "下"
+                                            _ridx = _r.get('roi_idx', '?')
+                                            _found_details.add(f"ROI{_ridx}{_h_pos}{_v_pos}侧({_rx},{_ry})")
+                                    if _found_details:
+                                        _existing = last_vertical_details_by_cam.get(c_idx, set())
+                                        _existing.update(_found_details)
+                                        last_vertical_details_by_cam[c_idx] = _existing
+                                except Exception:
+                                    pass
+
+                            # 实时计算并打印切片数
+                            try:
+                                expected = int(getattr(shared_settings, 'expected_cameras', num_cameras) or num_cameras)
+                                vert_counts_str = {str(ci): cnt for ci, cnt in last_vertical_counts_by_cam.items()}
+                                current_piece_count = _estimate_piece_count(vert_counts_str, expected)
+                                if current_piece_count != last_printed_piece_count:
+                                    last_printed_piece_count = current_piece_count
+                                    # 0-based索引：边缘相机为 0 和 expected-1
+                                    first_cam, last_cam = 0, max(0, expected - 1)
+                                    cams_with_vert = [ci for ci, cnt in last_vertical_counts_by_cam.items() if int(ci) != first_cam and int(ci) != last_cam and int(cnt) >= 1]
+                                    if cams_with_vert:
+                                        _info_parts = []
+                                        for _c in sorted(int(c) for c in cams_with_vert):
+                                            _d_set = last_vertical_details_by_cam.get(_c, set())
+                                            _d_str = f"[{','.join(sorted(list(_d_set)))}]" if _d_set else ""
+                                            # 显示时使用 1-based 索引，与前端一致（内部0对应前端cam1）
+                                            _info_parts.append(f"cam{_c + 1}{_d_str}")
+                                        print(f"    [状态机]: 检测到切{current_piece_count}片 ({','.join(_info_parts)}看到切片)")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
                 auto_reject_ready = (current_total_panes > 0 and shared_rejection_mode.value == 1 and result.get('should_reject', False))
                 if auto_reject_ready:
                     expected = int(getattr(shared_settings, 'expected_cameras', num_cameras) or num_cameras)
                     marks = None
-                    vertical_counts = {}
+                    # 使用累积的 last_vertical_counts_by_cam 构建 vertical_counts_str
+                    vertical_counts_str = {str(ci): cnt for ci, cnt in last_vertical_counts_by_cam.items()}
                     try:
-                        for ci, res in last_result_by_cam.items():
-                            vertical_counts[ci] = _count_near_vertical_per_cam(res)
                         piece_count_override = None
-                        if vertical_counts:
-                            # 使用增强版分片估计：基于"哪些相机出现多条竖直线"推断
-                            # 而非简单计数总竖直线
+                        if vertical_counts_str:
+                            # 分片估计直接使用累积的计数值
                             piece_count_override = _estimate_piece_count_with_validation(
-                                vertical_counts, expected, last_result_by_cam
+                                vertical_counts_str, expected, last_result_by_cam
                             )
                             marks = _decide_marks_by_pieces_and_positions(
-                                vertical_counts, last_result_by_cam, expected, shared_settings,
+                                vertical_counts_str, last_result_by_cam, expected, shared_settings,
                                 piece_count_override=piece_count_override
                             )
                     except Exception as e:
@@ -1095,7 +1178,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
 
                         # 统计与上传仍按"每片玻璃只计一次"的原则：
                         # 第一次触发自动剔废时更新 rejection_details 和全局计数，其余帧只做硬件剔废，不再重复计数。
-                        log_counts = vertical_counts if vertical_counts else 'N/A'
+                        log_counts = vertical_counts_str if vertical_counts_str else 'N/A'
                         if not is_current_event_rejected:
                             is_current_event_rejected = True
                             saved_for_this_pane = True
@@ -1163,7 +1246,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         send_reports_batch_to_server(current_pane_reports, [r.get('annotated_image_buffer') for r in current_pane_ng_buffer], shared_settings.upload_url, http_client, upload_timeout_s=getattr(shared_settings, 'http_upload_timeout_s', 30))
 
             elif machine_state == "WAITING_FOR_PANE":
-                if current_total_panes > 0:
+                if entry_trigger:
                     presence_streak += 1
                     # 记录首次出现 state_code>0 的相机与其触发 ROI（只记录一次）
                     try:
@@ -1217,7 +1300,7 @@ def results_and_state_machine_thread(num_cameras, results_queue, connection_mana
                         presence_streak = 0
                         absence_streak = 0
                         # 重置自动分路聚合状态
-                        auto_ng_cams.clear(); last_result_by_cam.clear()
+                        auto_ng_cams.clear(); last_result_by_cam.clear(); last_vertical_counts_by_cam.clear()
                         pane_max_total_vertical_count = 0
                         last_printed_piece_count = 0
                         if alarm_light_controller and getattr(alarm_light_controller, 'is_active', False):

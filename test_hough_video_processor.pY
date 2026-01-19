@@ -271,7 +271,11 @@ def main():
                 cam_match = re.search(r'cam(\d+)', file_lower)
                 if cam_match:
                     cam_num = int(cam_match.group(1))
-                    effective_cam_index = cam_num - 1 if cam_num >= 1 else 0
+                    # Special testing mapping: Line3 Cam2 -> Index 2 (to trigger Cam3 exclusion zones)
+                    if effective_line_name and effective_line_name.lower() == 'line3' and cam_num == 2:
+                        effective_cam_index = 2
+                    else:
+                        effective_cam_index = cam_num - 1 if cam_num >= 1 else 0
             
             gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             # 注意：此处返回的 annotated_image 是用于保存的，不是用于视频流
@@ -285,8 +289,12 @@ def main():
             output_image_path = os.path.join(args.output, f"{base_filename}_annotated.jpg")
             report_output_path = os.path.join(args.output, f"{base_filename}_report.json")
             
-            # 保存结果，并绘制 exclusion zones
-            annotated_image = draw_exclusion_zones(annotated_image, LINE3_CAM3_EXCLUSION_ZONES)
+            # 保存结果，并绘制 exclusion zones (动态获取)
+            try:
+                current_zones = image_processor.get_exclusion_zones(effective_line_name, effective_cam_index)
+                annotated_image = draw_exclusion_zones(annotated_image, current_zones)
+            except Exception:
+                pass
             cv2.imwrite(output_image_path, annotated_image)
             with open(report_output_path, 'w', encoding='utf-8') as f: json.dump(result, f, indent=2, ensure_ascii=False)
 

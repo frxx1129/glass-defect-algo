@@ -87,8 +87,8 @@ LINE3_CAM3_EXCLUSION_ZONES = [
     {"x": 1595, "y": 368, "width": 64, "height": 221},
     {"x": 1397, "y": 366, "width": 261, "height": 39},
     {"x": 1390, "y": 532, "width": 274, "height": 46},
-    {"x": 742, "y": 884, "width": 35, "height": 225},
-    {"x": 745, "y": 877, "width": 283, "height": 92},
+    {"x": 742, "y": 884, "width": 50, "height": 225},
+    {"x": 745, "y": 877, "width": 283, "height": 110},
     {"x": 974, "y": 875, "width": 46, "height": 228},
     {"x": 747, "y": 1064, "width": 271, "height": 30},
     {"x": 1411, "y": 872, "width": 44, "height": 225},
@@ -2923,6 +2923,21 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                         continue
                     x1, y1, x2, y2 = map(int, map(round, clipped))
                     cv2.line(mask_lines, (x1, y1), (x2, y2), 255, suppress_w_eff)
+            
+            # Additional masking for cached ideal vertical edges (fences) and glass boundaries
+            try:
+                if fences:
+                    for fx in fences:
+                        ix = int(round(fx))
+                        if 0 <= ix < W_loc:
+                            cv2.line(mask_lines, (ix, 0), (ix, H_loc - 1), 255, suppress_w_eff)
+                if glass_boundary is not None:
+                     ix = int(round(glass_boundary))
+                     if 0 <= ix < W_loc:
+                         cv2.line(mask_lines, (ix, 0), (ix, H_loc - 1), 255, suppress_w_eff)
+            except Exception:
+                pass
+
             if np.any(mask_lines):
                 edges_work[mask_lines > 0] = 0
         edges_for_e = edges_work
@@ -4629,9 +4644,9 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     except Exception:
         min_len_ratio = 0.05
     try:
-        min_len_mode = str(p_hough.get("MIN_LINE_LENGTH_MODE", "width")).lower()
+        min_len_mode = str(p_hough.get("MIN_LINE_LENGTH_MODE", "min")).lower()
     except Exception:
-        min_len_mode = "width"
+        min_len_mode = "min"
     try:
         roi_h_loc, roi_w_loc = roi_gray.shape[:2]
         if min_len_mode in ("height", "h"):
@@ -5884,6 +5899,29 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
     except Exception:
         cross_enabled = True
 
+    # --- 连续对齐位置高亮逻辑 (Global Highlighting for Consistent Vertical Edges) ---
+    # 目的：如果连续几帧在同一位置（15px半径内）发现竖直边，则在该处绘制半透明绿色圆点
+    try:
+        # 使用模块级全局变量保存状态 (需要在函数外定义或在此处声明global)
+        global _consistent_vert_tracker
+    except Exception:
+        pass
+        
+    # 初始化全局跟踪器 (dict: {cam_idx: {'center': (x,y), 'streak': int, 'last_piece_count': int}})
+    if '_consistent_vert_tracker' not in globals():
+        global _consistent_vert_tracker
+        _consistent_vert_tracker = {}
+
+    current_cam_idx = int(config.get('hough_inspector_params', {}).get('_RUNTIME_CAM_INDEX', -1))
+    
+    # 获取当前帧所有竖直边的重心 (若有)
+    # 为避免遍历所有 merged 线段，我们从结果中收集 vertical edges。但 merged 还未生成，
+    # 这里的 `shared_vertical_global` 逻辑在后半段才运行。
+    # 为了实现效果，我们需要在 `_safe_roi_hough` 内部或之后收集所有竖直边位置。
+    # 鉴于 `shared_vertical_global` 逻辑本就是跨roi收集竖直边，我们可以复用或提前部分逻辑，
+    # 但为了不破坏原有结构，我们在后处理阶段（results循环）再进行统计和绘制。
+    # 这里仅做 tracker 的引用准备。
+
     shared_vertical_global = []
     # 移除跨帧预注入的共享竖直边（不再支持跨帧基线复用）
     if cross_enabled and template_rois:
@@ -5924,12 +5962,16 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
                     continue
                 roi_gray = image_gray[ry:ry+rh, rx:rx+rw]
                 edge_img = preprocess_for_hough_enhanced(roi_gray, hough_params)
+                # 在 Hough 变换之前应用屏蔽区域遮罩，确保屏蔽区域内的边缘像素被清零
+                if _exclusion_zones_run:
+                    edge_img = apply_exclusion_zones_to_edges(edge_img, rx, ry, _exclusion_zones_run)
                 p_h = hough_params.get('HOUGH_TRANSFORM', {})
-                min_len_pixels = roi_gray.shape[1] * p_h.get('MIN_LINE_LENGTH_RATIO', 0.05)
+                # 使用 min(w, h) 而非 w，避免在横向长条 ROI 中漏检竖直边
+                min_len_pixels = float(min(roi_gray.shape[0], roi_gray.shape[1])) * p_h.get('MIN_LINE_LENGTH_RATIO', 0.05)
                 try:
                     min_len_pixels_i = int(max(1, round(float(min_len_pixels))))
                 except Exception:
-                    min_len_pixels_i = max(1, int(roi_gray.shape[1] * 0.05))
+                    min_len_pixels_i = max(1, int(min(roi_gray.shape[0], roi_gray.shape[1]) * 0.05))
                 max_line_gap_px = _get_dist_px(p_h, 'MAX_LINE_GAP_MM', 'MAX_LINE_GAP', None, pixels_per_mm)
                 try:
                     max_line_gap_px_i = int(max(0, round(float(max_line_gap_px)))) if max_line_gap_px is not None else 0
@@ -6073,8 +6115,70 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
         slim_report = {k: roi_report.get(k) for k in ("roi_idx","x","y","w","h","edges_found","near_vertical_line_count")}
         report['rois'].append(slim_report)
 
+    # --- 持续标记切片位置（整个玻璃进入事件期间）---
+    # 使用全局追踪器累积切片位置，玻璃离开时重置
+    try:
+        global _persistent_slice_tracker
+    except Exception:
+        pass
+    if '_persistent_slice_tracker' not in globals():
+        global _persistent_slice_tracker
+        _persistent_slice_tracker = {}  # {cam_idx: {'positions': [(x,y), ...], 'last_state_code': int}}
+
+    current_cam_idx = int(config.get('hough_inspector_params', {}).get('_RUNTIME_CAM_INDEX', -1))
+    
+    # 获取相机总数和边缘相机索引（0-based）
+    try:
+        _sys_params = config.get('system_params', {}) or {}
+        _cam_setup = config.get('camera_setup', {}) or {}
+        _expected_cams = int(_cam_setup.get('expected_cameras', 0) or 0)
+        if _expected_cams <= 0:
+            _expected_cams = int(_sys_params.get('expected_cameras', 5) or 5)
+    except Exception:
+        _expected_cams = 5
+    _first_cam_idx = 0
+    _last_cam_idx = max(0, _expected_cams - 1)
+    _is_edge_camera = (current_cam_idx == _first_cam_idx or current_cam_idx == _last_cam_idx)
+    
+    # 初始化当前相机的追踪器
+    if current_cam_idx not in _persistent_slice_tracker:
+        _persistent_slice_tracker[current_cam_idx] = {'positions': [], 'last_state_code': 0}
+    
+    tracker = _persistent_slice_tracker[current_cam_idx]
+    current_state_code = 1 if max_edges_found > 0 else 0
+    
+    # 检测玻璃离开事件（state_code 从正变为 0）：重置该相机的累积位置
+    if tracker['last_state_code'] > 0 and current_state_code == 0:
+        tracker['positions'] = []
+    tracker['last_state_code'] = current_state_code
+    
+    # 仅非边缘相机时，收集本帧切片位置并累积
+    if not _is_edge_camera and shared_vertical_global and current_state_code > 0:
+        for line in shared_vertical_global:
+            cx = (line[0] + line[2]) / 2.0
+            cy = (line[1] + line[3]) / 2.0
+            # 避免重复添加相近位置（15px 半径内）
+            is_duplicate = False
+            for (ex, ey) in tracker['positions']:
+                if np.hypot(cx - ex, cy - ey) <= 15.0:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                tracker['positions'].append((cx, cy))
+    
+    # 绘制所有累积的切片位置（仅非边缘相机）
+    if not _is_edge_camera and tracker['positions']:
+        try:
+            overlay = final_image.copy()
+            for (px, py) in tracker['positions']:
+                cv2.circle(overlay, (int(px), int(py)), 12, (0, 255, 0), -1)
+            alpha = 0.4
+            cv2.addWeighted(overlay, alpha, final_image, 1 - alpha, 0, final_image)
+        except Exception:
+            pass
+
     # 取消针对 E 类型的帧级竖直主边进入判定：恢复为仅依据是否有主边
-    report["state_code"] = 1 if max_edges_found > 0 else 0
+    report["state_code"] = current_state_code
     # 移除跨帧输出：不再在报告中携带共享竖直边
 
     # ===== DEBUG：在每张输出图上标出 ROI 区域 + Canny 边缘（需要时可整段注释掉） =====
