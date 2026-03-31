@@ -8,6 +8,7 @@
 
 import time
 import json
+import yaml
 import sys
 import re
 import subprocess
@@ -81,15 +82,16 @@ class CameraManager:
             MVTerminateLib()
             cls._lib_initialized = False
 
-    def __init__(self, cam_index, mac=None):
+    def __init__(self, cam_index, mac=None, ip=None):
         """
         初始化相机管理器
         :param cam_index: 配置中的相机索引
         :param mac: 相机的MAC地址（优先使用）
+        :param ip: 直接指定的IP地址，用于快速连接跳过枚举过程
         """
         self.cam_index = cam_index
         self.mac = mac
-        self.ip = None  # 将在open过程中根据MAC查找或设置
+        self.ip = ip  # 将在open过程中根据MAC查找或设置
         self.handle = 0
         self.opened_physical_index = None  # SDK看到的实际索引
         self.max_open_attempts = 3
@@ -102,6 +104,27 @@ class CameraManager:
         """
         CameraManager.ensure_lib_initialized()
         
+        # === 快速通道：如果已有具体的 IP，跳过耗时的枚举直接打开 ===
+        if self.ip:
+            print(f"[相机进程 {self.cam_index}]: 已有IP {self.ip}，尝试优先直接打开相机...")
+            try:
+                res, self.handle = MVOpenCamByIP(self.ip)
+                if res == MVST_SUCCESS and self.handle != 0:
+                    try:
+                        MVSetHeartbeatTimeout(self.handle, int(self.heartbeat_timeout_ms))
+                    except Exception:
+                        pass
+                    print(f"✅ [相机进程 {self.cam_index}]: 相机已通过预设IP {self.ip} 成功快速打开")
+                    return True
+                else:
+                    print(f"[相机进程 {self.cam_index}]: 直接通过预设IP {self.ip} 打开失败(错误码:{res})，退回常规流程...")
+                    self.handle = 0
+            except Exception as e:
+                print(f"[相机进程 {self.cam_index}]: 直接通过预设IP {self.ip} 打开出错: {e}，退回常规流程...")
+                self.handle = 0
+
+        # === 以下为常规枚举与打开流程 ===
+
         # 步骤1: 使用MVEnumerateAllDevices确保我们能看到所有相机，包括不在同一网段的
         res_enum, num_all_cams = MVEnumerateAllDevices()
         
@@ -273,7 +296,12 @@ class CameraManager:
             idx = self.opened_physical_index if self.opened_physical_index is not None else self.cam_index
             res, cam_info = MVGetDevInfo(idx)
             if res != MVST_SUCCESS:
-                hardware_info = {"error": "Failed to get device info"}
+                hardware_info = {
+                    'model_name': 'Unknown',
+                    'mac_address': self.mac or '',
+                    'ip_address': self.ip or '',
+                    'error': 'Failed to get device info fallback'
+                }
             else:
                 try:
                     model = cam_info.mModelName.decode('ascii', errors='ignore').strip('\x00')
@@ -821,15 +849,23 @@ class MultiCameraSetup:
         # 更新配置
         if "camera_setup" not in self.config:
             self.config["camera_setup"] = {}
-            
         self.config["camera_setup"]["camera_bindings"] = new_bindings
         self.config["camera_setup"]["expected_cameras"] = len(new_bindings)
-        
+
         # 保存配置
         try:
-            with open('config.json', 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, ensure_ascii=False, indent=2)
-            print(f"[SetupTool]: ✅ 已将 {len(new_bindings)} 台相机的映射信息保存到config.json")
+            cfg_path = str(self.config.get('__config_path', '') or '')
+            if not cfg_path:
+                cfg_path = 'config.yaml' if os.path.exists('config.yaml') else 'config.json'
+            cfg_to_save = dict(self.config)
+            cfg_to_save.pop('__config_path', None)
+            if cfg_path.endswith(('.yml', '.yaml')):
+                with open(cfg_path, 'w', encoding='utf-8') as f:
+                    yaml.safe_dump(cfg_to_save, f, allow_unicode=True, sort_keys=False)
+            else:
+                with open(cfg_path, 'w', encoding='utf-8') as f:
+                    json.dump(cfg_to_save, f, ensure_ascii=False, indent=2)
+            print(f"[SetupTool]: ✅ 已将 {len(new_bindings)} 台相机的映射信息保存到{cfg_path}")
             
             # 打印映射信息
             print("[SetupTool]: 相机映射信息:")

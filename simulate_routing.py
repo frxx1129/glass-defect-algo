@@ -13,16 +13,30 @@
 - 3: 最左边那片(仅3片时)
 """
 
-def simulate_piece_count(cams_with_vertical: list[int], expected_cams: int) -> int:
+
+
+def simulate_piece_count(cams_with_vertical: list[int], expected_cams: int, cam_vertical_coords: dict | None = None) -> int:
     """模拟切片数估计"""
     first_cam = 0
-    last_cam = expected_cams - 1
+    last_cam = max(0, expected_cams - 1)
     
-    middle_cams_with_vertical = sum(1 for ci in cams_with_vertical 
-                                     if ci != first_cam and ci != last_cam)
-    
-    piece_count = middle_cams_with_vertical + 1
-    return min(3, max(1, piece_count))  # 最大3片
+    valid_cuts = 0
+    for ci in cams_with_vertical:
+        is_valid = False
+        if expected_cams == 5:
+            # 简化逻辑：只要不是边缘相机就有效
+            if ci != 0 and ci != 4:
+                is_valid = True
+        else:
+            if ci != first_cam and ci != last_cam:
+                is_valid = True
+        
+        if is_valid:
+            valid_cuts += 1
+            
+    piece_count = valid_cuts + 1
+    max_pieces = 4 if expected_cams >= 5 else 3
+    return min(max_pieces, max(1, piece_count))
 
 
 def simulate_marks(piece_count: int, defect_cam: int, defect_x_ratio: float,
@@ -65,7 +79,7 @@ def simulate_marks(piece_count: int, defect_cam: int, defect_x_ratio: float,
 
 def print_simulation():
     print("=" * 70)
-    print("分路决策模拟 (简化版 - 最多切3片)")
+    print("分路决策模拟 (简化版 - 依旧排除边缘两个相机)")
     print("=" * 70)
     
     # === 5相机配置 ===
@@ -87,6 +101,16 @@ def print_simulation():
     ]
     for cams, desc in cases_5cam:
         pieces = simulate_piece_count(cams, 5)
+        print(f"  {desc:35} -> {pieces}片")
+
+    print("\n--- 5相机边缘切分测试 (边缘应当无效) ---")
+    cases_5cam_edge = [
+        ([0], {0: [1800]}, "Cam0(边缘)"),
+        ([4], {4: [300]}, "Cam4(边缘)"),
+        ([0, 2], {0: [1800], 2: [1200]}, "Cam0(边缘)+Cam2(有效)"),
+    ]
+    for cams, coords, desc in cases_5cam_edge:
+        pieces = simulate_piece_count(cams, 5, coords)
         print(f"  {desc:35} -> {pieces}片")
     
     print("\n--- 切2片时的分路 ---")
@@ -110,53 +134,6 @@ def print_simulation():
         m = simulate_marks(3, cam, x, 5)
         piece = {3: "左片", 2: "中片", 1: "右片"}.get(m[0], "?")
         print(f"  缺陷在{desc:12} -> 标记{m} ({piece})")
-    
-    # === 4相机配置 ===
-    print("\n" + "=" * 70)
-    print("【4相机配置】(Line1)")
-    print("  边缘相机: cam0, cam3 | 中间相机: cam1, cam2")
-    print("=" * 70)
-    
-    print("\n--- 切片数估计 ---")
-    cases_4cam = [
-        ([], "无中间相机看到竖直边"),
-        ([1], "cam1看到竖直边"),
-        ([2], "cam2看到竖直边"),
-        ([1, 2], "cam1,cam2都看到竖直边"),
-    ]
-    for cams, desc in cases_4cam:
-        pieces = simulate_piece_count(cams, 4)
-        print(f"  {desc:35} -> {pieces}片")
-    
-    print("\n--- 切2片时的分路 ---")
-    print("  布局: [左片(标记2) | 右片(标记1)]")
-    positions_2p_4c = [
-        (0, 0.5, "cam0"), (1, 0.3, "cam1左侧"), (1, 0.7, "cam1右侧"),
-        (2, 0.3, "cam2左侧"), (2, 0.7, "cam2右侧"), (3, 0.5, "cam3"),
-    ]
-    for cam, x, desc in positions_2p_4c:
-        m = simulate_marks(2, cam, x, 4)
-        piece = "左片" if 2 in m else "右片"
-        print(f"  缺陷在{desc:12} -> 标记{m} ({piece})")
-    
-    print("\n--- 切3片时的分路 (cam1,cam2都看到竖直边) ---")
-    print("  布局: [左片(标记3) | 中片(标记2) | 右片(标记1)]")
-    positions_3p_4c = [
-        (0, 0.5, "cam0"),
-        (1, 0.3, "cam1左侧"),
-        (1, 0.7, "cam1右侧"),
-        (2, 0.3, "cam2左侧"),
-        (2, 0.7, "cam2右侧"),
-        (3, 0.5, "cam3"),
-    ]
-    for cam, x, desc in positions_3p_4c:
-        m = simulate_marks(3, cam, x, 4)
-        piece = {3: "左片", 2: "中片", 1: "右片"}.get(m[0], "?")
-        print(f"  缺陷在{desc:12} -> 标记{m} ({piece})")
-    
-    print("\n" + "=" * 70)
-    print("模拟完成!")
-    print("=" * 70)
 
 
 if __name__ == "__main__":

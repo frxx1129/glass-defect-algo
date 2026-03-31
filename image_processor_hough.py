@@ -61,7 +61,7 @@ LINE2_CAM3_EXCLUSION_ZONES = [
     # ===== 右上框架 =====
     {"x": 1512, "y": 460, "width": 308, "height": 54},  # 顶部边
     {"x": 1506, "y": 667, "width": 305, "height": 71},  # 底部边
-    {"x": 1498, "y": 462, "width": 46, "height": 293},  # 左边
+    {"x": 1480, "y": 462, "width": 72, "height": 293},  # 左边
     {"x": 1742, "y": 465, "width": 78, "height": 271},  # 右边
     
     # ===== 左下框架 =====
@@ -74,7 +74,7 @@ LINE2_CAM3_EXCLUSION_ZONES = [
     {"x": 1536, "y": 972, "width": 274, "height": 71},  # 顶部边
     {"x": 1544, "y": 1165, "width": 264, "height": 69}, # 底部边
     {"x": 1500, "y": 984, "width": 63, "height": 252},  # 左边
-    {"x": 1754, "y": 1027, "width": 51, "height": 203}, # 右边
+    {"x": 1754, "y": 1027, "width": 60, "height": 203}, # 右边
 ]
 
 # Line3 cam3 exclusion zones - 简化版本 (4个框架，每框架4边)
@@ -766,7 +766,7 @@ def scan_edge_for_chipping_blocks(roi_gray, edge, params, pixels_per_mm: float):
     n_blocks = int(math.floor(line_len / block_len_px))
     if n_blocks < 2:
         return []
-    # 预计算梯度与 Canny
+        # 预计算梯度与 Canny
     try:
         blurred = cv2.medianBlur(roi_gray, 3)
         grad_x = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
@@ -2346,7 +2346,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             return a if a <= 90.0 else 180.0 - a
         cnt_v = sum(1 for e in true_edges if _ang_x(e) >= (90.0 - v_tol_deg_chk))
         cnt_h = sum(1 for e in true_edges if _ang_x(e) <= h_tol_deg_chk)
-        enable_hull_check = (cnt_v >= 2 and cnt_h >= 2)
+        try:
+            enable_hull_check_cfg = bool(params.get('DEFECT_DETECTION', {}).get('ENABLE_HULL_CHECK', False))
+        except Exception:
+            enable_hull_check_cfg = False
+        enable_hull_check = enable_hull_check_cfg and (cnt_v >= 2 and cnt_h >= 2)
         if enable_hull_check and (len(np.unique(cluster_labels)) >= 2):
             clusters_points = {}
             for idx, seg in enumerate(true_edges):
@@ -2988,7 +2992,41 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         except Exception:
             pass
 
-        contours, _ = cv2.findContours(edges_for_e, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        try:
+            e_prefilter_enable = bool(params.get('DEFECT_DETECTION', {}).get('E_FAST_PREFILTER_ENABLE', True))
+        except Exception:
+            e_prefilter_enable = True
+        skip_e_contours = False
+        if e_prefilter_enable and edges_for_e is not None and edges_for_e.size > 0:
+            try:
+                e_edge_pixels = int(np.count_nonzero(edges_for_e))
+                e_edge_ratio = float(e_edge_pixels) / float(edges_for_e.size)
+            except Exception:
+                e_edge_pixels = 0
+                e_edge_ratio = 0.0
+            try:
+                e_min_edge_pixels = int(params.get('DEFECT_DETECTION', {}).get('E_FAST_MIN_EDGE_PIXELS', 120))
+            except Exception:
+                e_min_edge_pixels = 120
+            try:
+                e_min_edge_ratio = float(params.get('DEFECT_DETECTION', {}).get('E_FAST_MIN_EDGE_RATIO', 0.0008))
+            except Exception:
+                e_min_edge_ratio = 0.0008
+            try:
+                e_roi_std_thr = float(params.get('DEFECT_DETECTION', {}).get('E_FAST_ROI_STD_THRESHOLD', 10.0))
+            except Exception:
+                e_roi_std_thr = 10.0
+            try:
+                roi_std = float(np.std(roi_gray))
+            except Exception:
+                roi_std = 9999.0
+            if e_edge_pixels < e_min_edge_pixels and e_edge_ratio < e_min_edge_ratio and roi_std < e_roi_std_thr:
+                skip_e_contours = True
+
+        if skip_e_contours:
+            contours = []
+        else:
+            contours, _ = cv2.findContours(edges_for_e, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         try:
             min_area_px2 = _get_area_px2(params.get('DEFECT_DETECTION', {}), 'E_MIN_AREA_MM2', None, 4.0, pixels_per_mm)
         except Exception:
@@ -3211,6 +3249,9 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     # 收集玻璃主体轮廓（与矩形差法重复一次，后续可优化成复用）
     corner_contour_q_defects = []
     try:
+        # Q 被运行时关闭时，跳过该分支的轮廓与射线重计算。
+        if not _q_enabled_runtime:
+            raise RuntimeError('Q contour pipeline skipped by runtime switch')
         kernel_qc = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
         edges_qc = preprocess_for_defect_edges(roi_gray, params)
         edges_qc_dil = cv2.dilate(edges_qc, kernel_qc, iterations=1)
@@ -4676,14 +4717,48 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     except Exception:
         hough_threshold_i = 50
 
-    raw_lines = cv2.HoughLinesP(
-        hough_edges,
-        1,
-        np.pi / 180,
-        hough_threshold_i,
-        minLineLength=min_len_pixels_i,
-        maxLineGap=max_line_gap_px_i,
-    )
+    try:
+        hough_downsample_scale = float(p_hough.get("DOWNSAMPLE_SCALE", 0.85) or 0.85)
+    except Exception:
+        hough_downsample_scale = 0.85
+    if hough_downsample_scale < 0.2 or hough_downsample_scale > 1.0:
+        hough_downsample_scale = 0.85
+
+    if hough_downsample_scale < 0.999:
+        h_full, w_full = hough_edges.shape[:2]
+        w_small = max(1, int(round(float(w_full) * hough_downsample_scale)))
+        h_small = max(1, int(round(float(h_full) * hough_downsample_scale)))
+        hough_edges_small = cv2.resize(hough_edges, (w_small, h_small), interpolation=cv2.INTER_AREA)
+        scale_x = float(w_full) / float(w_small)
+        scale_y = float(h_full) / float(h_small)
+        scale_len = min(1.0, float(min(w_small / max(1, w_full), h_small / max(1, h_full))))
+        min_len_pixels_i_small = int(max(1, round(float(min_len_pixels_i) * scale_len)))
+        max_line_gap_px_i_small = int(max(0, round(float(max_line_gap_px_i) * scale_len)))
+
+        raw_small = cv2.HoughLinesP(
+            hough_edges_small,
+            1,
+            np.pi / 180,
+            hough_threshold_i,
+            minLineLength=min_len_pixels_i_small,
+            maxLineGap=max_line_gap_px_i_small,
+        )
+        raw_lines = None
+        if raw_small is not None:
+            raw_lines = raw_small.copy()
+            raw_lines[:, 0, 0] = np.round(raw_lines[:, 0, 0].astype(np.float32) * scale_x).astype(np.int32)
+            raw_lines[:, 0, 1] = np.round(raw_lines[:, 0, 1].astype(np.float32) * scale_y).astype(np.int32)
+            raw_lines[:, 0, 2] = np.round(raw_lines[:, 0, 2].astype(np.float32) * scale_x).astype(np.int32)
+            raw_lines[:, 0, 3] = np.round(raw_lines[:, 0, 3].astype(np.float32) * scale_y).astype(np.int32)
+    else:
+        raw_lines = cv2.HoughLinesP(
+            hough_edges,
+            1,
+            np.pi / 180,
+            hough_threshold_i,
+            minLineLength=min_len_pixels_i,
+            maxLineGap=max_line_gap_px_i,
+        )
     
     main_edges = merge_lines_and_get_main_edges(raw_lines, params, pixels_per_mm, edge_img=hough_edges)
 
@@ -4701,6 +4776,13 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         _q_enabled_runtime = bool(params.get('DEFECT_DETECTION', {}).get('Q_ENABLED', True))
     except Exception:
         _q_enabled_runtime = True
+    try:
+        q_mode = str(params.get('DEFECT_DETECTION', {}).get('Q_MODE', 'full') or 'full').strip().lower()
+    except Exception:
+        q_mode = 'full'
+    # q_mode=off/as_e: 完全关闭 Q 计算，走 E-only 实验路径。
+    if q_mode in ('off', 'disabled', 'disable', 'as_e', 'e_only'):
+        _q_enabled_runtime = False
 
     # 接入“跨 ROI 统一竖直虚拟边”：将全局共享竖直边裁剪到本 ROI 并并入主边
     try:
@@ -5848,6 +5930,18 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
     _cam_index_run = hough_params.get('_RUNTIME_CAM_INDEX', -1)
     _exclusion_zones_run = get_exclusion_zones(_line_name_run, _cam_index_run)
 
+    # 降采样时同步缩放排除区域的像素坐标
+    try:
+        _proc_scale = float(config.get('_PROCESSING_SCALE', 1.0) or 1.0)
+        if 0 < _proc_scale < 1.0 and _exclusion_zones_run:
+            _exclusion_zones_run = [
+                {"x": int(z["x"] * _proc_scale), "y": int(z["y"] * _proc_scale),
+                 "width": int(z["width"] * _proc_scale), "height": int(z["height"] * _proc_scale)}
+                for z in _exclusion_zones_run
+            ]
+    except Exception:
+        pass
+
     try:
         roi_threads_cfg = int(sys_params.get('roi_threads', 0) or 0)
     except Exception:
@@ -5981,14 +6075,47 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
                     hough_threshold_i = int(round(float(p_h.get('THRESHOLD', 50))))
                 except Exception:
                     hough_threshold_i = 50
-                raw = cv2.HoughLinesP(
-                    edge_img,
-                    1,
-                    np.pi/180,
-                    hough_threshold_i,
-                    minLineLength=min_len_pixels_i,
-                    maxLineGap=max_line_gap_px_i,
-                )
+                try:
+                    cross_hough_scale = float(p_h.get('DOWNSAMPLE_SCALE', 0.85) or 0.85)
+                except Exception:
+                    cross_hough_scale = 0.85
+                if cross_hough_scale < 0.2 or cross_hough_scale > 1.0:
+                    cross_hough_scale = 0.85
+
+                if cross_hough_scale < 0.999:
+                    eh, ew = edge_img.shape[:2]
+                    ew_s = max(1, int(round(float(ew) * cross_hough_scale)))
+                    eh_s = max(1, int(round(float(eh) * cross_hough_scale)))
+                    edge_small = cv2.resize(edge_img, (ew_s, eh_s), interpolation=cv2.INTER_AREA)
+                    sx = float(ew) / float(ew_s)
+                    sy = float(eh) / float(eh_s)
+                    s_len = min(1.0, float(min(ew_s / max(1, ew), eh_s / max(1, eh))))
+                    min_len_i_s = int(max(1, round(float(min_len_pixels_i) * s_len)))
+                    max_gap_i_s = int(max(0, round(float(max_line_gap_px_i) * s_len)))
+                    raw_small = cv2.HoughLinesP(
+                        edge_small,
+                        1,
+                        np.pi/180,
+                        hough_threshold_i,
+                        minLineLength=min_len_i_s,
+                        maxLineGap=max_gap_i_s,
+                    )
+                    raw = None
+                    if raw_small is not None:
+                        raw = raw_small.copy()
+                        raw[:, 0, 0] = np.round(raw[:, 0, 0].astype(np.float32) * sx).astype(np.int32)
+                        raw[:, 0, 1] = np.round(raw[:, 0, 1].astype(np.float32) * sy).astype(np.int32)
+                        raw[:, 0, 2] = np.round(raw[:, 0, 2].astype(np.float32) * sx).astype(np.int32)
+                        raw[:, 0, 3] = np.round(raw[:, 0, 3].astype(np.float32) * sy).astype(np.int32)
+                else:
+                    raw = cv2.HoughLinesP(
+                        edge_img,
+                        1,
+                        np.pi/180,
+                        hough_threshold_i,
+                        minLineLength=min_len_pixels_i,
+                        maxLineGap=max_line_gap_px_i,
+                    )
                 merged = merge_lines_and_get_main_edges(raw, hough_params, pixels_per_mm, edge_img=edge_img)
                 
                 # 预处理阶段：对 merged 列表应用 exclusion zones 屏蔽
@@ -6166,8 +6293,14 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
             if not is_duplicate:
                 tracker['positions'].append((cx, cy))
     
+    # 默认不向客户显示切片位置绿点；如需调试可在配置中显式开启。
+    try:
+        show_slice_markers = bool(hough_params.get('VISUALIZATION', {}).get('SHOW_SLICE_MARKERS', False))
+    except Exception:
+        show_slice_markers = False
+
     # 绘制所有累积的切片位置（仅非边缘相机）
-    if not _is_edge_camera and tracker['positions']:
+    if show_slice_markers and (not _is_edge_camera) and tracker['positions']:
         try:
             overlay = final_image.copy()
             for (px, py) in tracker['positions']:

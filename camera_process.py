@@ -4,6 +4,7 @@ import traceback
 import numpy as np
 import multiprocessing as mp
 import json
+import yaml
 from camera_manager import CameraManager, MultiCameraSetup
 from GigECamera_Types import TriggerMode_On, TriggerMode_Off, TriggerSource_Software, TriggerActivation_RisingEdge, MVStreamCB  # noqa
 from MVGigE import *
@@ -51,6 +52,37 @@ def _compute_trigger_period_ms(config: dict) -> float:
     return max(period_ms, min_ms)
 
 
+def _privacy_enabled(config: dict) -> bool:
+    """默认启用隐私日志模式，可通过 system_params.hide_sensitive_logs 显式关闭。"""
+    try:
+        sp = (config.get('system_params') or {}) if isinstance(config, dict) else {}
+        return bool(sp.get('hide_sensitive_logs', True))
+    except Exception:
+        return True
+
+
+def _mask_mac(mac: str) -> str:
+    try:
+        m = str(mac or '').upper()
+        parts = m.split(':')
+        if len(parts) == 6:
+            return ':'.join(parts[:2] + ['**', '**', '**', parts[-1]])
+        return '***'
+    except Exception:
+        return '***'
+
+
+def _mask_ip(ip: str) -> str:
+    try:
+        s = str(ip or '')
+        seg = s.split('.')
+        if len(seg) == 4:
+            return f"{seg[0]}.{seg[1]}.{seg[2]}.***"
+        return '***'
+    except Exception:
+        return '***'
+
+
 def _camera_worker_process(cam_index: int, task_queue, stop_event, run_event, config: dict,
                            shared_states, capture_interval_s: float, use_soft_trigger: bool):
         """每个相机一个独立进程：打开相机→应用参数→注册回调→按周期软件触发→写入共享队列。"""
@@ -76,13 +108,16 @@ def _camera_worker_process(cam_index: int, task_queue, stop_event, run_event, co
             desired_ip = cam_binding.get('ip')
             physical_index = cam_binding.get('physical_index')
             
-            print(f"[相机进程 {cam_index}]: 配置 逻辑索引={cam_index}, MAC={desired_mac}, IP={desired_ip}, 配置中的物理索引={physical_index}（仅参考）")
+            if _privacy_enabled(config):
+                print(f"[相机进程 {cam_index}]: 配置 逻辑索引={cam_index}, MAC={_mask_mac(desired_mac)}, IP={_mask_ip(desired_ip)}, 配置中的物理索引={physical_index}（仅参考）")
+            else:
+                print(f"[相机进程 {cam_index}]: 配置 逻辑索引={cam_index}, MAC={desired_mac}, IP={desired_ip}, 配置中的物理索引={physical_index}（仅参考）")
             
             # 确保更新相机列表获取最新状态
             MVUpdateCameraList()
             
-            # 优先使用MAC地址打开相机
-            cam = CameraManager(cam_index, mac=desired_mac)
+            # 使用MAC地址和IP打开相机，IP可触发快速连接
+            cam = CameraManager(cam_index, mac=desired_mac, ip=desired_ip)
         else:
             # 如果没有绑定信息，使用索引直接打开
             print(f"[相机进程 {cam_index}]: 未找到相机绑定信息，使用索引打开")
@@ -111,7 +146,10 @@ def _camera_worker_process(cam_index: int, task_queue, stop_event, run_event, co
 
             # 相机已成功打开，更新状态
             shared_states[cam_index] = {"status": "Opened", "mac": cam.mac, "ip": cam.ip}
-            print(f"[相机进程 {cam_index}]: 相机就绪，MAC: {cam.mac}, IP: {cam.ip}")
+            if _privacy_enabled(config):
+                print(f"[相机进程 {cam_index}]: 相机就绪，MAC: {_mask_mac(cam.mac)}, IP: {_mask_ip(cam.ip)}")
+            else:
+                print(f"[相机进程 {cam_index}]: 相机就绪，MAC: {cam.mac}, IP: {cam.ip}")
 
             # 应用相机参数
             unified_params = copy.deepcopy(config.get('camera_setup', {}).get('unified_params', {}) or {})
@@ -509,11 +547,22 @@ def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, 
     while not stop_event.is_set() and not all_ready and (time.time() - start_time) < timeout:
         time.sleep(0.5)  # 每0.5秒检查一次
 
-        # 检查所有相机是否已更新状态
+        # 检查所有相机是否已真正进入可采集状态
         initialized_cameras = 0
+        not_ready_detail = []
         for i in started_indices:
             if i in shared_states and shared_states[i]:
-                initialized_cameras += 1
+                st = str((shared_states[i] or {}).get('status', ''))
+                if st in ('Grabbing', 'Connected (Test Mode)'):
+                    initialized_cameras += 1
+                else:
+                    err = str((shared_states[i] or {}).get('error', '') or '')
+                    if err:
+                        not_ready_detail.append(f"cam{i}:{st}({err})")
+                    else:
+                        not_ready_detail.append(f"cam{i}:{st}")
+            else:
+                not_ready_detail.append(f"cam{i}:NoState")
 
         if initialized_cameras == len(started_indices):
             all_ready = True
@@ -529,6 +578,11 @@ def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, 
     
     if not all_ready and not stop_event.is_set():
         print(f"[相机池]: 警告 - 超时未能初始化所有相机，继续运行 (已就绪 {initialized_cameras}/{len(started_indices)})")
+        try:
+            if not_ready_detail:
+                print(f"[相机池]: 未就绪详情: {', '.join(not_ready_detail[:10])}")
+        except Exception:
+            pass
         # 即使有相机未准备好，也发送就绪事件以避免主进程无限等待
         cameras_ready_event.set()
 
@@ -623,6 +677,10 @@ def update_empty_camera_configs(config, shared_states, num_cameras):
                         cam_info = shared_states[i]
                         cam_mac = cam_info.get('mac', '').upper()
                         cam_ip = cam_info.get('ip')
+
+                        if not cam_mac:
+                            print(f"[相机池]: 相机 {i} 缺少MAC信息，跳过自动网卡绑定推导")
+                            continue
                         
                         # 找到对应的逻辑索引
                         logical_idx = None
@@ -631,7 +689,10 @@ def update_empty_camera_configs(config, shared_states, num_cameras):
                         else:
                             # 如果没有找到MAC映射，使用物理索引作为逻辑索引（回退方案）
                             logical_idx = i
-                            print(f"[相机池]: 相机 MAC={cam_mac} 未找到逻辑索引映射，使用物理索引 {i} 作为回退")
+                            if _privacy_enabled(config):
+                                print(f"[相机池]: 相机 MAC={_mask_mac(cam_mac)} 未找到逻辑索引映射，使用物理索引 {i} 作为回退")
+                            else:
+                                print(f"[相机池]: 相机 MAC={cam_mac} 未找到逻辑索引映射，使用物理索引 {i} 作为回退")
                         
                         if cam_ip:
                             # 根据相机IP前缀找到对应的网卡
@@ -648,11 +709,17 @@ def update_empty_camera_configs(config, shared_states, num_cameras):
                             # 如果找到匹配的网卡，建立绑定
                             if matching_nic_idx is not None:
                                 new_bindings[str(logical_idx)] = matching_nic_idx
-                                print(f"[相机池]: 相机 MAC={cam_mac}, 逻辑索引={logical_idx} -> 网卡 {matching_nic_idx} (IP前缀匹配)")
+                                if _privacy_enabled(config):
+                                    print(f"[相机池]: 相机 MAC={_mask_mac(cam_mac)}, 逻辑索引={logical_idx} -> 网卡 {matching_nic_idx} (IP前缀匹配)")
+                                else:
+                                    print(f"[相机池]: 相机 MAC={cam_mac}, 逻辑索引={logical_idx} -> 网卡 {matching_nic_idx} (IP前缀匹配)")
                             # 如果没有找到匹配的网卡，尝试使用物理索引匹配网卡
                             elif logical_idx in indexed_nics:
                                 new_bindings[str(logical_idx)] = logical_idx
-                                print(f"[相机池]: 相机 MAC={cam_mac}, 逻辑索引={logical_idx} -> 网卡 {logical_idx} (索引匹配)")
+                                if _privacy_enabled(config):
+                                    print(f"[相机池]: 相机 MAC={_mask_mac(cam_mac)}, 逻辑索引={logical_idx} -> 网卡 {logical_idx} (索引匹配)")
+                                else:
+                                    print(f"[相机池]: 相机 MAC={cam_mac}, 逻辑索引={logical_idx} -> 网卡 {logical_idx} (索引匹配)")
                 
                 if new_bindings:
                     camera_setup['camera_nic_bindings'] = new_bindings
@@ -690,9 +757,18 @@ def update_empty_camera_configs(config, shared_states, num_cameras):
     # 如果配置有更新，保存到文件
     if config_updated:
         try:
-            # 写入配置文件
-            with open('config.json', 'w', encoding='utf-8') as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
-            print("[相机池]: 配置文件已更新")
+            # 优先回写当前加载的配置文件；若未知则回写 config.yaml。
+            cfg_path = str(config.get('__config_path', '') or '')
+            if not cfg_path:
+                cfg_path = 'config.yaml'
+            cfg_to_save = dict(config)
+            cfg_to_save.pop('__config_path', None)
+            if cfg_path.endswith(('.yml', '.yaml')):
+                with open(cfg_path, 'w', encoding='utf-8') as f:
+                    yaml.safe_dump(cfg_to_save, f, allow_unicode=True, sort_keys=False)
+            else:
+                with open(cfg_path, 'w', encoding='utf-8') as f:
+                    json.dump(cfg_to_save, f, ensure_ascii=False, indent=2)
+            print(f"[相机池]: 配置文件已更新: {cfg_path}")
         except Exception as e:
             print(f"[相机池]: 写入配置文件失败: {e}")

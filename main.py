@@ -203,9 +203,11 @@ def main():
                     f.seek(0)
                     config = json.load(f)
         try:
-            print(f"[主进程]: 加载配置文件: {cfg_path}")
+            print("[主进程]: 配置加载完成")
         except Exception:
             pass
+        # 记录配置来源路径，供子进程在“自动补全配置”时回写到同一文件。
+        config['__config_path'] = cfg_path
     except Exception as e:
         sys.exit(f"错误: 无法加载 {cfg_path}: {e}")
 
@@ -224,7 +226,7 @@ def main():
             # 取第一个 value
             try:
                 roi_file = next(iter(cam_rois_cfg.values()))
-                print(f"[主进程]: 使用 camera_rois 中的 '{roi_file}' 进行ROI越界校验")
+                print("[主进程]: 使用 camera_rois 配置进行ROI越界校验")
             except Exception:
                 roi_file = None
         if not roi_file:

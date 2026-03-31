@@ -26,6 +26,62 @@ def should_reject_pane(pane_json, shared_settings, pixels_per_mm):
                 return True
     return False
 
+def _scale_rois(rois, scale):
+    """将 ROI 坐标按比例缩放，用于降采样后的处理。"""
+    scaled = []
+    for r in rois:
+        sr = dict(r)
+        for key in ('x', 'y', 'width', 'height', 'w', 'h'):
+            if key in sr:
+                try:
+                    sr[key] = int(round(float(sr[key]) * scale))
+                except Exception:
+                    pass
+        # 处理 left/top/right/bottom 格式
+        for key in ('left', 'top', 'right', 'bottom'):
+            if key in sr:
+                try:
+                    sr[key] = int(round(float(sr[key]) * scale))
+                except Exception:
+                    pass
+        scaled.append(sr)
+    return scaled
+
+
+def _unscale_results(pane_json, scale):
+    """将检测结果中的像素坐标从缩放空间反映射回原始空间。
+    mm 单位的尺寸无需调整（因为 pixels_per_mm 已同步缩放，mm 值本身是正确的）。"""
+    inv = 1.0 / scale
+    # 反缩放 ROI 报告中的像素坐标
+    for roi_rpt in pane_json.get('rois', []):
+        for key in ('x', 'y', 'w', 'h'):
+            if key in roi_rpt:
+                try:
+                    roi_rpt[key] = int(round(float(roi_rpt[key]) * inv))
+                except Exception:
+                    pass
+        # 反缩放 ROI 内缺陷的像素坐标
+        for defect in roi_rpt.get('defects', []):
+            loc = defect.get('location', {})
+            if isinstance(loc, dict):
+                for key in ('x', 'y'):
+                    if key in loc:
+                        try:
+                            loc[key] = int(round(float(loc[key]) * inv))
+                        except Exception:
+                            pass
+    # 反缩放顶层 defects 列表中的像素坐标
+    for defect in pane_json.get('defects', []):
+        loc = defect.get('location', {})
+        if isinstance(loc, dict):
+            for key in ('x', 'y'):
+                if key in loc:
+                    try:
+                        loc[key] = int(round(float(loc[key]) * inv))
+                    except Exception:
+                        pass
+
+
 def calculation_worker(process_index, task_queue, results_queue, stop_event, run_event, config, shared_settings, data_sessions=None):
     """A worker process that consumes raw images and produces analysis results."""
     print(f"[计算进程 {process_index}]: 已启动。")
@@ -41,8 +97,26 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
     except Exception:
         pass
     PIXELS_PER_MM = config['system_params']['pixels_per_mm']
+    # 降采样比例：1.0=不缩放(原始分辨率), 0.75=缩放到75%(推荐), 0.5=缩放到50%
+    try:
+        processing_scale = float(config.get('system_params', {}).get('processing_scale', 1.0) or 1.0)
+        if processing_scale <= 0 or processing_scale > 1.0:
+            processing_scale = 1.0
+    except Exception:
+        processing_scale = 1.0
+    if processing_scale < 1.0:
+        print(f"[计算进程 {process_index}]: 启用帧降采样，比例={processing_scale:.2f}")
     drain_budget_ms = int(config.get('system_params', {}).get('coalesce_drain_budget_ms', 5))
-    drain_max_n = int(config.get('system_params', {}).get('coalesce_max_drain', 500))
+    drain_max_n_cfg = int(config.get('system_params', {}).get('coalesce_max_drain', 50))
+    try:
+        expected_cams = int(config.get('camera_setup', {}).get('expected_cameras', 0) or 0)
+    except Exception:
+        expected_cams = 0
+    if expected_cams <= 0:
+        expected_cams = 5
+    # 防止单次批量过大导致队列抖动和端到端延迟上升。
+    drain_cap_by_topology = max(20, expected_cams * 8)
+    drain_max_n = max(1, min(drain_max_n_cfg, drain_cap_by_topology))
     
     roi_cache: dict[int, list] = {}
     camera_rois_cfg = config.get('camera_rois', {})
@@ -196,8 +270,32 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                 except Exception:
                     conf_local = config
 
-                pane_json, annotated_image = fused_image_processor.process_image(
-                    frame_data, roi_cache[cam_idx], conf_local, algo_mode)
+                # === 帧降采样处理 ===
+                # 在送入检测器前缩放帧和ROI，检测后反缩放坐标并放大标注图
+                if processing_scale < 1.0:
+                    orig_h, orig_w = frame_data.shape[:2]
+                    new_w = int(orig_w * processing_scale)
+                    new_h = int(orig_h * processing_scale)
+                    frame_scaled = cv2.resize(frame_data, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    rois_scaled = _scale_rois(roi_cache[cam_idx], processing_scale)
+                    # 同步缩放 pixels_per_mm，确保 mm 级尺寸判定不受影响
+                    conf_scaled = dict(conf_local)
+                    sys_params_scaled = dict(conf_scaled.get('system_params', {}))
+                    sys_params_scaled['pixels_per_mm'] = PIXELS_PER_MM * processing_scale
+                    conf_scaled['system_params'] = sys_params_scaled
+                    # 注入缩放因子供内部模块（如排除区域坐标缩放）使用
+                    conf_scaled['_PROCESSING_SCALE'] = processing_scale
+
+                    pane_json, annotated_image = fused_image_processor.process_image(
+                        frame_scaled, rois_scaled, conf_scaled, algo_mode)
+
+                    # 将像素坐标反缩放回原始空间
+                    _unscale_results(pane_json, processing_scale)
+                    # 将标注图放大回原始尺寸（保证上传/预览画质）
+                    annotated_image = cv2.resize(annotated_image, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    pane_json, annotated_image = fused_image_processor.process_image(
+                        frame_data, roi_cache[cam_idx], conf_local, algo_mode)
 
                 # 会话逻辑：只有检测到玻璃(state_code>0)才开启文件夹；玻璃离开(state_code==0 且之前active)结束。
                 is_collection = bool(getattr(shared_settings, 'data_collection_mode', False))
