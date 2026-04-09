@@ -8,66 +8,6 @@ from queue import Empty
 import time
 import fused_image_processor
 import copy
-import numpy as np
-
-def filter_flying_insects(pane_json, frame_data, pixels_per_mm):
-    """
-    基于用户标注特征过滤蚊虫假不良：
-    提取原图上的灰度块计算拉普拉斯方差和长宽比；如果符合蚊子特征，则从结果中剔除。
-    """
-    if not pane_json.get('defects'):
-        return
-
-    gray = frame_data
-    if len(frame_data.shape) == 3:
-        gray = cv2.cvtColor(frame_data, cv2.COLOR_BGR2GRAY)
-        
-    H, W = gray.shape[:2]
-    filtered_defects = []
-
-    for defect in pane_json.get('defects', []):
-        is_fly = False
-        try:
-            dt = str(defect.get('type', '')).upper()
-            if dt in ('B', 'L', 'E', 'Q'):
-                loc = defect.get('location', {})
-                cx = float(loc.get('x', 0))
-                cy = float(loc.get('y', 0))
-                w_mm = float(loc.get('width_mm', 0) or 0)
-                l_mm = float(loc.get('length_mm', 0) or 0)
-                
-                # 计算原图像素宽高
-                px_w = max(2, int(w_mm * pixels_per_mm))
-                px_l = max(2, int(l_mm * pixels_per_mm))
-                area_px = px_w * px_l
-                
-                aspect = float(max(px_w, px_l)) / float(min(px_w, px_l)) if min(px_w, px_l) > 0 else 0
-                
-                # 典型蚊子特征：面积约在百到数万间，且不够细长（长宽比<2.5）
-                if aspect <= 2.5 and 200 <= area_px <= 25000:
-                    x_min = max(0, int(cx - px_w/2) - 15)
-                    y_min = max(0, int(cy - px_l/2) - 15)
-                    x_max = min(W, int(cx + px_w/2) + 15)
-                    y_max = min(H, int(cy + px_l/2) + 15)
-                    
-                    crop = gray[y_min:y_max, x_min:x_max]
-                    if crop.size > 0:
-                        lap_var = cv2.Laplacian(crop, cv2.CV_64F).var()
-                        # 蚊子相对玻璃碎渣经常边缘不够锐利
-                        if lap_var < 1500:
-                            is_fly = True
-                            print(f"[滤除蚊子] 类别:{dt}, 尺寸:{w_mm:.1f}x{l_mm:.1f}mm, lap_var:{lap_var:.1f}")
-        except Exception:
-            is_fly = False
-            
-        if not is_fly:
-            filtered_defects.append(defect)
-            
-    pane_json['defects'] = filtered_defects
-    # 如果缺陷被全过滤，重置总状态
-    if not filtered_defects and pane_json.get('image_status') == 'NG':
-        pane_json['image_status'] = 'OK'
-
 
 def should_reject_pane(pane_json, shared_settings, pixels_per_mm):
     """根据缺陷类型与尺寸判定是否剔废：Q/E/B/L/X 均按照尺寸阈值处理。"""
@@ -201,12 +141,6 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
     
     last_paused_log_ts = 0.0
     last_results_full_log_ts = 0.0
-
-    # 预加载各个相机的 ROI 以确保就绪状态
-    for c_idx in range(expected_cams):
-        if c_idx not in roi_cache:
-            roi_cache[c_idx] = load_rois_for_cam(c_idx)
-
     try:
         while not stop_event.is_set():
             if not run_event.is_set():
@@ -337,33 +271,31 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                     conf_local = config
 
                 # === 帧降采样处理 ===
-                # 图像已在 camera_process 被提前降采样以减小 IPC 带宽
-                orig_h, orig_w = task_data.get('orig_shape', frame_data.shape[:2])
-                scale_applied = float(task_data.get('scale_applied', 1.0))
-                
-                if scale_applied < 1.0:
-                    rois_scaled = _scale_rois(roi_cache[cam_idx], scale_applied)
+                # 在送入检测器前缩放帧和ROI，检测后反缩放坐标并放大标注图
+                if processing_scale < 1.0:
+                    orig_h, orig_w = frame_data.shape[:2]
+                    new_w = int(orig_w * processing_scale)
+                    new_h = int(orig_h * processing_scale)
+                    frame_scaled = cv2.resize(frame_data, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    rois_scaled = _scale_rois(roi_cache[cam_idx], processing_scale)
                     # 同步缩放 pixels_per_mm，确保 mm 级尺寸判定不受影响
                     conf_scaled = dict(conf_local)
                     sys_params_scaled = dict(conf_scaled.get('system_params', {}))
-                    sys_params_scaled['pixels_per_mm'] = PIXELS_PER_MM * scale_applied
+                    sys_params_scaled['pixels_per_mm'] = PIXELS_PER_MM * processing_scale
                     conf_scaled['system_params'] = sys_params_scaled
-                    # 注入缩放因子供内部模块使用
-                    conf_scaled['_PROCESSING_SCALE'] = scale_applied
+                    # 注入缩放因子供内部模块（如排除区域坐标缩放）使用
+                    conf_scaled['_PROCESSING_SCALE'] = processing_scale
 
                     pane_json, annotated_image = fused_image_processor.process_image(
-                        frame_data, rois_scaled, conf_scaled, algo_mode)
+                        frame_scaled, rois_scaled, conf_scaled, algo_mode)
 
                     # 将像素坐标反缩放回原始空间
-                    _unscale_results(pane_json, scale_applied)
+                    _unscale_results(pane_json, processing_scale)
                     # 将标注图放大回原始尺寸（保证上传/预览画质）
                     annotated_image = cv2.resize(annotated_image, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
                 else:
                     pane_json, annotated_image = fused_image_processor.process_image(
                         frame_data, roi_cache[cam_idx], conf_local, algo_mode)
-
-                # --- 增加蚊虫特性过滤 ---
-                filter_flying_insects(pane_json, frame_data, PIXELS_PER_MM)
 
                 # 会话逻辑：只有检测到玻璃(state_code>0)才开启文件夹；玻璃离开(state_code==0 且之前active)结束。
                 is_collection = bool(getattr(shared_settings, 'data_collection_mode', False))
