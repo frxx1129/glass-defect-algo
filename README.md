@@ -116,7 +116,35 @@ python -m compileall *.py tools
 
 ## 打包说明
 
-项目依赖中包含 Nuitka。打包产物不提交到仓库，生成后通常是 `main.build/`、`main.dist/` 或 `main.dist_*.zip`。打包时需要确保 `MVGigE.dll`、配置文件、ROI 模板和图标随产线部署包一起放置。
+每次代码或算法更新后，都需要用 Nuitka 重新打包，再把打包产物发到产线电脑。打包产物不提交到仓库，生成后通常是 `main.build/`、`main.dist/` 或 `main.dist_*.zip`。
+
+打包时要包含程序运行必需的 DLL 和静态资源，例如 `MVGigE.dll` 和 `icon.ico`；不要把本机调试用的 `config.yaml`、`config1.yaml`、`config2.yaml`、`config3.yaml` 等 YAML 配置文件打进 `main.dist`。产线配置以产线电脑 `C:\lineXXX` 目录中的现场 YAML 为准。
+
+示例命令：
+
+```powershell
+.\.venv\Scripts\python.exe -m nuitka main.py `
+  --standalone `
+  --enable-plugin=multiprocessing `
+  --include-package=scipy `
+  --include-data-files=MVGigE.dll=MVGigE.dll `
+  --include-data-files=icon.ico=icon.ico `
+  --windows-icon-from-ico=icon.ico
+```
+
+打包完成后检查 `main.dist`：
+
+- 必须有 `main.exe`、`MVGigE.dll` 和必要的 Python/第三方依赖文件。
+- 不要有本地 `*.yaml` 配置文件。
+- 不要有回放数据、日志、检测输出、历史压缩包或本地测试报表。
+
+确认无误后压缩 `main.dist`：
+
+```powershell
+Compress-Archive -Path .\main.dist\* -DestinationPath .\main.dist.zip -Force
+```
+
+把 `main.dist.zip` 传到产线电脑，解压到 C 盘对应产线目录，例如 `C:\line1`、`C:\line2`、`C:\line3` 或现场约定的 `C:\lineXXX` 文件夹。解压时直接覆盖同名文件即可；不要先清空整个目录，这样可以保留产线电脑上的现场 YAML、ROI 和硬件参数文件。
 
 ## 目录维护约定
 
