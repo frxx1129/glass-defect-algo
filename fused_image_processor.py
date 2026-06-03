@@ -84,14 +84,18 @@ def _adjust_params_for_dark(params: Dict[str, Any]) -> Dict[str, Any]:
     return p
 
 def _run_dark(image_gray, rois, full_config):
-    """深色玻璃：仅基于浅色参数集做运行时调整，不再读取独立 dark 参数。"""
+    """深色玻璃：优先使用独立 dark 参数；缺失时回退到浅色参数的运行时调整。"""
     try:
         # 优化：避免 deepcopy 整个 config，仅浅拷贝顶层并替换需要修改的部分
         cfg = dict(full_config) if isinstance(full_config, dict) else {}
-        base_params = full_config.get('hough_inspector_params')
-        if base_params is None:
-            raise ValueError("'hough_inspector_params' missing in config")
-        cfg['hough_inspector_params'] = _adjust_params_for_dark(base_params)
+        dark_params = full_config.get('hough_inspector_dark_params') if isinstance(full_config, dict) else None
+        if isinstance(dark_params, dict) and dark_params:
+            cfg['hough_inspector_params'] = dict(dark_params)
+        else:
+            base_params = full_config.get('hough_inspector_params')
+            if base_params is None:
+                raise ValueError("'hough_inspector_params' missing in config")
+            cfg['hough_inspector_params'] = _adjust_params_for_dark(base_params)
         return light_impl.process_image_from_memory_parallel(image_gray, rois, cfg)
     except Exception as e:
         print(f"[fused_image_processor] 深色模式执行异常, 回退浅色: {e}")

@@ -41,6 +41,7 @@ collections/
 main.build/
 main.dist/
 main.dist.zip
+main.dist_*.zip
 persistent_stats.dat
 hough_results_gpu
 valid/
@@ -64,3 +65,19 @@ inputs
 *_results/
 *_output/
 *_reports/
+
+# Runtime logs, profiling, and debug dumps
+*.log
+error_*.log
+*.prof
+debug_*.txt
+test_output.txt
+profile_*_summary.txt
+
+# Generated ROI/statistics/report artifacts
+*_rois_statistics.json
+*_ts*_roi_averaged_by_group.json
+*.webm_*_roi_averaged_by_group.json
+background_cleanup_report_*
+naobo_line2_cam01_defect_*
+naobo_line2/

@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import json
 import os
+import time
 from itertools import combinations
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
@@ -79,22 +80,22 @@ LINE2_CAM3_EXCLUSION_ZONES = [
 
 # Line3 cam3 exclusion zones - 简化版本 (4个框架，每框架4边)
 LINE3_CAM3_EXCLUSION_ZONES = [
-    {"x": 727, "y": 407, "width": 56, "height": 226},
-    {"x": 725, "y": 566, "width": 276, "height": 76},
-    {"x": 720, "y": 387, "width": 281, "height": 59},
-    {"x": 950, "y": 390, "width": 58, "height": 250},
-    {"x": 1382, "y": 375, "width": 295, "height": 46},
-    {"x": 1382, "y": 372, "width": 56, "height": 232},
-    {"x": 1382, "y": 532, "width": 290, "height": 71},
-    {"x": 1594, "y": 370, "width": 76, "height": 237},
-    {"x": 745, "y": 899, "width": 90, "height": 245},
-    {"x": 737, "y": 890, "width": 295, "height": 59},
-    {"x": 952, "y": 885, "width": 76, "height": 271},
-    {"x": 744, "y": 1051, "width": 288, "height": 102},
-    {"x": 1406, "y": 872, "width": 81, "height": 259},
-    {"x": 1402, "y": 868, "width": 285, "height": 80},
-    {"x": 1617, "y": 870, "width": 73, "height": 281},
-    {"x": 1399, "y": 1027, "width": 317, "height": 129}
+    {"x": 733, "y": 406, "width": 32, "height": 197},
+    {"x": 735, "y": 395, "width": 267, "height": 40},
+    {"x": 972, "y": 397, "width": 25, "height": 211},
+    {"x": 735, "y": 559, "width": 273, "height": 44},
+    {"x": 1390, "y": 378, "width": 58, "height": 213},
+    {"x": 1595, "y": 368, "width": 64, "height": 221},
+    {"x": 1397, "y": 366, "width": 261, "height": 39},
+    {"x": 1390, "y": 532, "width": 274, "height": 46},
+    {"x": 742, "y": 884, "width": 50, "height": 225},
+    {"x": 745, "y": 877, "width": 283, "height": 110},
+    {"x": 974, "y": 875, "width": 46, "height": 228},
+    {"x": 747, "y": 1064, "width": 271, "height": 30},
+    {"x": 1411, "y": 872, "width": 44, "height": 225},
+    {"x": 1409, "y": 855, "width": 269, "height": 49},
+    {"x": 1645, "y": 855, "width": 35, "height": 233},
+    {"x": 1418, "y": 1037, "width": 266, "height": 56}
 ]
 
 
@@ -342,6 +343,8 @@ _roi_ideal_vertical_cache = {}
 
 # 全局缓存大小限制，防止内存无限增长
 _CACHE_MAX_ENTRIES = 50
+# 过滤统计日志节流，避免刷屏
+_last_filter_stats_log_ts = 0.0
 
 def reset_global_caches():
     """重置所有全局缓存以释放内存。可在每片玻璃处理完成后或内存压力时调用。"""
@@ -2229,6 +2232,7 @@ def merge_lines_and_get_main_edges(lines, params, pixels_per_mm: float, edge_img
 def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: float, binary_edges=None, dbg=None):
     p_defect = params["DEFECT_DETECTION"]; p_crack = params["CRACK_CLASSIFICATION"]
     num_edges = len(edges); roi_h, roi_w = roi_dims
+    disable_x_defects = True
     # 保留原始检测到的所有线段，用于后续“斜边异常(E)”对全量直线的扫描
     all_detected_edges = [np.array(e, dtype=float) for e in (edges or [])]
     # 调试开关（控制台打印）：默认关闭，可通过 params.DEBUG.PRINT_CORNERS 开启
@@ -2996,6 +3000,11 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
             e_prefilter_enable = bool(params.get('DEFECT_DETECTION', {}).get('E_FAST_PREFILTER_ENABLE', True))
         except Exception:
             e_prefilter_enable = True
+        try:
+            e_prefilter_relax = float(params.get('DEFECT_DETECTION', {}).get('E_FAST_PREFILTER_RELAX', 1.0) or 1.0)
+        except Exception:
+            e_prefilter_relax = 1.0
+        e_prefilter_relax = min(1.0, max(0.1, e_prefilter_relax))
         skip_e_contours = False
         if e_prefilter_enable and edges_for_e is not None and edges_for_e.size > 0:
             try:
@@ -3016,6 +3025,10 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 e_roi_std_thr = float(params.get('DEFECT_DETECTION', {}).get('E_FAST_ROI_STD_THRESHOLD', 10.0))
             except Exception:
                 e_roi_std_thr = 10.0
+            # relax<1 时降低触发门槛，减少 E 在快速预过滤被过早屏蔽
+            e_min_edge_pixels = max(1, int(round(e_min_edge_pixels * e_prefilter_relax)))
+            e_min_edge_ratio = float(e_min_edge_ratio) * e_prefilter_relax
+            e_roi_std_thr = float(e_roi_std_thr) * e_prefilter_relax
             try:
                 roi_std = float(np.std(roi_gray))
             except Exception:
@@ -4140,6 +4153,8 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
                 pass
 
             def _handle_as_x_defect():
+                if disable_x_defects:
+                    return
                 angle = calculate_vertex_angle(p1_far, intersection, p2_far)
                 # 仅在合理范围考虑 X（避免尖角/钝角极端值）
                 if angle < 5.0 or angle > 175.0:
@@ -4590,36 +4605,62 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
         return 0.0
 
     filtered_defects = []
+    prefilter_drop_counts = {}
+
+    def _record_prefilter_drop(reason: str):
+        prefilter_drop_counts[reason] = int(prefilter_drop_counts.get(reason, 0)) + 1
+
+    try:
+        p_def_cfg = params.get('DEFECT_DETECTION', {})
+    except Exception:
+        p_def_cfg = {}
+    try:
+        prefilter_min_width_mm = float(p_def_cfg.get('PREFILTER_MIN_WIDTH_MM', p_def_cfg.get('MIN_WIDTH_MM', 3.0)))
+    except Exception:
+        prefilter_min_width_mm = 3.0
+    prefilter_min_width_mm = max(0.0, prefilter_min_width_mm)
+
     try:
         q_len_filter_enable = bool(params.get('DEFECT_DETECTION', {}).get('Q_LENGTH_RANGE_FILTER_ENABLE', False))
     except Exception:
         q_len_filter_enable = True
     try:
-        q_len_min_mm = float(params.get('DEFECT_DETECTION', {}).get('Q_LENGTH_MIN_MM', 23.0))
+        q_len_min_mm = float(params.get('DEFECT_DETECTION', {}).get('Q_LENGTH_MIN_MM', 5.0))
     except Exception:
-        q_len_min_mm = 23.0
+        q_len_min_mm = 5.0
     try:
-        q_len_max_mm = float(params.get('DEFECT_DETECTION', {}).get('Q_LENGTH_MAX_MM', 34.0))
+        q_len_max_mm = float(params.get('DEFECT_DETECTION', {}).get('Q_LENGTH_MAX_MM', 30.0))
     except Exception:
-        q_len_max_mm = 34.0
+        q_len_max_mm = 30.0
     for d in combined_defects:
         if d is None:
             continue
         t = d.get('type')
         if t in ('Q', 'B', 'L'):
             width_mm = _measure_width_mm_for_defect(d, pixels_per_mm)
-            if width_mm >= 5.0:
+            if width_mm >= prefilter_min_width_mm:
                 if t == 'Q' and q_len_filter_enable:
                     length_mm = _measure_length_mm_for_defect(d, pixels_per_mm)
                     if (q_len_min_mm and length_mm < q_len_min_mm) or (q_len_max_mm and length_mm > q_len_max_mm):
-                        # drop
+                        _record_prefilter_drop('Q_PREFILTER_LEN_RANGE')
                         continue
                 filtered_defects.append(d)
             else:
-                # 过滤宽度小于 5mm 的 Q/B/L
-                pass
+                _record_prefilter_drop('QBL_PREFILTER_MIN_WIDTH')
         else:
             filtered_defects.append(d)
+
+    try:
+        global _last_filter_stats_log_ts
+        filter_log_enable = bool(p_def_cfg.get('FILTER_LOG_ENABLE', True))
+        filter_log_interval_s = float(p_def_cfg.get('FILTER_LOG_INTERVAL_S', 30.0) or 30.0)
+        roi_tag = params.get('ROI_ID', -1) if isinstance(params, dict) else -1
+        now_ts = time.time()
+        if filter_log_enable and prefilter_drop_counts and (now_ts - _last_filter_stats_log_ts >= max(1.0, filter_log_interval_s)):
+            print(f"[过滤统计][预过滤] roi={roi_tag} counts={prefilter_drop_counts}")
+            _last_filter_stats_log_ts = now_ts
+    except Exception:
+        pass
 
     return edges_for_drawing, filtered_defects, paired_corners
 
@@ -5220,7 +5261,15 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 pass
     
     final_defects_for_report = []
+    filter_reason_counts = {}
+
+    def _record_filter(reason: str, defect_type: str):
+        key = f"{str(defect_type).upper()}:{reason}"
+        filter_reason_counts[key] = int(filter_reason_counts.get(key, 0)) + 1
+
     for defect in all_defects:
+        if str(defect.get('type', '')).upper() == 'X':
+            continue
         # 若当前相机禁用 Q，则直接跳过所有 Q 缺陷（不进入后续绘制与上报）
         try:
             if (not _q_enabled_runtime) and str(defect.get('type','')).upper() == 'Q':
@@ -5262,6 +5311,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             break
                     if in_zone:
                         should_be_filtered = True
+                        _record_filter('E_EXCLUSION_ZONE', 'E')
                         # print(f"    [DEBUG] 过滤 E 缺陷: 点({px:.1f},{py:.1f}) 在 exclusion zone 内")
                         break
             except Exception:
@@ -5403,6 +5453,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         # 这里先对 Q 进行早期过滤；B 的过滤放到后续 B 分支且“未转为 L”时执行。
         if new_defect['type'] == 'Q':
             if float(location.get('width_mm', 0.0) or 0.0) < min_width_mm_rule:
+                _record_filter('Q_MIN_WIDTH_MM', 'Q')
                 continue
 
         min_size_mm = params["DEFECT_DETECTION"].get("MIN_DEFECT_SIZE_MM", 3.0)
@@ -5422,6 +5473,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 rect_w, rect_h = min_area_rect_for_extent[1]
                 rect_area = rect_w * rect_h
                 if rect_area > 1e-6 and (contour_area / rect_area) < min_extent_ratio:
+                    _record_filter('B_MIN_EXTENT_RATIO', 'B')
                     continue
 
             # 平行过滤：若 B 的长边与最近主边近似平行（<=容差），且(长宽比>10 或 窄边<2mm) 则直接丢弃
@@ -5469,6 +5521,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                         ar_min = float(p_def.get('B_FILTER_PARALLEL_AR_MIN', 10.0))
                         min_side_mm = float(p_def.get('B_FILTER_PARALLEL_MIN_SIDE_MM', 2.0))
                         if is_parallel and (ar > ar_min or width_mm < min_side_mm):
+                            _record_filter('B_PARALLEL_SUPPRESS', 'B')
                             continue
             except Exception:
                 pass
@@ -5479,13 +5532,22 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                 continue
             length_mm = location.get('length_mm', 0); width_mm = location.get('width_mm', 0)
             area_mm2 = length_mm * width_mm; aspect_ratio = length_mm / width_mm if width_mm > 1e-6 else float('inf')
-            if area_mm2 < 2.25: continue
-            if aspect_ratio > 20.0: continue
-            if min(length_mm, width_mm) < 2.0: continue
-            if length_mm < min_size_mm: continue
+            if area_mm2 < 2.25:
+                _record_filter('Q_MIN_AREA_MM2', 'Q')
+                continue
+            if aspect_ratio > 20.0:
+                _record_filter('Q_MAX_ASPECT_RATIO', 'Q')
+                continue
+            if min(length_mm, width_mm) < 2.0:
+                _record_filter('Q_MIN_SIDE_MM', 'Q')
+                continue
+            if length_mm < min_size_mm:
+                _record_filter('Q_MIN_DEFECT_SIZE_MM', 'Q')
+                continue
             
         elif new_defect['type'] in ['B']:
             if location.get('length_mm', 0) < min_size_mm:
+                _record_filter('B_MIN_DEFECT_SIZE_MM', 'B')
                 continue
 
         if new_defect['type'] == 'B':
@@ -5549,14 +5611,18 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                             inter = cv2.bitwise_and(tmp_mask, l_endpoint_belt_mask)
                             if cv2.countNonZero(inter) > 0:
                                 should_be_filtered = True
+                                _record_filter('L_ENDPOINT_BELT_MASK', 'L')
                 except Exception:
                     pass
             else:
                 # 仅对仍为 B 的缺陷应用 B 专属筛选
                 # 宽度过滤（仅对未被转为 L 的 B 生效）
                 if width_mm < min_width_mm_rule:
+                    _record_filter('B_MIN_WIDTH_MM', 'B')
                     continue
-                if area_mm2 < 25 and width_mm < min_size_mm: continue
+                if area_mm2 < 25 and width_mm < min_size_mm:
+                    _record_filter('B_MIN_AREA_AND_WIDTH', 'B')
+                    continue
         
         # 新增：L 型缺陷过滤——在完成 B→L 重分类之后，屏蔽主边缘附近(≤阈值，默认5mm)的所有 L 型缺陷
         if new_defect.get('type') == 'L':
@@ -5571,6 +5637,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                         # 对应 B 分支中的面积/比例启发式（不包含 MIN_WIDTH_MM 最短边过滤）
                         if (area_mm2 < 25 and width_mm < 2.0):
                             should_be_filtered = True
+                            _record_filter('L_FROM_B_SMALL_AREA', 'L')
                 except Exception:
                     pass
 
@@ -5594,6 +5661,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                         d_mm = d_px / float(pixels_per_mm if pixels_per_mm else 1.0)
                         if d_mm <= max_dist_mm:
                             should_be_filtered = True
+                            _record_filter('L_NEAR_MAIN_EDGE', 'L')
                             break
             except Exception:
                 pass
@@ -5602,6 +5670,18 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         if not should_be_filtered:
             final_defects_for_report.append(new_defect)
         # --- MODIFICATION END ---
+
+    try:
+        global _last_filter_stats_log_ts
+        p_def_cfg2 = params.get('DEFECT_DETECTION', {}) if isinstance(params, dict) else {}
+        filter_log_enable = bool(p_def_cfg2.get('FILTER_LOG_ENABLE', True))
+        filter_log_interval_s = float(p_def_cfg2.get('FILTER_LOG_INTERVAL_S', 30.0) or 30.0)
+        now_ts = time.time()
+        if filter_log_enable and filter_reason_counts and (now_ts - _last_filter_stats_log_ts >= max(1.0, filter_log_interval_s)):
+            print(f"[过滤统计][后处理] roi={roi_idx} counts={filter_reason_counts}")
+            _last_filter_stats_log_ts = now_ts
+    except Exception:
+        pass
 
     # 统计“近竖直”的主边数量（0~2 常见）：基于主边段方向角(相对x轴 0~90°)，角度>=90°-tol 视为近竖直
     try:
@@ -5824,7 +5904,7 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
     # 绘制识别到的主直线和“理想直线边”（可配置开关）
     try:
-        draw_main = bool(params.get('VISUALIZATION', {}).get('SHOW_MAIN_EDGES', False))
+        draw_main = False
     except Exception:
         draw_main = False
     try:
@@ -5836,16 +5916,6 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     except Exception:
         draw_shared = False
 
-
-    # 当 SHOW_MAIN_EDGES 开启时，在 ROI 画面中用蓝色绘制所有识别为玻璃边的主边
-    if draw_main and main_edges:
-        try:
-            for edge in main_edges:
-                x1, y1, x2, y2 = int(round(float(edge[0]))), int(round(float(edge[1]))), \
-                                  int(round(float(edge[2]))), int(round(float(edge[3])))
-                cv2.line(roi_color, (x1, y1), (x2, y2), (255, 0, 0), 2)  # 蓝色 BGR
-        except Exception:
-            pass
     # 仍保留：若某些缺陷对象自身提供 center/region_contour，则额外用绿色标点以示区分
     try:
         for defect_report in final_defects_for_report:
@@ -5939,18 +6009,6 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
     _line_name_run = hough_params.get('_RUNTIME_LINE_NAME', '')
     _cam_index_run = hough_params.get('_RUNTIME_CAM_INDEX', -1)
     _exclusion_zones_run = get_exclusion_zones(_line_name_run, _cam_index_run)
-
-    # 降采样时同步缩放排除区域的像素坐标
-    try:
-        _proc_scale = float(config.get('_PROCESSING_SCALE', 1.0) or 1.0)
-        if 0 < _proc_scale < 1.0 and _exclusion_zones_run:
-            _exclusion_zones_run = [
-                {"x": int(z["x"] * _proc_scale), "y": int(z["y"] * _proc_scale),
-                 "width": int(z["width"] * _proc_scale), "height": int(z["height"] * _proc_scale)}
-                for z in _exclusion_zones_run
-            ]
-    except Exception:
-        pass
 
     try:
         roi_threads_cfg = int(sys_params.get('roi_threads', 0) or 0)

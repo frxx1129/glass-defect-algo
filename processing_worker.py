@@ -6,6 +6,7 @@ import base64
 import traceback
 from queue import Empty
 import time
+import gc
 import fused_image_processor
 import copy
 import numpy as np
@@ -169,6 +170,10 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
     drain_budget_ms = int(config.get('system_params', {}).get('coalesce_drain_budget_ms', 5))
     drain_max_n_cfg = int(config.get('system_params', {}).get('coalesce_max_drain', 50))
     try:
+        worker_cache_clear_interval_s = float(config.get('system_params', {}).get('worker_cache_clear_interval_s', 60.0) or 60.0)
+    except Exception:
+        worker_cache_clear_interval_s = 60.0
+    try:
         expected_cams = int(config.get('camera_setup', {}).get('expected_cameras', 0) or 0)
     except Exception:
         expected_cams = 0
@@ -177,6 +182,7 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
     # 防止单次批量过大导致队列抖动和端到端延迟上升。
     drain_cap_by_topology = max(20, expected_cams * 8)
     drain_max_n = max(1, min(drain_max_n_cfg, drain_cap_by_topology))
+    last_cache_clear_ts = time.time()
     
     roi_cache: dict[int, list] = {}
     camera_rois_cfg = config.get('camera_rois', {})
@@ -209,6 +215,20 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
 
     try:
         while not stop_event.is_set():
+            now_ts = time.time()
+            if worker_cache_clear_interval_s > 0 and (now_ts - last_cache_clear_ts) >= worker_cache_clear_interval_s:
+                try:
+                    # 仅清理算法全局缓存，避免跨帧状态无限增长。
+                    from image_processor_hough import reset_global_caches
+                    reset_global_caches()
+                except Exception:
+                    pass
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
+                last_cache_clear_ts = now_ts
+
             if not run_event.is_set():
                 # 检测被暂停时，仍会持续从队列取数据以防队列堆积；这里补一条低频日志，避免“静默不处理”难定位。
                 now = time.time()
@@ -236,8 +256,18 @@ def calculation_worker(process_index, task_queue, results_queue, stop_event, run
                     tasks_to_process.append(first_task)
                 t0 = time.perf_counter()
                 drained = 0
+                adaptive_drain_max_n = drain_max_n
+                try:
+                    qsize_now = int(task_queue.qsize())
+                except Exception:
+                    qsize_now = -1
+                if qsize_now >= expected_cams * 80:
+                    adaptive_drain_max_n = max(1, min(drain_max_n, expected_cams * 2))
+                elif qsize_now >= expected_cams * 40:
+                    adaptive_drain_max_n = max(1, min(drain_max_n, expected_cams * 4))
+
                 # 继续在时间/数量预算内尽可能多取任务，但不去重/覆盖，保持 FIFO 处理
-                while drained < max(0, drain_max_n - 1) and (time.perf_counter() - t0) * 1000.0 < max(0, drain_budget_ms):
+                while drained < max(0, adaptive_drain_max_n - 1) and (time.perf_counter() - t0) * 1000.0 < max(0, drain_budget_ms):
                     try:
                         item = task_queue.get_nowait()
                         tasks_to_process.append(item)

@@ -103,25 +103,7 @@ class CameraManager:
         打开相机，优先尝试通过物理索引(相机ID)打开，然后尝试通过MAC地址查找IP，最后尝试通过IP打开
         """
         CameraManager.ensure_lib_initialized()
-        
-        # === 快速通道：如果已有具体的 IP，跳过耗时的枚举直接打开 ===
-        if self.ip:
-            print(f"[相机进程 {self.cam_index}]: 已有IP {self.ip}，尝试优先直接打开相机...")
-            try:
-                res, self.handle = MVOpenCamByIP(self.ip)
-                if res == MVST_SUCCESS and self.handle != 0:
-                    try:
-                        MVSetHeartbeatTimeout(self.handle, int(self.heartbeat_timeout_ms))
-                    except Exception:
-                        pass
-                    print(f"✅ [相机进程 {self.cam_index}]: 相机已通过预设IP {self.ip} 成功快速打开")
-                    return True
-                else:
-                    print(f"[相机进程 {self.cam_index}]: 直接通过预设IP {self.ip} 打开失败(错误码:{res})，退回常规流程...")
-                    self.handle = 0
-            except Exception as e:
-                print(f"[相机进程 {self.cam_index}]: 直接通过预设IP {self.ip} 打开出错: {e}，退回常规流程...")
-                self.handle = 0
+        print(f"[相机进程 {self.cam_index}]: 快速IP直连通道已禁用，强制使用回退连接流程")
 
         # === 以下为常规枚举与打开流程 ===
 

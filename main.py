@@ -208,6 +208,23 @@ def main():
             pass
         # 记录配置来源路径，供子进程在“自动补全配置”时回写到同一文件。
         config['__config_path'] = cfg_path
+        try:
+            sp0 = config.get('system_params', {}) or {}
+            dd0 = ((config.get('hough_inspector_params', {}) or {}).get('DEFECT_DETECTION', {}) or {})
+            rp0 = config.get('rejection_params', {}) or {}
+            print(
+                "[主进程]: 配置快照 "
+                f"path={cfg_path} "
+                f"Q_LEN=[{dd0.get('Q_LENGTH_MIN_MM', 23.0)}, {dd0.get('Q_LENGTH_MAX_MM', 34.0)}] "
+                f"Q_FILTER={dd0.get('Q_LENGTH_RANGE_FILTER_ENABLE', False)} "
+                f"MIN_WIDTH_MM={dd0.get('MIN_WIDTH_MM', 5.0)} "
+                f"MIN_DEFECT_SIZE_MM={dd0.get('MIN_DEFECT_SIZE_MM', 3.0)} "
+                f"LUMINOSITY_MIN_AREA_MM2={dd0.get('LUMINOSITY_MIN_AREA_MM2', 'NA')} "
+                f"max_defect_size_mm={rp0.get('max_defect_size_mm', 20)} "
+                f"memory_auto_restart_enabled={sp0.get('memory_auto_restart_enabled', False)}"
+            )
+        except Exception:
+            pass
     except Exception as e:
         sys.exit(f"错误: 无法加载 {cfg_path}: {e}")
 
@@ -859,15 +876,93 @@ def main():
     except Exception:
         mem_check_interval_s = 5.0
 
+    try:
+        mem_auto_restart_enabled = bool(system_params.get('memory_auto_restart_enabled', False))
+    except Exception:
+        mem_auto_restart_enabled = False
+    try:
+        periodic_gc_interval_s = float(system_params.get('periodic_gc_interval_s', 30.0) or 30.0)
+    except Exception:
+        periodic_gc_interval_s = 30.0
+    try:
+        periodic_trim_interval_s = float(system_params.get('periodic_trim_workingset_interval_s', 120.0) or 120.0)
+    except Exception:
+        periodic_trim_interval_s = 120.0
+
     mem_recovering_flag = threading.Event()
 
     try:
         print(
             f"[主进程]: 内存监控已启用 main_process_tree_threshold={mem_restart_threshold_gb:.2f}GB "
-            f"(fallback_system_threshold={mem_threshold_pct:.1f}%) interval={mem_check_interval_s:.1f}s"
+            f"(fallback_system_threshold={mem_threshold_pct:.1f}%) interval={mem_check_interval_s:.1f}s "
+            f"auto_restart={'ON' if mem_auto_restart_enabled else 'OFF'} gc_interval={periodic_gc_interval_s:.1f}s "
+            f"trim_interval={periodic_trim_interval_s:.1f}s"
         )
     except Exception:
         pass
+
+    def _trim_pid_working_set(pid: int) -> bool:
+        """在 Windows 上尝试收缩指定进程工作集。"""
+        if os.name != 'nt':
+            return False
+        PROCESS_QUERY_INFORMATION = 0x0400
+        PROCESS_SET_QUOTA = 0x0100
+        handle = None
+        try:
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, int(pid))
+            if not handle:
+                return False
+            return bool(psapi.EmptyWorkingSet(handle))
+        except Exception:
+            return False
+        finally:
+            try:
+                if handle:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+
+    def _trim_process_tree_working_set() -> int:
+        """尝试修剪主进程及其子进程工作集，返回成功修剪数量。"""
+        trimmed = 0
+        # 优先修剪主进程
+        try:
+            if _trim_pid_working_set(os.getpid()):
+                trimmed += 1
+        except Exception:
+            pass
+
+        # 可选修剪子进程
+        try:
+            import psutil
+            root = psutil.Process(os.getpid())
+            for child in root.children(recursive=True):
+                try:
+                    if _trim_pid_working_set(child.pid):
+                        trimmed += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return trimmed
+
+    def _run_light_maintenance(do_trim: bool):
+        """轻量内存维护：GC + 可选 Working Set 修剪，不做重启。"""
+        gc_collected = 0
+        trimmed = 0
+        try:
+            import gc as _gc
+            gc_collected = int(_gc.collect() or 0)
+        except Exception:
+            gc_collected = 0
+        if do_trim:
+            try:
+                trimmed = _trim_process_tree_working_set()
+            except Exception:
+                trimmed = 0
+        return gc_collected, trimmed
 
     def _clear_caches_and_temp():
         cleared = {}
@@ -905,8 +1000,26 @@ def main():
             pass
 
     def _memory_watch_loop():
+        last_gc_ts = 0.0
+        last_trim_ts = 0.0
         while not stop_event.is_set():
             time.sleep(max(1.0, mem_check_interval_s))
+
+            now_ts = time.time()
+            # 周期轻量维护：无论是否达到阈值均执行
+            try:
+                do_gc = (periodic_gc_interval_s > 0.0) and ((now_ts - last_gc_ts) >= periodic_gc_interval_s)
+                do_trim = (periodic_trim_interval_s > 0.0) and ((now_ts - last_trim_ts) >= periodic_trim_interval_s)
+                if do_gc or do_trim:
+                    gc_n, trimmed_n = _run_light_maintenance(do_trim=do_trim)
+                    if do_gc:
+                        last_gc_ts = now_ts
+                    if do_trim:
+                        last_trim_ts = now_ts
+                    if gc_n > 0 or trimmed_n > 0:
+                        print(f"[主进程]: 周期内存维护 gc_collected={gc_n}, trimmed_processes={trimmed_n}")
+            except Exception:
+                pass
 
             # 1) 主判定：进程树内存（main.exe + 子进程）
             proc_gb = _get_process_tree_memory_gb()
@@ -958,20 +1071,27 @@ def main():
                         extra += f" system_used={sys_used_gb:.2f}/{sys_total_gb:.2f}GB ({sys_pct:.1f}%)"
                     print(
                         f"\n[主进程]: [内存看门狗] 触发 @ {ts} reason={trigger_reason}{extra} "
-                        f"run_event={run_on} qsize(task/results/rej)={tq}/{rq}/{jq}"
+                        f"run_event={run_on} qsize(task/results/rej)={tq}/{rq}/{jq} auto_restart={'ON' if mem_auto_restart_enabled else 'OFF'}"
                     )
                 except Exception:
                     pass
-                try:
-                    run_event.clear()
-                except Exception:
-                    pass
-                _clear_caches_and_temp()
-                try:
-                    _restart_children(grace_seconds=5.0)
-                except Exception as e:
+                if mem_auto_restart_enabled:
                     try:
-                        print(f"[主进程]: [内存看门狗] 重启子进程失败: {e}")
+                        run_event.clear()
+                    except Exception:
+                        pass
+                    _clear_caches_and_temp()
+                    try:
+                        _restart_children(grace_seconds=5.0)
+                    except Exception as e:
+                        try:
+                            print(f"[主进程]: [内存看门狗] 重启子进程失败: {e}")
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        gc_n, trimmed_n = _run_light_maintenance(do_trim=True)
+                        print(f"[主进程]: [内存看门狗] 已执行非重启维护 gc_collected={gc_n}, trimmed_processes={trimmed_n}")
                     except Exception:
                         pass
                 try:

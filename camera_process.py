@@ -116,8 +116,8 @@ def _camera_worker_process(cam_index: int, task_queue, stop_event, run_event, co
             # 确保更新相机列表获取最新状态
             MVUpdateCameraList()
             
-            # 使用MAC地址和IP打开相机，IP可触发快速连接
-            cam = CameraManager(cam_index, mac=desired_mac, ip=desired_ip)
+            # 优先使用MAC地址打开相机
+            cam = CameraManager(cam_index, mac=desired_mac)
         else:
             # 如果没有绑定信息，使用索引直接打开
             print(f"[相机进程 {cam_index}]: 未找到相机绑定信息，使用索引打开")
@@ -186,34 +186,13 @@ def _camera_worker_process(cam_index: int, task_queue, stop_event, run_event, co
             cam.set_params(unified_params)
             shared_states[cam_index] = cam.get_full_status()
 
-            # 获取降采样比例
-            try:
-                processing_scale = float(config.get('system_params', {}).get('processing_scale', 1.0) or 1.0)
-                if processing_scale <= 0 or processing_scale > 1.0:
-                    processing_scale = 1.0
-            except Exception:
-                processing_scale = 1.0
-
-            # 回调函数：转图并复制缓冲，缩放后投入队列（减少IPC传输开销）
+            # 回调函数：转图并复制缓冲，投入队列（回调内尽量短）
             def _on_frame(info_ptr, user_val_ptr):
                 try:
                     img, fid = MV_info_to_image(cam.handle, info_ptr)
                     try:
-                        orig_h, orig_w = img.shape[:2]
-                        if processing_scale < 1.0:
-                            import cv2
-                            new_w = int(orig_w * processing_scale)
-                            new_h = int(orig_h * processing_scale)
-                            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                        
                         # 始终投递帧（临时屏蔽运行开关）
-                        task_queue.put_nowait({
-                            "data": img, 
-                            "cam_index": cam_index, 
-                            "frame_id": fid,
-                            "orig_shape": (orig_h, orig_w),
-                            "scale_applied": processing_scale
-                        })
+                        task_queue.put_nowait({"data": img, "cam_index": cam_index, "frame_id": fid})
                     except queue.Full:
                         pass
                 except Exception:
@@ -506,29 +485,9 @@ def camera_pool_process(task_queue, stop_event, run_event, cameras_ready_event, 
                     h_in, w_in = frame_gray.shape
                     if h_in != cam_h or w_in != cam_w:
                         frame_gray = cv2.resize(frame_gray, (cam_w, cam_h), interpolation=cv2.INTER_AREA)
-
-                try:
-                    processing_scale_sim = float(config.get('system_params', {}).get('processing_scale', 1.0) or 1.0)
-                    if processing_scale_sim <= 0 or processing_scale_sim > 1.0:
-                        processing_scale_sim = 1.0
-                except Exception:
-                    processing_scale_sim = 1.0
-
-                orig_h, orig_w = frame_gray.shape[:2]
-                if processing_scale_sim < 1.0:
-                    new_w = int(orig_w * processing_scale_sim)
-                    new_h = int(orig_h * processing_scale_sim)
-                    frame_gray = cv2.resize(frame_gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
                 try:
                     # 将统一 ROI 一并投递，供处理进程首次载入时直接使用
-                    task_queue.put_nowait({
-                        "data": frame_gray, 
-                        "cam_index": idx, 
-                        "rois": unified_rois,
-                        "orig_shape": (orig_h, orig_w),
-                        "scale_applied": processing_scale_sim
-                    })
+                    task_queue.put_nowait({"data": frame_gray, "cam_index": idx, "rois": unified_rois})
                 except queue.Full:
                     pass
                 next_times[idx] += frame_intervals[idx]
