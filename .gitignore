@@ -81,3 +81,13 @@ profile_*_summary.txt
 background_cleanup_report_*
 naobo_line2_cam01_defect_*
 naobo_line2/
+
+# Local-only tools and experiments
+docs/
+tools/
+*_annotator.py
+debug_*.py
+main_sim.py
+simulate_*.py
+test_*.py
+*_validation/

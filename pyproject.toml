@@ -19,17 +19,8 @@ dependencies = [
 	# HTTP client
 	"requests>=2.31.0",
 
-	# Performance JIT
-	"numba>=0.59.0",
-	"llvmlite>=0.42.0",  # 与 numba 版本配套
-
-	# Clustering (DBSCAN used) - 正确包名是 scikit-learn 不是 scikit
-	"scikit-learn>=1.4.0",
 	"nuitka>=2.3",
-	"scipy>=1.12.0",  # 打包命令中引用 --include-package=scipy
 	"pyserial",
-	"opencv-contrib-python",
-	"tqdm",
 	"Pillow",
 	"pyyaml"
 ]
