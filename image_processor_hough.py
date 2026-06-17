@@ -1099,10 +1099,10 @@ def _snap_line_to_canny(seg: np.ndarray, edge_img: np.ndarray, stripe_half_px: i
         return seg
     pts = np.column_stack((xs, ys)).astype(np.float32)
     try:
-        vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
+        vx, vy, x0, y0 = [float(x.item() if hasattr(x, 'item') else x) for x in cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)]
     except Exception:
         return seg
-    norm = math.hypot(float(vx), float(vy))
+    norm = math.hypot(vx, vy)
     if norm < 1e-6:
         return seg
     vx = float(vx) / norm
@@ -1163,13 +1163,13 @@ def _fit_line_from_edges(edge_img: np.ndarray, seg: np.ndarray, band_half: int,
     ys = ys.astype(np.float32) + float(y0)
     pts = np.column_stack((xs, ys)).astype(np.float32)
     try:
-        vx, vy, cx, cy = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
+        vx, vy, cx, cy = [float(x.item() if hasattr(x, 'item') else x) for x in cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)]
     except Exception:
         return None
-    norm = math.hypot(float(vx), float(vy))
+    norm = math.hypot(vx, vy)
     if norm < 1e-6:
         return None
-    vx = float(vx) / norm; vy = float(vy) / norm
+    vx = vx / norm; vy = vy / norm
     ang = abs(math.degrees(math.atan2(vy, vx)))
     if ang > 90.0:
         ang = 180.0 - ang
@@ -5476,6 +5476,18 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
                     _record_filter('B_MIN_EXTENT_RATIO', 'B')
                     continue
 
+            # 圆形度过滤：灯珠投影呈圆形（假缺陷），圆形度 > 阈值则过滤
+            circ_enabled = params["DEFECT_DETECTION"].get("B_FILTER_CIRCULARITY_ENABLED", False)
+            if circ_enabled and contour is not None and len(contour) >= 5:
+                circ_threshold = params["DEFECT_DETECTION"].get("B_FILTER_CIRCULARITY_THRESHOLD", 0.85)
+                area = cv2.contourArea(contour)
+                perimeter = cv2.arcLength(contour, True)
+                if perimeter > 1e-6:
+                    circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+                    if circularity > circ_threshold:
+                        _record_filter('B_CIRCULARITY', 'B')
+                        continue
+
             # 平行过滤：若 B 的长边与最近主边近似平行（<=容差），且(长宽比>10 或 窄边<2mm) 则直接丢弃
             try:
                 # 使用 main_edges（本函数作用域的主边列表）
@@ -5993,6 +6005,151 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
 
     return roi_report, roi_color
 
+
+# ============================================================
+# 静态干扰自动抑制器 (Static Artifact Suppressor)
+# 原理：真缺陷随玻璃移动位置不断变化，静态干扰（灯板反光/镜头脏污）
+#       在同一位置持续出现。同一网格位置连续出现超过阈值帧数，
+#       自动标记为"静态干扰"并抑制上报。
+# ============================================================
+import os as _os_static
+import json as _json_static
+import time as _time_static
+
+_static_artifact_state = {}
+
+def _get_artifact_state_path():
+    try:
+        return _os_static.path.join(
+            _os_static.path.dirname(_os_static.path.abspath(__file__)),
+            'static_artifact_state.json'
+        )
+    except Exception:
+        return 'static_artifact_state.json'
+
+def _load_artifact_state():
+    global _static_artifact_state
+    try:
+        sp = _get_artifact_state_path()
+        if _os_static.path.exists(sp):
+            with open(sp, 'r', encoding='utf-8') as f:
+                loaded = _json_static.load(f)
+                if isinstance(loaded, dict):
+                    _static_artifact_state = loaded
+    except Exception:
+        pass
+
+def _save_artifact_state():
+    try:
+        sp = _get_artifact_state_path()
+        with open(sp, 'w', encoding='utf-8') as f:
+            _json_static.dump(_static_artifact_state, f)
+    except Exception:
+        pass
+
+_load_artifact_state()
+
+def filter_static_artifact_defects(defects, line_name, cam_index, hough_params):
+    global _static_artifact_state
+    if not defects:
+        return defects
+    try:
+        dd = hough_params.get('DEFECT_DETECTION', {})
+        sas_enabled = bool(dd.get('STATIC_ARTIFACT_ENABLED', True))
+        if not sas_enabled:
+            return defects
+        min_consecutive = int(dd.get('STATIC_ARTIFACT_MIN_CONSECUTIVE', 100))
+        grid_size = int(dd.get('STATIC_ARTIFACT_GRID_SIZE', 60))
+        cooldown_frames = int(dd.get('STATIC_ARTIFACT_COOLDOWN_FRAMES', 500))
+        report_interval = int(dd.get('STATIC_ARTIFACT_REPORT_INTERVAL', 500))
+    except Exception:
+        return defects
+
+    cam_key = f"{line_name}_cam{cam_index}" if line_name else f"cam{cam_index}"
+    if cam_key not in _static_artifact_state:
+        _static_artifact_state[cam_key] = {"total": 0, "cells": {}}
+    tracker = _static_artifact_state[cam_key]
+    tracker["total"] = tracker.get("total", 0) + 1
+    cells = tracker.get("cells", {})
+
+    # ---- 当前帧缺陷位置网格化 ----
+    current_cells = set()
+    for defect in defects:
+        loc = defect.get('location', {})
+        gx = loc.get('x', -1)
+        gy = loc.get('y', -1)
+        if gx < 0 or gy < 0:
+            continue
+        cx = int(gx // grid_size) * grid_size
+        cy = int(gy // grid_size) * grid_size
+        current_cells.add(f"{cx}_{cy}")
+
+    # ---- 更新网格状态：出现则+streak，未出现则+absent ----
+    for cell_key in list(cells.keys()):
+        info = cells[cell_key]
+        if cell_key in current_cells:
+            info["streak"] = info.get("streak", 0) + 1
+            info["absent"] = 0
+        else:
+            info["absent"] = info.get("absent", 0) + 1
+            if info["absent"] > cooldown_frames:
+                del cells[cell_key]
+
+    for cell_key in current_cells:
+        if cell_key not in cells:
+            cells[cell_key] = {"streak": 1, "absent": 0, "suppressed": False,
+                               "first_seen": int(_time_static.time())}
+
+    tracker["cells"] = cells
+
+    # ---- 标记需要抑制的网格 ----
+    suppressed_cells = set()
+    for cell_key, info in cells.items():
+        if info.get("streak", 0) >= min_consecutive:
+            info["suppressed"] = True
+            suppressed_cells.add(cell_key)
+        elif info.get("suppressed", False):
+            suppressed_cells.add(cell_key)  # 从持久化恢复的已抑制位置
+
+    # ---- 过滤缺陷 ----
+    filtered = []
+    suppressed_count = 0
+    for defect in defects:
+        loc = defect.get('location', {})
+        gx = loc.get('x', -1)
+        gy = loc.get('y', -1)
+        cx = int(gx // grid_size) * grid_size
+        cy = int(gy // grid_size) * grid_size
+        cell_key = f"{cx}_{cy}"
+        if cell_key in suppressed_cells:
+            suppressed_count += 1
+            continue
+        filtered.append(defect)
+
+    # ---- 全部被抑制时，每 N 帧上报一条 S 类型兜底（确保系统知道在运行） ----
+    total = tracker["total"]
+    if not filtered and defects and suppressed_count > 0:
+        if total % report_interval == 0 or total <= 5:
+            d = dict(defects[0])
+            d['location'] = dict(defects[0].get('location', {}))
+            d['type'] = 'S'  # S = Static artifact，系统记录但不下发NG报警
+            filtered.append(d)
+
+    # ---- 定期持久化 ----
+    if total % 500 == 0:
+        _save_artifact_state()
+
+    # ---- 定期清理过旧数据 ----
+    if total % 10000 == 0:
+        for cell_key in list(tracker.get("cells", {}).keys()):
+            info = tracker["cells"].get(cell_key, {})
+            if info.get("absent", 0) > cooldown_frames * 10:
+                del tracker["cells"][cell_key]
+        _save_artifact_state()
+
+    return filtered
+
+
 def process_image_from_memory_parallel(image_gray, template_rois, config):
     final_image = cv2.cvtColor(image_gray, cv2.COLOR_GRAY2BGR)
     report = {"image_status": "OK", "defects": [] , "state_code": 0, "rois": []}
@@ -6243,14 +6400,14 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
                     total_len += float(np.hypot(float(s[2]) - float(s[0]), float(s[3]) - float(s[1])))
                 pts_np = np.array(pts, dtype=np.float32)
                 try:
-                    vx, vy, x0, y0 = cv2.fitLine(pts_np, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+                    vx, vy, x0, y0 = [float(x) for x in cv2.fitLine(pts_np, cv2.DIST_L2, 0, 0.01, 0.01).flatten()]
                 except Exception:
                     vx, vy, x0, y0 = 0.0, 1.0, float(np.mean(g['xs'])), float(np.mean(pts_np[:,1]))
-                norm = math.hypot(float(vx), float(vy))
+                norm = math.hypot(vx, vy)
                 if norm < 1e-6:
                     vx, vy = 0.0, 1.0
                 else:
-                    vx, vy = float(vx) / norm, float(vy) / norm
+                    vx, vy = vx / norm, vy / norm
                 ang_fit = abs(np.degrees(math.atan2(vy, vx)))
                 if ang_fit > 90.0:
                     ang_fit = 180.0 - ang_fit
@@ -6444,6 +6601,19 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
                     cv2.addWeighted(overlay, canny_alpha, roi_bgr, 1.0 - canny_alpha, 0, roi_bgr)
                 except Exception:
                     continue
+    except Exception:
+        pass
+    
+    # ---- 静态干扰自动抑制：同一位置持续出现的缺陷判定为静态干扰 ----
+    try:
+        _line_name_run = hough_params.get('_RUNTIME_LINE_NAME', '')
+        _cam_index_run = hough_params.get('_RUNTIME_CAM_INDEX', -1)
+        report["defects"] = filter_static_artifact_defects(
+            report.get("defects", []),
+            _line_name_run,
+            int(_cam_index_run) if _cam_index_run != -1 else -1,
+            hough_params
+        )
     except Exception:
         pass
     
