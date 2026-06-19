@@ -6616,5 +6616,9 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
         )
     except Exception:
         pass
-    
+   
+    # 缺陷全部被静态抑制过滤掉后，恢复 image_status 为 OK，避免空缺陷上传
+    if not report.get("defects"):
+        report["image_status"] = "OK"
+        
     return report, final_image
