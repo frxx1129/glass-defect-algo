@@ -6128,7 +6128,10 @@ def filter_static_artifact_defects(defects, line_name, cam_index, hough_params):
 
     # ---- 全部被抑制时，每 N 帧上报一条 S 类型兜底（确保系统知道在运行） ----
     total = tracker["total"]
-    if not filtered and defects and suppressed_count > 0:
+    # report_interval <= 0 时禁用心跳报告
+    if report_interval <= 0:
+        pass  # 不生成 S 类型心跳
+    elif not filtered and defects and suppressed_count > 0:
         if total % report_interval == 0 or total <= 5:
             d = dict(defects[0])
             d['location'] = dict(defects[0].get('location', {}))
@@ -6616,5 +6619,9 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
         )
     except Exception:
         pass
+    
+    # 缺陷全部被静态抑制过滤掉后，恢复 image_status 为 OK，避免空缺陷上传
+    if not report.get("defects"):
+        report["image_status"] = "OK"
     
     return report, final_image
