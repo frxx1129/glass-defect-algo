@@ -1,4 +1,8 @@
 # --- START OF FILE http_client.py ---
+import warnings
+# 在 import requests 之前设置过滤，避免导入时弹 RequestsDependencyWarning
+warnings.filterwarnings('ignore', message='Unable to find acceptable character detection dependency')
+
 import requests
 import json
 import threading

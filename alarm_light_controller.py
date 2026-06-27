@@ -51,31 +51,43 @@ class _AlarmLightService:
             print(f"❌ [声光报警器服务]: 发送指令时发生错误: {e}")
 
     def run(self):
-        """服务的主循环，在单独的线程中运行。"""
+        """服务的主循环，在单独的线程中运行。（非阻塞版）"""
         print("[声光报警器服务]: 后台服务线程已启动。")
+        restore_info = None  # (restore_time, light_on_exit, is_red)
+
         while not self.stop_event.is_set():
+            # 非阻塞：先检查是否有到期的恢复操作
+            now = time.time()
+            if restore_info is not None and now >= restore_info[0]:
+                try:
+                    self._send_command(light=restore_info[1], buzzer="off")
+                    if restore_info[2]:  # is_red → 自动恢复绿色常亮
+                        self._send_command(light="green", buzzer="off")
+                except Exception:
+                    pass
+                restore_info = None
+
             try:
-                command, args = self.command_queue.get(timeout=1)
-                
+                command, args = self.command_queue.get(timeout=0.05)
+
                 if command == "SET_STATE":
                     light, buzzer_on, duration = args
-                    current_light_state = light
+                    # 立即发送指令，不阻塞
                     self._send_command(light=light, buzzer="on" if buzzer_on else "off")
                     if duration > 0:
-                        time.sleep(duration)
-                        # 持续时间结束：先关闭蜂鸣
-                        self._send_command(light=current_light_state, buzzer="off")
-                        # 若为红色剔废模式，结束后自动恢复为绿色常亮
-                        if str(current_light_state).lower() == "red":
-                            self._send_command(light="green", buzzer="off")
-                
+                        # 非阻塞：记录恢复时间，继续处理新命令
+                        restore_info = (time.time() + duration, light, str(light).lower() == "red")
+                    else:
+                        # duration=0 → 覆盖清除待恢复操作
+                        restore_info = None
+
                 elif command == "SHUTDOWN":
                     self._send_command(light="off", buzzer="off")
                     break
 
             except Empty:
                 continue
-        
+
         if self.ser:
             self.ser.close()
         print("[声光报警器服务]: 后台服务线程已停止。")

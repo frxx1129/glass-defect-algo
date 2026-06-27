@@ -1,4 +1,8 @@
 # --- START OF FILE main.py ---
+import warnings
+# 屏蔽第三方库的 DeprecationWarning（urllib3/requests/等，Nuitka 打包后更敏感）
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+
 import multiprocessing
 import threading
 import json
@@ -192,7 +196,7 @@ def main():
 
     # 优先读取 YAML 配置；若不存在则回退到 JSON（并尝试用 YAML 解析器解析 JSON，失败再用 json.load）
     try:
-        cfg_path = 'config.yaml' if os.path.exists('config.yaml') else 'config.json'
+        cfg_path = os.path.join(base_dir, 'config.yaml') if os.path.exists(os.path.join(base_dir, 'config.yaml')) else os.path.join(base_dir, 'config.json')
         with open(cfg_path, 'r', encoding='utf-8') as f:
             if cfg_path.endswith(('.yml', '.yaml')):
                 config = yaml.safe_load(f)
@@ -202,6 +206,10 @@ def main():
                 except Exception:
                     f.seek(0)
                     config = json.load(f)
+        # 把所有后续用到的相对路径文件也转成 base_dir 下的绝对路径
+        for key in ('roi_template_file', 'remote_alarm_server'):
+            if key in config and not os.path.isabs(config[key]):
+                config[key] = os.path.join(base_dir, config[key])
         try:
             print("[主进程]: 配置加载完成")
         except Exception:
@@ -248,6 +256,8 @@ def main():
                 roi_file = None
         if not roi_file:
             roi_file = config.get('roi_template_file', 'roi_averaged_by_group_CORRECTED.json')
+        if not os.path.isabs(roi_file):
+            roi_file = os.path.join(base_dir, roi_file)
         with open(roi_file, 'r', encoding='utf-8') as f:
             averaged_data = json.load(f)
         if not averaged_data:
