@@ -4665,7 +4665,7 @@ def find_and_analyze_defects(edges, roi_gray, roi_dims, params, pixels_per_mm: f
     return edges_for_drawing, filtered_defects, paired_corners
 
 
-def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm, dbg_edges_after_suppress=None):
+def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_per_mm, draw_defects=True, dbg_edges_after_suppress=None):
     # 兼容多种 ROI 表达：dict/list/tuple
     def _parse_roi(rt):
         if isinstance(rt, (list, tuple)) and len(rt) >= 4:
@@ -5844,75 +5844,76 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
     
     # annotations_to_draw = []
 
-    for defect_report in final_defects_for_report:
-        defect = defect_report['raw_defect']
-        color_bgr = DEFECT_COLORS_BGR.get(defect_report["type"], (255, 255, 255))
-        
-        loc = defect_report['location']
-        defect_type_map = {'Q': '缺角', 'B': '崩边', 'E': '边缘异常', 'X': '斜边', 'L': '裂纹'}
-        type_str = defect_type_map.get(defect_report['type'], '未知')
+    if draw_defects:
+        for defect_report in final_defects_for_report:
+            defect = defect_report['raw_defect']
+            color_bgr = DEFECT_COLORS_BGR.get(defect_report["type"], (255, 255, 255))
+            
+            loc = defect_report['location']
+            defect_type_map = {'Q': '缺角', 'B': '崩边', 'E': '边缘异常', 'X': '斜边', 'L': '裂纹'}
+            type_str = defect_type_map.get(defect_report['type'], '未知')
 
-        try:
-            if defect_report['type'] == 'Q' and isinstance(defect.get('ray_segments'), (list, tuple)):
-                for seg_entry in defect.get('ray_segments'):
-                    try:
-                        if isinstance(seg_entry, dict) and 'seg' in seg_entry:
-                            p0, p1 = seg_entry['seg']
-                        else:
-                            p0, p1 = seg_entry
-                        x0,y0 = int(p0[0]), int(p0[1])
-                        x1,y1 = int(p1[0]), int(p1[1])
-                        cv2.arrowedLine(roi_color, (x0,y0), (x1,y1), (0,255,255), 1, tipLength=0.25)
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-#
-        if defect_report['type'] in ('E', 'X'):
-            # 区分 E 与 X 的标注：均显示角度；E 还需显示长宽；X 为“混合型”也显示长宽
-            if loc.get('subtype') == 'curved' or (defect.get('skew_subtype', '') == 'curved'):
-                angle_part = f"曲度: {loc.get('angle', 0.0):.1f}°"
-            else:
-                angle_part = f"角度: {loc.get('angle', 0.0):.1f}°"
-            if 'length_mm' in loc and 'width_mm' in loc and (loc.get('length_mm') or loc.get('width_mm')):
-                text = f"{type_str}: ({loc['x']}, {loc['y']}), {angle_part}, 尺寸: {loc.get('length_mm',0):.1f}x{loc.get('width_mm',0):.1f}mm"
-            else:
-                text = f"{type_str}: ({loc['x']}, {loc['y']}), {angle_part}"
-        elif defect_report['type'] == 'Q' and 'pixel_area' in loc:
-            text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm"
-        else:
-            text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm"
-        
-        annotations_to_draw.append({'text': text, 'color': color_bgr})
-
-        # Q 不再强制绘制三角形，统一用 region_contour；若有 barrier 信息，附加 barrier 显示
-        if defect_report["type"] == "Q" and "region_contour" in defect:
-            # 使用像素块的真实轮廓高亮（不使用 minAreaRect 来圈出）
-            region = defect["region_contour"]
-            overlay = roi_color.copy()
-            cv2.fillPoly(overlay, [region], color_bgr)
-            cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
-            # 可选：画细边框帮助观察（维持同色细线）——如完全不需要可去掉下一行
-            cv2.drawContours(roi_color, [region], 0, color_bgr, THICKNESS)
-            # 绘制 Q 检测条带（thick ray）与玻璃轮廓，便于调试观察
             try:
-                raw_q = defect
-                # 新：绘制玻璃轮廓（来自 barrier_contour）
-                bc = raw_q.get('barrier_contour')
-                if bc:
-                    bc_np = np.array(bc, dtype=np.int32)
-                    cv2.polylines(roi_color, [bc_np], True, (0, 255, 255), 1)
+                if defect_report['type'] == 'Q' and isinstance(defect.get('ray_segments'), (list, tuple)):
+                    for seg_entry in defect.get('ray_segments'):
+                        try:
+                            if isinstance(seg_entry, dict) and 'seg' in seg_entry:
+                                p0, p1 = seg_entry['seg']
+                            else:
+                                p0, p1 = seg_entry
+                            x0,y0 = int(p0[0]), int(p0[1])
+                            x1,y1 = int(p1[0]), int(p1[1])
+                            cv2.arrowedLine(roi_color, (x0,y0), (x1,y1), (0,255,255), 1, tipLength=0.25)
+                        except Exception:
+                            continue
             except Exception:
                 pass
-        elif defect["type"] == "X" and "center" in defect:
-            cv2.circle(roi_color, defect["center"], 15, color_bgr, THICKNESS)
-        elif defect_report["type"] in ["L", "B", "X", "E"] and "box_points" in defect:
-            # 其它缺陷继续使用自身 box_points 可视化
-            box_points = defect["box_points"]
-            overlay = roi_color.copy()
-            cv2.fillPoly(overlay, [box_points], color_bgr)
-            cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
-            cv2.drawContours(roi_color, [box_points], 0, color_bgr, THICKNESS)
+#
+            if defect_report['type'] in ('E', 'X'):
+                # 区分 E 与 X 的标注：均显示角度；E 还需显示长宽；X 为"混合型"也显示长宽
+                if loc.get('subtype') == 'curved' or (defect.get('skew_subtype', '') == 'curved'):
+                    angle_part = f"曲度: {loc.get('angle', 0.0):.1f}°"
+                else:
+                    angle_part = f"角度: {loc.get('angle', 0.0):.1f}°"
+                if 'length_mm' in loc and 'width_mm' in loc and (loc.get('length_mm') or loc.get('width_mm')):
+                    text = f"{type_str}: ({loc['x']}, {loc['y']}), {angle_part}, 尺寸: {loc.get('length_mm',0):.1f}x{loc.get('width_mm',0):.1f}mm"
+                else:
+                    text = f"{type_str}: ({loc['x']}, {loc['y']}), {angle_part}"
+            elif defect_report['type'] == 'Q' and 'pixel_area' in loc:
+                text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm"
+            else:
+                text = f"{type_str}: ({loc['x']}, {loc['y']}), 尺寸: {loc['length_mm']:.1f}x{loc['width_mm']:.1f}mm"
+            
+            annotations_to_draw.append({'text': text, 'color': color_bgr})
+
+            # Q 不再强制绘制三角形，统一用 region_contour；若有 barrier 信息，附加 barrier 显示
+            if defect_report["type"] == "Q" and "region_contour" in defect:
+                # 使用像素块的真实轮廓高亮（不使用 minAreaRect 来圈出）
+                region = defect["region_contour"]
+                overlay = roi_color.copy()
+                cv2.fillPoly(overlay, [region], color_bgr)
+                cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
+                # 可选：画细边框帮助观察（维持同色细线）——如完全不需要可去掉下一行
+                cv2.drawContours(roi_color, [region], 0, color_bgr, THICKNESS)
+                # 绘制 Q 检测条带（thick ray）与玻璃轮廓，便于调试观察
+                try:
+                    raw_q = defect
+                    # 新：绘制玻璃轮廓（来自 barrier_contour）
+                    bc = raw_q.get('barrier_contour')
+                    if bc:
+                        bc_np = np.array(bc, dtype=np.int32)
+                        cv2.polylines(roi_color, [bc_np], True, (0, 255, 255), 1)
+                except Exception:
+                    pass
+            elif defect["type"] == "X" and "center" in defect:
+                cv2.circle(roi_color, defect["center"], 15, color_bgr, THICKNESS)
+            elif defect_report["type"] in ["L", "B", "X", "E"] and "box_points" in defect:
+                # 其它缺陷继续使用自身 box_points 可视化
+                box_points = defect["box_points"]
+                overlay = roi_color.copy()
+                cv2.fillPoly(overlay, [box_points], color_bgr)
+                cv2.addWeighted(overlay, alpha, roi_color, beta, 0, roi_color)
+                cv2.drawContours(roi_color, [box_points], 0, color_bgr, THICKNESS)
 
     # 绘制识别到的主直线和“理想直线边”（可配置开关）
     try:
@@ -6004,6 +6005,101 @@ def process_roi_hough_based(roi_idx, roi_template, image_gray, params, pixels_pe
         roi_color = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
     return roi_report, roi_color
+
+
+# ===================================================================
+# 缺陷标注绘制函数（提取自 process_roi_hough_based，供过滤后重绘使用）
+# ===================================================================
+def _draw_defect_annotations(roi_bgr, defect_reports, hough_params, roi_w, roi_h):
+    """在 ROI 图像上绘制缺陷形状和文字标注。返回修改后的 roi_bgr。"""
+    DEFECT_COLORS_BGR = {'Q': (0, 0, 255), 'E': (0, 0, 255), 'X': (255, 0, 0), 'L': (255, 0, 255), 'B': (0, 165, 255)}
+    p_vis = hough_params.get("VISUALIZATION", {})
+    THICKNESS = 1
+    alpha = p_vis.get("DEFECT_OVERLAY_ALPHA", 0.35)
+    beta = 1 - alpha
+    annotations_to_draw = []
+
+    for defect_report in defect_reports:
+        defect = defect_report.get('raw_defect', {})
+        color_bgr = DEFECT_COLORS_BGR.get(defect_report.get("type", ""), (255, 255, 255))
+        loc = defect_report.get('location', {})
+        defect_type_map = {'Q': '缺角', 'B': '崩边', 'E': '边缘异常', 'X': '斜边', 'L': '裂纹'}
+        type_str = defect_type_map.get(defect_report.get('type', ''), '未知')
+
+        try:
+            if defect_report.get('type') == 'Q' and isinstance(defect.get('ray_segments'), (list, tuple)):
+                for seg_entry in defect.get('ray_segments', []):
+                    try:
+                        if isinstance(seg_entry, dict) and 'seg' in seg_entry:
+                            p0, p1 = seg_entry['seg']
+                        else:
+                            p0, p1 = seg_entry
+                        x0, y0 = int(p0[0]), int(p0[1])
+                        x1, y1 = int(p1[0]), int(p1[1])
+                        cv2.arrowedLine(roi_bgr, (x0, y0), (x1, y1), (0, 255, 255), 1, tipLength=0.25)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        if defect_report.get('type') in ('E', 'X'):
+            if loc.get('subtype') == 'curved' or (defect.get('skew_subtype', '') == 'curved'):
+                angle_part = f"曲度: {loc.get('angle', 0.0):.1f}°"
+            else:
+                angle_part = f"角度: {loc.get('angle', 0.0):.1f}°"
+            if 'length_mm' in loc and 'width_mm' in loc and (loc.get('length_mm') or loc.get('width_mm')):
+                text = f"{type_str}: ({loc.get('x', '')}, {loc.get('y', '')}), {angle_part}, 尺寸: {loc.get('length_mm',0):.1f}x{loc.get('width_mm',0):.1f}mm"
+            else:
+                text = f"{type_str}: ({loc.get('x', '')}, {loc.get('y', '')}), {angle_part}"
+        elif defect_report.get('type') == 'Q' and 'pixel_area' in loc:
+            text = f"{type_str}: ({loc.get('x', '')}, {loc.get('y', '')}), 尺寸: {loc.get('length_mm', 0.0):.1f}x{loc.get('width_mm', 0.0):.1f}mm"
+        else:
+            text = f"{type_str}: ({loc.get('x', '')}, {loc.get('y', '')}), 尺寸: {loc.get('length_mm', 0.0):.1f}x{loc.get('width_mm', 0.0):.1f}mm"
+
+        annotations_to_draw.append({'text': text, 'color': color_bgr})
+
+        if defect_report.get("type") == "Q" and "region_contour" in defect:
+            region = defect["region_contour"]
+            overlay = roi_bgr.copy()
+            cv2.fillPoly(overlay, [region], color_bgr)
+            cv2.addWeighted(overlay, alpha, roi_bgr, beta, 0, roi_bgr)
+            cv2.drawContours(roi_bgr, [region], 0, color_bgr, THICKNESS)
+            try:
+                bc = defect.get('barrier_contour')
+                if bc:
+                    bc_np = np.array(bc, dtype=np.int32)
+                    cv2.polylines(roi_bgr, [bc_np], True, (0, 255, 255), 1)
+            except Exception:
+                pass
+        elif defect.get("type") == "X" and "center" in defect:
+            cv2.circle(roi_bgr, defect["center"], 15, color_bgr, THICKNESS)
+        elif defect_report.get("type") in ["L", "B", "X", "E"] and "box_points" in defect:
+            box_points = defect["box_points"]
+            overlay = roi_bgr.copy()
+            cv2.fillPoly(overlay, [box_points], color_bgr)
+            cv2.addWeighted(overlay, alpha, roi_bgr, beta, 0, roi_bgr)
+            cv2.drawContours(roi_bgr, [box_points], 0, color_bgr, THICKNESS)
+
+    if annotations_to_draw and PIL_AVAILABLE and ANNOTATION_FONT:
+        pil_img = Image.fromarray(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_img)
+        y_text = 10
+        padding = 10
+        for ann in annotations_to_draw:
+            txt = ann['text']
+            color_rgb = tuple(reversed(ann['color']))
+            if hasattr(draw, 'textbbox'):
+                bbox = draw.textbbox((0, 0), txt, font=ANNOTATION_FONT)
+                text_width = bbox[2] - bbox[0]
+                text_height = bbox[3] - bbox[1]
+            else:
+                text_width, text_height = draw.textsize(txt, font=ANNOTATION_FONT)
+            x_text = roi_w - text_width - 10
+            draw.text((x_text, y_text), txt, font=ANNOTATION_FONT, fill=color_rgb)
+            y_text += text_height + padding
+        roi_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+    return roi_bgr
 
 
 # ============================================================
@@ -6184,7 +6280,7 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
 
     def _safe_roi_hough(i, r):
         try:
-            return process_roi_hough_based(i, r, image_gray, hough_params, pixels_per_mm, dbg_edges_after_suppress=debug_e_edges_by_roi)
+            return process_roi_hough_based(i, r, image_gray, hough_params, pixels_per_mm, draw_defects=False, dbg_edges_after_suppress=debug_e_edges_by_roi)
         except Exception as e:
             print(f"Error processing ROI {i}: {e}")
             # 兼容多种 ROI 表达，尽可能返回一个安全的占位 ROI
@@ -6453,7 +6549,8 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
         results = [future.result() for future in futures]
 
     max_edges_found = 0
-    for roi_report, roi_color in results:
+    per_roi_defects = {}
+    for i, (roi_report, roi_color) in enumerate(results):
         if "x" not in roi_report: continue
         x, y, w, h = roi_report["x"], roi_report["y"], roi_report["w"], roi_report["h"]
         if w > 0 and h > 0: final_image[y:y+h, x:x+w] = roi_color
@@ -6463,6 +6560,7 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
         max_edges_found = max(max_edges_found, roi_report.get("edges_found", 0))
         
         if roi_report.get("defects"):
+            per_roi_defects[i] = list(roi_report["defects"])
             report["image_status"] = "NG"
             report["defects"].extend(roi_report["defects"])
             
@@ -6617,6 +6715,19 @@ def process_image_from_memory_parallel(image_gray, template_rois, config):
             int(_cam_index_run) if _cam_index_run != -1 else -1,
             hough_params
         )
+        # ---- 对保留的缺陷重新绘制标记（被抑制的不画） ----
+        _kept_ids = set(id(d) for d in report["defects"])
+        for i, (roi_report, _) in enumerate(results):
+            if "x" not in roi_report:
+                continue
+            x, y, w, h = roi_report["x"], roi_report["y"], roi_report["w"], roi_report["h"]
+            if w <= 0 or h <= 0:
+                continue
+            _roi_kept = [d for d in per_roi_defects.get(i, []) if id(d) in _kept_ids]
+            if _roi_kept:
+                roi_crop = final_image[y:y+h, x:x+w].copy()
+                roi_crop = _draw_defect_annotations(roi_crop, _roi_kept, hough_params, w, h)
+                final_image[y:y+h, x:x+w] = roi_crop
     except Exception:
         pass
     
